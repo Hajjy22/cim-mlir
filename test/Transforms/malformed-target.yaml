@@ -1,0 +1,22 @@
+# Deliberately broken: `tiles.rows` is missing, so cim-partition must fail
+# with a diagnostic naming the field rather than partitioning against a
+# half-parsed device. Referenced by pass-failures.mlir.
+name: malformed
+class: near_memory
+tiles:
+  count: 2
+  cols: 4
+  weight_dtype: i8
+  activation_dtype: i8
+costs:
+  program:
+    latency_ns: 1
+    energy_pj: 1
+  mvm:
+    latency_ns: 1
+    energy_pj: 1
+  transfer:
+    bandwidth_gbps: 1.0
+    energy_pj_per_byte: 1.0
+precision:
+  output_effective_bits: 8

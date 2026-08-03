@@ -36,7 +36,16 @@ Type TileType::parse(AsmParser &parser) {
   Type elementType;
   if (parser.parseType(elementType) || parser.parseGreater())
     return {};
-  return TileType::get(parser.getContext(), shape, elementType);
+
+  // getChecked, not get: `get` asserts on a malformed type in a debug build
+  // and silently constructs one otherwise, which makes TileType::verify's
+  // branches unreachable from parsing. getChecked routes them to a proper
+  // diagnostic, so `!cim.tile<0x4xi8>` is a parse error the user can read
+  // rather than an assertion or a corrupt type.
+  const SMLoc loc = parser.getCurrentLocation();
+  return TileType::getChecked([&] { return parser.emitError(loc); },
+                              parser.getContext(),
+                              ArrayRef<int64_t>(shape), elementType);
 }
 
 void TileType::print(AsmPrinter &printer) const {

@@ -114,3 +114,20 @@ func.func @requantize_bits_exceed_result(%sum: memref<256xi32, #cim.space<near>>
        : memref<256xi32, #cim.space<near>> -> memref<256xi8, #cim.space<near>>
   return %q : memref<256xi8, #cim.space<near>>
 }
+
+// -----
+
+// TileType::verify's branches were unreachable from parsing until
+// TileType::parse switched from get() to getChecked(): get() asserts in a
+// debug build and silently constructs a malformed type otherwise.
+// expected-error @+1 {{cim.tile expects a 2D shape}}
+func.func @tile_must_be_2d(%t: !cim.tile<256xi8>) {
+  return
+}
+
+// -----
+
+// expected-error @+1 {{cim.tile dimensions must be positive}}
+func.func @tile_dims_must_be_positive(%t: !cim.tile<0x256xi8>) {
+  return
+}

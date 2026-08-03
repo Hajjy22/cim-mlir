@@ -12,9 +12,11 @@ config.test_exec_root = os.path.join(config.cim_obj_root, "test")
 
 llvm_config.use_default_substitutions()
 
-config.excludes = ["lit.cfg.py", "lit.site.cfg.py", "CMakeLists.txt"]
+config.excludes = ["lit.cfg.py", "lit.site.cfg.py", "CMakeLists.txt",
+                   "malformed-target.yaml"]
 
 tool_dirs = [config.cim_tools_dir, config.llvm_tools_dir]
-tools = ["cim-opt", "FileCheck"]
+# `not` is needed by tests that assert a pass fails.
+tools = ["cim-opt", "FileCheck", "not"]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

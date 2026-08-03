@@ -4,6 +4,9 @@ add_executable(cim-unit-tests
   target_spec_test.cpp
   cimrt_test.cpp
   placement_property_test.cpp
+  validator_mutation_test.cpp
+  parser_error_test.cpp
+  cost_report_test.cpp
 )
 
 # cimrt was previously linked into no test binary at all, which is why its
