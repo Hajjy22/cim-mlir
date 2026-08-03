@@ -2,7 +2,10 @@
 #ifndef CIM_TRANSFORMS_PASSDETAIL_H
 #define CIM_TRANSFORMS_PASSDETAIL_H
 
-// The generated pass base classes name ModuleOp unqualified.
+// The generated pass base classes name ModuleOp unqualified, and the
+// dependentDialects lists in Passes.td name these dialect classes.
+#include "cim/Dialect/CIMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 

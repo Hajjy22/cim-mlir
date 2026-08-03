@@ -35,9 +35,19 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Declared, not implemented.** The 8-pass lowering pipeline is registered and runnable, but
-the pass bodies are `TODO` stubs — nothing compiles a real model end to end yet. See
-[`docs/roadmap.md`](docs/roadmap.md).
+**Partly implemented.** Two of the eight lowering passes are real: `cim-detect` finds
+INT8 matmuls with a constant weight operand, and `cim-partition` lowers them into per-tile
+`cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
+driven by the target file's tile geometry:
+
+```sh
+cim-opt model.mlir --cim-detect --cim-partition=target-yaml=targets/erbium-8t.yaml
+```
+
+The remaining six passes are registered but their bodies are `TODO` stubs, so nothing
+compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
+output-major weights, exact tile multiples) are each refused with a warning rather than
+silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Quickstart
 

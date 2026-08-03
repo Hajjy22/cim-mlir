@@ -3,15 +3,14 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** The milestones are not being completed in order, because
-the MLIR-dependent work and the algorithm work have different blockers. M0
-and M1 are done: the dialect builds against MLIR 18, round-trips, and its
-verifiers reject bad IR. M3's substance -- the placement engine and cost
-model -- is implemented and tested, because it needs only a C++ compiler.
-What is missing is the middle: the lowering passes are registered but their
-bodies are stubs, so nothing compiles a real model yet (M2). Concretely:
-the algorithm is real and the dialect is real; the pipeline between them
-is not.
+**Current state.** M0 and M1 are done. The first two lowering passes are
+real: `cim-detect` annotates eligible matmuls and `cim-partition` lowers
+them into per-tile `cim.program`/`cim.mvm` with partial-sum reduction and
+explicit space transfers, driven by the target file's tile geometry. M3's
+substance -- the placement engine and cost model -- is implemented and
+tested standalone. What remains open is joining the two: `cim-placement`
+has the algorithm and now has IR to run it on, but does not yet rewrite
+that IR from its schedule.
 
 ## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
@@ -32,15 +31,33 @@ is not.
   verifiers actually reject bad IR (10 tests, all passing).
 - [x] CI builds and tests both layers.
 
-## M2 — Functional correctness (future)
-- Functional simulator + `cimrt` runtime: partially scaffolded now
-  (`runtime/src/simulator/simulator.cpp` has a real INT8 MVM reference
-  implementation; the compiler side does not feed it real IR yet).
-- Passes 1, 2, 5, 7 (`cim-detect`, `cim-partition`, `cim-insert-transfers`,
-  `cim-lower-to-target`) need real logic — currently `TODO` stubs in
-  `lib/Transforms/`.
-- End-to-end: an ONNX INT8 matmul compiles and produces numerically correct
-  output vs. PyTorch.
+## M2 — Functional correctness (in progress)
+- [x] Pass 1 `cim-detect`: annotates INT8 matmuls with a constant weight
+  operand. Rejects f32, activation-times-activation, narrow accumulators,
+  and convolution (`test/Transforms/cim-detect.mlir`).
+- [x] Pass 2 `cim-partition`: lowers a candidate into per-tile
+  `cim.tile_alloc`/`cim.program`/`cim.mvm`, a `cim.reduce_partial` over the
+  contraction dimension, and explicit `cim.copy` staging into near memory.
+  Tile geometry and per-op costs come from `-target-yaml`, never from a
+  hardcoded constant.
+- [x] Functional simulator + `cimrt` runtime with a real INT8 MVM reference
+  implementation (`runtime/src/simulator/simulator.cpp`).
+- [ ] Passes 5 and 7 (`cim-insert-transfers`, `cim-lower-to-target`) are
+  still stubs. `cim-partition` currently emits its own transfers, so
+  pass 5 has little to do until multi-layer models arrive.
+- [ ] End-to-end: an ONNX INT8 matmul compiles and produces numerically
+  correct output vs. PyTorch. Nothing yet connects the compiled IR to the
+  simulator, so there is no numerical check across the whole pipeline.
+
+### Known limits of cim-partition
+Each is refused with a warning and the `linalg` op left intact, so the
+module stays correct and is simply not offloaded:
+- Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
+  output-major convention). A plain `linalg.matmul` needs a transpose first.
+- Only a single output row: `cim.mvm` is a matrix-vector primitive and the
+  v0.1 contract is matrix-vector.
+- Only exact multiples of the tile geometry. Spec Sec. 6 calls for
+  zero-padding ragged edges; that needs a pad-and-copy sequence.
 
 ## M3 — The placement pass (algorithm done, IR rewriting outstanding)
 - [x] Belady/MIN eviction implemented and unit-tested, with LRU and FIFO
