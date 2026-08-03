@@ -1,7 +1,6 @@
-add_llvm_executable(cim-bench cim-bench.cpp)
-
-llvm_update_compile_flags(cim-bench)
+add_executable(cim-bench cim-bench.cpp)
 
 target_link_libraries(cim-bench PRIVATE
-  LLVMSupport
+  cimPlacement
+  cimTarget
 )

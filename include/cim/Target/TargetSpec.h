@@ -3,10 +3,13 @@
 #define CIM_TARGET_TARGETSPEC_H
 
 #include <cstdint>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
-namespace mlir {
+// Plain `cim`, not `mlir::cim`: this schema and the placement/cost engines
+// built on it carry no MLIR dependency, so they stay outside the mlir
+// namespace. Only the dialect and passes live in `mlir::cim`.
 namespace cim {
 
 /// One of near_memory | digital_cim | analog_cim | dpu (spec Sec. 7).
@@ -73,12 +76,17 @@ struct TargetSpec {
   CapabilitiesSpec capabilities;
 };
 
-/// TODO(spec Sec.7): implemented in TargetYAMLParser.cpp via
-/// llvm::yaml::MappingTraits<TargetSpec>. Returns failure (and diagnostics
-/// on stderr) on malformed YAML.
+/// Parse a target description (spec Sec. 7, docs/target-format.md).
+/// Rejects — rather than guesses at — missing required fields, unknown
+/// enum values, and geometries that cannot describe a real device.
+///
+/// The `error` overloads report what was wrong; the two-argument form logs
+/// to stderr and is the convenience entry point for tools.
+bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error);
+bool parseTargetSpecFromFile(const std::string &path, TargetSpec &outSpec,
+                              std::string *error);
 bool parseTargetSpecFromFile(const std::string &path, TargetSpec &outSpec);
 
 } // namespace cim
-} // namespace mlir
 
 #endif // CIM_TARGET_TARGETSPEC_H

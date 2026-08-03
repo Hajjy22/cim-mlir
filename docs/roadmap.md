@@ -1,9 +1,14 @@
 # Roadmap
 
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
-nothing counts until it is public. **This commit's actual state is M0/M1**:
-the repo/dialect skeleton exists and round-trips through `cim-opt`, but no
-pass has real logic yet and nothing here compiles a real model.
+nothing counts until it is public.
+
+**Current state.** The milestones are not being completed in order, because
+the MLIR-dependent work and the algorithm work have different blockers. The
+placement engine and cost model (M3's substance) are implemented and tested,
+since they need only a C++ compiler. The dialect exists but its passes are
+stubs, so nothing compiles a real model yet (M2 outstanding). Concretely:
+the algorithm is real, the compiler is not.
 
 ## M0 — Environment and orientation (this commit, partial)
 - [x] Repository scaffold matching this layout.
@@ -32,12 +37,24 @@ pass has real logic yet and nothing here compiles a real model.
 - End-to-end: an ONNX INT8 matmul compiles and produces numerically correct
   output vs. PyTorch.
 
-## M3 — The placement pass (future)
-- `cim-placement` (Belady/MIN eviction) and `cim-cost-report` — both
-  currently `TODO` stubs; `cim-placement` is the flagship pass (spec Sec. 3.3).
-- `cim-bench` running the five v0.1 workloads (`bench/workloads/`).
-- Headline result: reprogramming cost vs. model-size/tile-capacity ratio,
-  optimal placement vs. naive baseline, on volatile vs. non-volatile targets.
+## M3 — The placement pass (algorithm done, IR rewriting outstanding)
+- [x] Belady/MIN eviction implemented and unit-tested, with LRU and FIFO
+  baselines to compare against (`lib/Placement/`, `test/unit/placement_test.cpp`).
+  Every schedule is replayed through `validatePlacement()` before its
+  numbers are trusted.
+- [x] Analytical cost model over the target file's cost table, including
+  install-vs-steady-state breakdown and amortization
+  (`lib/Placement/CostReport.cpp`).
+- [x] `cim-bench` running the five v0.1 workloads end to end, emitting
+  results JSON with target-file hash, git commit, and date
+  (`bench/workloads/README.md` has the current numbers).
+- [x] Plot script in the repo (`bench/plots/plot_residency.py`).
+- [ ] `cim-placement` rewriting actual IR: the pass calls the engine, but
+  recovering the use sequence from `cim.program`/`cim.mvm` and rewriting
+  from the schedule is still `TODO`. Blocked on M2 — there is no IR to
+  place until `cim-partition` emits some.
+- [ ] Volatile-vs-non-volatile comparison plot showing that persistence
+  changes the optimum, not just the magnitude.
 
 ## M4 — Second target and generalization (future)
 - `targets/generic-digital-cim.yaml` already exists as a placeholder

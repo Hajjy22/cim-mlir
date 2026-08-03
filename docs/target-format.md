@@ -49,6 +49,36 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 | `partial_sum_in_place` | Can `cim.reduce_partial` accumulate without an extra buffer? |
 | `autonomous_control` | Host-less execution supported (spec Sec. 3.1 control-model axis)? |
 
+## Units, and a discrepancy in the spec's worked example
+
+All energy fields are **picojoules** (`energy_pj`) and all latency fields
+are **nanoseconds** (`latency_ns`). `lib/Placement/CostReport.cpp` does its
+arithmetic in those units throughout.
+
+Worth flagging before anyone builds a plot on it: the v0.1 spec's Section 17
+worked example is internally inconsistent by 1000x on program energy. With
+`erbium-8t.yaml`'s `program.energy_pj: 480000`:
+
+- 480000 pJ = 480 nJ per program, and 8 programs = **3.84 µJ** of install energy.
+- Section 17 states `× 480 nJ = 3.84 mJ`, which is 1000x larger than
+  8 × 480 nJ.
+- The rest of that table then follows from the mJ figure: amortized over 1M
+  inferences it reports 3.84 nJ/inference and calls that 13% of the
+  per-inference cost. Using the field as written (pJ), the same amortization
+  gives 0.00384 nJ/inference — about 0.012%, i.e. negligible rather than
+  material.
+- The MVM numbers in the same table *are* self-consistent in pJ
+  (`3100 pJ` = the 3.1 nJ the spec quotes), which points to the program-energy
+  line being the error rather than the field's unit.
+
+This repository implements the units as the field names declare them.
+Whether the intended figure is 480 nJ or 480 µJ per program changes whether
+install cost is a rounding error or a real 13% of the per-inference budget —
+which is the crux of the amortization argument — so it is worth resolving
+against real hardware before the number appears in a paper. Until then,
+`provenance: estimated` on the Erbium file is doing exactly the job it
+exists for.
+
 ## Adding a new target
 
 1. Copy `targets/erbium-8t.yaml` as a starting point.

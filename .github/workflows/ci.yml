@@ -8,7 +8,11 @@ env:
   LLVM_TAG: llvmorg-18.1.8
 
 jobs:
-  build-and-test:
+  # The core (placement engine, target reader, runtime, cim-bench) has no
+  # LLVM/MLIR dependency, so it builds and tests in seconds. Running it as a
+  # separate job means a broken algorithm is reported immediately rather
+  # than after an LLVM build.
+  core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,10 +20,55 @@ jobs:
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
-      # LLVM/MLIR is not distributed as an apt package, so it is built from
-      # source here and cached by tag — only the first run (or a tag bump)
-      # pays the full build cost (~45-90 min); subsequent runs restore the
-      # install prefix from cache in seconds.
+      - name: Configure (core only, no MLIR)
+        run: cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark smoke run
+        run: |
+          ./build/tools/cim-bench/cim-bench run --target erbium-8t \
+            --out results-erbium-8t.json --inferences 100
+          ./build/tools/cim-bench/cim-bench run --target generic-digital-cim \
+            --out results-generic-digital-cim.json --inferences 100
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: results-*.json
+
+  lint-targets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate target YAML files
+        run: |
+          python3 -c "
+          import glob, yaml
+          for f in sorted(glob.glob('targets/*.yaml')):
+              with open(f) as fh:
+                  yaml.safe_load(fh)
+              print(f'OK: {f}')
+          "
+
+  # The MLIR layer: dialect, lowering passes, cim-opt, and the FileCheck
+  # suite. MLIR is not distributed as an apt package and there is no
+  # prebuilt artifact worth trusting, so LLVM+MLIR is built from source and
+  # cached by tag -- only the first run (or a tag bump) pays the ~45-90 min
+  # build cost.
+  mlir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
       - name: Cache LLVM/MLIR build
         id: cache-llvm
         uses: actions/cache@v4
@@ -46,22 +95,8 @@ jobs:
             -DLLVM_DIR="$PWD/llvm-install/lib/cmake/llvm" \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build cim-opt and cim-bench
-        run: cmake --build build --target cim-opt cim-bench -j"$(nproc)"
+      - name: Build cim-opt
+        run: cmake --build build --target cim-opt -j"$(nproc)"
 
-      - name: Run FileCheck tests
+      - name: Dialect tests (FileCheck)
         run: cmake --build build --target check-cim-opt
-
-  lint-targets:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate target YAML files
-        run: |
-          python3 -c "
-          import glob, sys, yaml
-          for f in glob.glob('targets/*.yaml'):
-              with open(f) as fh:
-                  yaml.safe_load(fh)
-              print(f'OK: {f}')
-          "

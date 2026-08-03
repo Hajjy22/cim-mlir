@@ -15,7 +15,6 @@
 #include "cim/Target/TargetSpec.h"
 #include <cstdint>
 
-namespace mlir {
 namespace cim {
 
 /// Accumulates cost over a trace of program/mvm/transfer events, using a
@@ -60,6 +59,5 @@ private:
 };
 
 } // namespace cim
-} // namespace mlir
 
 #endif // CIM_RUNTIME_SIMULATOR_COST_MODEL_H

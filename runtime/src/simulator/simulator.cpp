@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace mlir::cim;
+using namespace cim;
 
 struct cimrt_device {
   std::string name;
