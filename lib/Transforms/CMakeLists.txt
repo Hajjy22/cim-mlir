@@ -26,4 +26,4 @@ add_mlir_dialect_library(MLIRCIMTransforms
 )
 
 # The passes delegate their actual algorithms to the MLIR-free core.
-target_link_libraries(MLIRCIMTransforms PUBLIC cimPlacement cimTarget)
+target_link_libraries(MLIRCIMTransforms PUBLIC cimPlacement cimTarget cim_build_flags)

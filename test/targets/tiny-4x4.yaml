@@ -1,0 +1,51 @@
+# test/targets/tiny-4x4.yaml
+#
+# A deliberately tiny device, for tests only -- not a model of real hardware.
+#
+# The shipped targets have 256x256 tiles, which means any end-to-end test that
+# has to spell its weights out as a `dense<>` literal needs 65536 elements per
+# tile block. With 4x4 tiles a whole multi-block matmul fits in a few lines of
+# IR, and -- more importantly -- 2 tiles against a 3+ block workload makes
+# eviction reachable in a test, which 8 tiles of 256x256 never would.
+#
+# The cost numbers are round and arbitrary. Nothing should read them as a
+# claim about any device; they exist so cost arithmetic has something to
+# multiply.
+
+name: tiny-4x4
+description: Tiny synthetic target for tests (2 tiles of 4x4)
+version: 0.1
+
+class: digital_cim
+
+provenance: estimated  # synthetic; not measured, not modelling any real part
+
+tiles:
+  count: 2
+  rows: 4
+  cols: 4
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: true
+  persistence: nonvolatile
+
+costs:
+  program:
+    latency_ns: 1000
+    energy_pj: 10000
+  mvm:
+    latency_ns: 10
+    energy_pj: 100
+  transfer:
+    bandwidth_gbps: 1.0
+    energy_pj_per_byte: 1.0
+  standby_leakage_uw_per_tile: 0.0
+
+precision:
+  output_effective_bits: 8
+
+capabilities:
+  double_buffer_program: false
+  partial_sum_in_place: true
+  autonomous_control: false

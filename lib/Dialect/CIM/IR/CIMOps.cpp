@@ -29,7 +29,11 @@ Type memRefElementType(Value value) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult TileAllocOp::verify() {
-  if (getId() < 0)
+  // ODS gives an I64Attr an *unsigned* accessor, so `getId() < 0` is dead
+  // code that always evaluates false -- a negative id written in the IR
+  // (`id = -1 : i64`) round-trips as a huge unsigned and would sail past it.
+  // Reinterpreting as signed is what actually rejects it.
+  if (static_cast<int64_t>(getId()) < 0)
     return emitOpError("tile id must be non-negative");
 
   // Rule 5 (spec Sec. 5.4) also requires tile IDs to be unique and within
@@ -198,14 +202,18 @@ LogicalResult RequantizeOp::verify() {
   if (inType.getShape() != outType.getShape())
     return emitOpError("requantize must not change shape");
 
-  if (getEffectiveBits() <= 0)
+  // Signed reinterpretation for the same reason as TileAllocOp's id: the
+  // ODS accessor for an I32Attr is unsigned, so a negative effective_bits
+  // in the IR would otherwise read as a very large positive one.
+  const int64_t effectiveBits = static_cast<int32_t>(getEffectiveBits());
+  if (effectiveBits <= 0)
     return emitOpError("effective_bits must be positive");
 
   // effective_bits models what the readout path can actually resolve (an
   // ADC on an analog target). Claiming more bits out than the result type
   // can hold is a target-description error worth catching early.
   if (auto outElem = llvm::dyn_cast<IntegerType>(outType.getElementType())) {
-    if (getEffectiveBits() > static_cast<int32_t>(outElem.getWidth()))
+    if (effectiveBits > static_cast<int64_t>(outElem.getWidth()))
       return emitOpError("effective_bits (")
              << getEffectiveBits() << ") exceeds the width of the result type "
              << outElem;

@@ -23,7 +23,7 @@ namespace cim {
 /// Pass 8) when running against the functional simulator.
 class CostAccumulator {
 public:
-  explicit CostAccumulator(const TargetSpec &spec) : spec(spec) {}
+  explicit CostAccumulator(const TargetSpec &targetSpec) : spec(targetSpec) {}
 
   void recordProgram() {
     ++programsIssued;

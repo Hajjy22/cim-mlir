@@ -13,6 +13,6 @@ target_include_directories(cimrt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/simulator
 )
 
-target_link_libraries(cimrt PUBLIC cimTarget)
+target_link_libraries(cimrt PUBLIC cimTarget cim_build_flags)
 
 set_target_properties(cimrt PROPERTIES POSITION_INDEPENDENT_CODE ON)

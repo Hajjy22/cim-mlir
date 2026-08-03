@@ -4,6 +4,12 @@ project(cim-mlir LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
+# clang-tidy and cppcheck both read compile_commands.json.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(CIMBuildFlags)
+
 # The project splits in two:
 #
 #   * A core (lib/Placement, lib/Target, runtime/, tools/cim-bench) with no
@@ -48,14 +54,18 @@ if(CIM_ENABLE_MLIR)
   include(AddMLIR)
   include(HandleLLVMOptions)
 
-  include_directories(${LLVM_INCLUDE_DIRS})
-  include_directories(${MLIR_INCLUDE_DIRS})
+  # SYSTEM: upstream MLIR/LLVM headers emit warnings we neither own nor can
+  # fix, and -Werror would turn every one of them into our build failure.
+  include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+  include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
   link_directories(${LLVM_BUILD_LIBRARY_DIR})
   add_definitions(${LLVM_DEFINITIONS})
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
+# Also SYSTEM: this is where TableGen writes its generated .inc files, which
+# are not ours to keep warning-clean either.
+include_directories(SYSTEM ${CMAKE_CURRENT_BINARY_DIR}/include)
 
 if(CIM_ENABLE_MLIR)
   add_subdirectory(include)

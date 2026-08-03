@@ -11,6 +11,6 @@ target_include_directories(cimPlacement PUBLIC
   ${PROJECT_SOURCE_DIR}/include
 )
 
-target_link_libraries(cimPlacement PUBLIC cimTarget)
+target_link_libraries(cimPlacement PUBLIC cimTarget cim_build_flags)
 
 set_target_properties(cimPlacement PROPERTIES POSITION_INDEPENDENT_CODE ON)
