@@ -2,11 +2,16 @@ add_executable(cim-unit-tests
   test_main.cpp
   placement_test.cpp
   target_spec_test.cpp
+  cimrt_test.cpp
 )
 
+# cimrt was previously linked into no test binary at all, which is why its
+# INT8 matrix-vector multiply had never executed.
 target_link_libraries(cim-unit-tests PRIVATE
   cimPlacement
   cimTarget
+  cimrt
+  cim_build_flags
 )
 
 target_include_directories(cim-unit-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
