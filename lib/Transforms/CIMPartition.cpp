@@ -181,8 +181,22 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
         Value weightBlock = subView(builder, loc, weights, {n0, k0},
                                     {tileRows, tileCols});
 
+        // Tile ids must stay within the target's declared tile count (spec
+        // Sec. 5.4 rule 5). Handing out one id per block emits IR that asks
+        // for tile 2 on a 2-tile device -- structurally valid, and rejected
+        // by the runtime the moment it actually runs.
+        //
+        // Round-robin is safe *given this emission order*: each
+        // cim.program is immediately followed by the cim.mvm that consumes
+        // its resident, so a tile is never reprogrammed while a live
+        // resident still refers to it. It is deliberately naive -- it
+        // reprograms on every block even when the weights would still be
+        // there. Choosing which weights stay resident is cim-placement's
+        // job, and replacing this line is what wiring that pass up means.
+        const int64_t tileId =
+            spec.tiles.count > 0 ? blockId % spec.tiles.count : 0;
         Value tile = builder.create<TileAllocOp>(loc, tileType, device,
-                                                  builder.getI64IntegerAttr(blockId));
+                                                  builder.getI64IntegerAttr(tileId));
 
         // cim.program carries its own cost so later passes can reason about
         // reprogramming without a target lookup (spec Sec. 5.3).

@@ -2,8 +2,10 @@
 # the first thing CI runs.
 add_subdirectory(unit)
 
-# FileCheck/lit suite for the dialect. Needs cim-opt, and therefore MLIR.
+# Tests that need MLIR: the numerical end-to-end suite and the lit suite.
 if(CIM_ENABLE_MLIR)
+  add_subdirectory(mlir)
+
   configure_lit_site_cfg(
     ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
     ${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py
