@@ -4,14 +4,10 @@ on:
   push:
   pull_request:
 
-env:
-  LLVM_TAG: llvmorg-18.1.8
-
 jobs:
   # The core (placement engine, target reader, runtime, cim-bench) has no
   # LLVM/MLIR dependency, so it builds and tests in seconds. Running it as a
-  # separate job means a broken algorithm is reported immediately rather
-  # than after an LLVM build.
+  # separate job means a broken algorithm is reported immediately.
   core:
     runs-on: ubuntu-latest
     steps:
@@ -31,10 +27,12 @@ jobs:
 
       - name: Benchmark smoke run
         run: |
-          ./build/tools/cim-bench/cim-bench run --target erbium-8t \
+          ./build/bin/cim-bench run --target erbium-8t \
             --out results-erbium-8t.json --inferences 100
-          ./build/tools/cim-bench/cim-bench run --target generic-digital-cim \
+          ./build/bin/cim-bench run --target generic-digital-cim \
             --out results-generic-digital-cim.json --inferences 100
+          ./build/bin/cim-bench run --target upmem-like \
+            --out results-upmem-like.json --inferences 100
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -57,46 +55,35 @@ jobs:
           "
 
   # The MLIR layer: dialect, lowering passes, cim-opt, and the FileCheck
-  # suite. MLIR is not distributed as an apt package and there is no
-  # prebuilt artifact worth trusting, so LLVM+MLIR is built from source and
-  # cached by tag -- only the first run (or a tag bump) pays the ~45-90 min
-  # build cost.
+  # suite. Ubuntu ships MLIR 18 as a distro package, so this installs it
+  # rather than building LLVM from source -- the from-source route costs
+  # 45-90 minutes on a cold cache and buys nothing here, because the dialect
+  # only uses stable public MLIR APIs.
   mlir:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Cache LLVM/MLIR build
-        id: cache-llvm
-        uses: actions/cache@v4
-        with:
-          path: llvm-install
-          key: llvm-mlir-${{ runner.os }}-${{ env.LLVM_TAG }}-v1
-
-      - name: Build LLVM/MLIR
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
+      - name: Install LLVM/MLIR 18 and build tools
         run: |
-          git clone --depth 1 --branch ${{ env.LLVM_TAG }} https://github.com/llvm/llvm-project.git
-          cmake -S llvm-project/llvm -B llvm-build -G Ninja \
-            -DLLVM_ENABLE_PROJECTS=mlir \
-            -DLLVM_TARGETS_TO_BUILD=host \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_ASSERTIONS=ON \
-            -DCMAKE_INSTALL_PREFIX="$PWD/llvm-install"
-          cmake --build llvm-build --target install -j"$(nproc)"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            llvm-18-dev libmlir-18-dev mlir-18-tools
+          pip install lit
 
-      - name: Configure cim-mlir
+      - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
-            -DMLIR_DIR="$PWD/llvm-install/lib/cmake/mlir" \
-            -DLLVM_DIR="$PWD/llvm-install/lib/cmake/llvm" \
+            -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DLLVM_EXTERNAL_LIT="$(which lit)" \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build cim-opt
-        run: cmake --build build --target cim-opt -j"$(nproc)"
+      - name: Build everything
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Core unit tests
+        run: ctest --test-dir build --output-on-failure
 
       - name: Dialect tests (FileCheck)
         run: cmake --build build --target check-cim-opt

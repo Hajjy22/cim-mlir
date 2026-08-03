@@ -8,17 +8,20 @@
 //===----------------------------------------------------------------------===//
 
 #include "cim/Dialect/CIMTypes.h"
+
+// The generated type/attribute definitions below reference CIMDialect and
+// construct mlir::Builder, so both must be complete here.
+#include "cim/Dialect/CIMDialect.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 using namespace mlir::cim;
 
-#define GET_ATTRDEF_CLASSES
-#include "cim/Dialect/CIMOpsAttributes.cpp.inc"
-
-#define GET_TYPEDEF_CLASSES
-#include "cim/Dialect/CIMOpsTypes.cpp.inc"
+// The generated definitions themselves live in CIMDialect.cpp -- see the
+// note at the top of that file. This TU holds only the members ODS asks us
+// to write by hand.
 
 //===----------------------------------------------------------------------===//
 // TileType

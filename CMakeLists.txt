@@ -20,6 +20,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 option(CIM_ENABLE_MLIR "Build the MLIR dialect, passes, and cim-opt" ON)
 option(CIM_INCLUDE_TESTS "Build the cim-mlir test suites" ON)
 
+# Put every tool in <build>/bin. Without this, add_llvm_executable and
+# add_executable scatter binaries across their source-relative build
+# directories, and the lit suite cannot find cim-opt.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
+
 if(CIM_ENABLE_MLIR)
   find_package(MLIR CONFIG)
   if(NOT MLIR_FOUND)

@@ -6,6 +6,10 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Types.h"
 
+// The generated attribute classes reference SpaceKind/PersistenceKind, so
+// the enums must be declared before they are pulled in.
+#include "cim/Dialect/CIMEnums.h"
+
 #define GET_ATTRDEF_CLASSES
 #include "cim/Dialect/CIMOpsAttributes.h.inc"
 

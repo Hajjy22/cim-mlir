@@ -40,10 +40,19 @@ def CIM_DeviceOpenOp : CIM_Op<"device_open", []> {
 
 def CIM_TileAllocOp : CIM_Op<"tile_alloc", []> {
   let summary = "Allocate a physical tile on an open device";
-  // TODO(spec Sec.5.3): e.g. cim.tile_alloc %dev {id = 0} : !cim.tile<256x256xi8>
+  let description = [{
+    Syntax note: the spec (Sec. 5.3) writes this as
+    `cim.tile_alloc %dev {id = 0} : !cim.tile<256x256xi8>`, printing only
+    the result type. That form is unparseable — !cim.device carries a
+    target-name parameter, so the operand type cannot be inferred and must
+    appear in the syntax. Printed as a functional type instead:
+      %t = cim.tile_alloc %dev {id = 0 : i64}
+           : (!cim.device<"erbium-8t">) -> !cim.tile<256x256xi8>
+  }];
   let arguments = (ins CIM_DeviceType:$device, I64Attr:$id);
   let results = (outs CIM_TileType:$result);
-  let assemblyFormat = "$device attr-dict `:` type($result)";
+  let assemblyFormat = "$device attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1; // TODO(rule 5): tile IDs unique and within tiles.count
 }
 
 def CIM_TileFreeOp : CIM_Op<"tile_free", []> {
@@ -148,6 +157,7 @@ def CIM_RequantizeOp : CIM_Op<"requantize", []> {
   );
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -165,6 +175,7 @@ def CIM_CopyOp : CIM_Op<"copy", []> {
   let arguments = (ins AnyMemRef:$source);
   let results = (outs AnyMemRef:$dest);
   let assemblyFormat = "$source attr-dict `:` type($source) `to` type($dest)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

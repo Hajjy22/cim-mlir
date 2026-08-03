@@ -4,28 +4,33 @@ Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
 **Current state.** The milestones are not being completed in order, because
-the MLIR-dependent work and the algorithm work have different blockers. The
-placement engine and cost model (M3's substance) are implemented and tested,
-since they need only a C++ compiler. The dialect exists but its passes are
-stubs, so nothing compiles a real model yet (M2 outstanding). Concretely:
-the algorithm is real, the compiler is not.
+the MLIR-dependent work and the algorithm work have different blockers. M0
+and M1 are done: the dialect builds against MLIR 18, round-trips, and its
+verifiers reject bad IR. M3's substance -- the placement engine and cost
+model -- is implemented and tested, because it needs only a C++ compiler.
+What is missing is the middle: the lowering passes are registered but their
+bodies are stubs, so nothing compiles a real model yet (M2). Concretely:
+the algorithm is real and the dialect is real; the pipeline between them
+is not.
 
-## M0 — Environment and orientation (this commit, partial)
+## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
-- [ ] LLVM/MLIR built from source, `cim-opt` actually compiling (blocked in
-  the environment this scaffold was generated in — no MLIR install, no
-  internet; see `.github/workflows/ci.yml` for the real build path).
+- [x] `cim-opt` compiles and runs against MLIR 18. Note: no from-source LLVM
+  build is needed — Debian/Ubuntu ship `libmlir-18-dev`, which is what CI
+  installs. That turned a 45–90 minute cold CI build into an apt install.
 - [ ] Toy tutorial chapters 1–7 completed.
 - [ ] Erbium emulator running locally.
 
-## M1 — Dialect skeleton (this commit, structurally complete)
+## M1 — Dialect skeleton (complete)
 - [x] `cim` dialect defined in ODS: types, attributes, all nine ops
-  (`include/cim/Dialect/`).
-- [x] Verifier hooks declared for the ops with real semantic rules
-  (`cim.program`, `cim.mvm`, `cim.reduce_partial`) — bodies are `TODO`
-  pending M2.
-- [x] FileCheck round-trip test per op (`test/Dialect/CIM/`).
-- [ ] CI green (workflow exists, unverified — see M0 note).
+  (`include/cim/Dialect/`), compiling and parsing.
+- [x] Verifiers implemented for rules 1 and 4 plus shape/geometry/accumulator
+  checks (`lib/Dialect/CIM/IR/CIMOps.cpp`). Rules 2, 3, and 5 need
+  information a single op cannot see and are documented as such in the
+  source rather than silently skipped.
+- [x] FileCheck round-trip test per op, plus `invalid.mlir` proving the
+  verifiers actually reject bad IR (10 tests, all passing).
+- [x] CI builds and tests both layers.
 
 ## M2 — Functional correctness (future)
 - Functional simulator + `cimrt` runtime: partially scaffolded now
@@ -73,9 +78,19 @@ Assess against the signals in spec Section 15 (external engagement, MLIR
 learning curve, competitive landscape) and choose: raise/recruit, take a
 role at a company in the space, or continue as an open-source maintainer.
 
-## Naming note
+## Deviations from the spec
 
-The spec names the seventh pass `--cim-lower-to-<target>` (implying one
-flag per target). MLIR pass registration requires a single fixed pass
-name, so this is implemented as one `cim-lower-to-target` pass parameterized
-by a `-target-yaml=<path>` option instead (`include/cim/Transforms/Passes.td`).
+Two places where the spec as written could not be implemented literally.
+Both were found by compiling it, not by reading it.
+
+**Pass naming.** The spec names the seventh pass `--cim-lower-to-<target>`
+(implying one flag per target). MLIR pass registration requires a single
+fixed pass name, so this is one `cim-lower-to-target` pass parameterized by
+a `-target-yaml=<path>` option instead (`include/cim/Transforms/Passes.td`).
+
+**`cim.tile_alloc` syntax.** The spec writes it as
+`cim.tile_alloc %dev {id = 0} : !cim.tile<256x256xi8>`, printing only the
+result type. That is unparseable: `!cim.device` carries a target-name
+parameter, so the operand type cannot be inferred and must appear in the
+syntax. It prints as a functional type instead:
+`%t = cim.tile_alloc %dev {id = 0 : i64} : (!cim.device<"erbium-8t">) -> !cim.tile<256x256xi8>`.

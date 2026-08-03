@@ -31,9 +31,12 @@ and runnable, along with the target-description reader, the analytical cost mode
 `cimrt` functional simulator's INT8 matrix-vector multiply, and the `cim-bench` harness.
 None of it needs an LLVM toolchain.
 
-**Scaffolded, not implemented.** The `cim` dialect and its types/ops/verifiers are defined
-in ODS with FileCheck round-trip tests, and the 8-pass pipeline is declared — but the pass
-bodies are `TODO` stubs, so nothing compiles a real model end to end yet. See
+**Builds and passes its tests.** The `cim` dialect compiles against MLIR 18, parses and
+round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
+including negative cases for shape mismatch, accumulator saturation, and same-space copies).
+
+**Declared, not implemented.** The 8-pass lowering pipeline is registered and runnable, but
+the pass bodies are `TODO` stubs — nothing compiles a real model end to end yet. See
 [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Quickstart
@@ -45,7 +48,7 @@ immediately:
 cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
-./build/tools/cim-bench/cim-bench run --target erbium-8t --out results.json
+./build/bin/cim-bench run --target erbium-8t --out results.json
 ```
 
 That prints the reprogramming cost of each benchmark workload under each eviction policy.
@@ -54,20 +57,24 @@ On `erbium-8t`, `mm-fit` programs its 8 tiles once and then reprograms nothing a
 47–64% against an LRU baseline — see [`bench/workloads/README.md`](bench/workloads/README.md)
 for the table and its caveats.
 
-To build the MLIR layer as well (dialect, lowering passes, `cim-opt`), point CMake at your
-own LLVM/MLIR build — this project does not vendor or build LLVM. Tested against LLVM 18.x:
+To build the MLIR layer as well (dialect, lowering passes, `cim-opt`), you need MLIR 18.
+This project does not vendor or build LLVM. On Debian/Ubuntu the distro packages are
+enough — no from-source LLVM build required:
 
 ```sh
+sudo apt-get install llvm-18-dev libmlir-18-dev mlir-18-tools
+pip install lit    # for the FileCheck suite
+
 cmake -S . -B build -G Ninja \
-  -DMLIR_DIR=/path/to/llvm-install/lib/cmake/mlir \
-  -DLLVM_DIR=/path/to/llvm-install/lib/cmake/llvm \
+  -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
+  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+  -DLLVM_EXTERNAL_LIT="$(which lit)" \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target cim-opt
-cmake --build build --target check-cim-opt   # FileCheck test suite
+cmake --build build
+cmake --build build --target check-cim-opt   # dialect FileCheck suite
 ```
 
-See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for a full from-source LLVM/MLIR
-build if you don't already have one.
+If you have your own LLVM/MLIR build, point `MLIR_DIR` and `LLVM_DIR` at it instead.
 
 ## Repository layout
 

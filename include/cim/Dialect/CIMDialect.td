@@ -33,14 +33,16 @@ def CIM_Dialect : Dialect {
 class CIM_Op<string mnemonic, list<Trait> traits = []> :
     Op<CIM_Dialect, mnemonic, traits>;
 
-class CIM_Type<string name, string mnemonic, list<Trait> traits = []> :
+// The parameter is deliberately not called `mnemonic`: TableGen treats
+// `let mnemonic = mnemonic` as recursive self-assignment and rejects it.
+class CIM_Type<string name, string typeMnemonic, list<Trait> traits = []> :
     TypeDef<CIM_Dialect, name, traits> {
-  let mnemonic = mnemonic;
+  let mnemonic = typeMnemonic;
 }
 
-class CIM_Attr<string name, string mnemonic, list<Trait> traits = []> :
+class CIM_Attr<string name, string attrMnemonic, list<Trait> traits = []> :
     AttrDef<CIM_Dialect, name, traits> {
-  let mnemonic = mnemonic;
+  let mnemonic = attrMnemonic;
 }
 
 #endif // CIM_DIALECT

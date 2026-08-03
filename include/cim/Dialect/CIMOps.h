@@ -4,6 +4,7 @@
 
 #include "cim/Dialect/CIMDialect.h"
 #include "cim/Dialect/CIMTypes.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"

@@ -2,6 +2,7 @@
 #ifndef CIM_TRANSFORMS_PASSES_H
 #define CIM_TRANSFORMS_PASSES_H
 
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include <memory>
 
