@@ -16,6 +16,7 @@ if(CIM_ENABLE_MLIR)
   set(CIM_TEST_DEPENDS
     FileCheck
     cim-opt
+    cim-run
   )
 
   add_lit_testsuite(check-cim-opt "Running the cim-mlir dialect tests"

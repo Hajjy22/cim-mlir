@@ -3,4 +3,5 @@ add_subdirectory(cim-bench)
 
 if(CIM_ENABLE_MLIR)
   add_subdirectory(cim-opt)
+  add_subdirectory(cim-run)
 endif()

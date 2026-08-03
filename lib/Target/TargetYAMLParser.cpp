@@ -20,6 +20,8 @@
 #include "cim/Target/TargetSpec.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -149,10 +151,26 @@ struct Reader {
   }
 
   bool toUInt(const std::string &path, const std::string &text, uint32_t &out) {
+    // strtoul silently *negates* a leading '-' and saturates on overflow, so
+    // `count: -1` would arrive as 4294967295 and sail past the "must be
+    // greater than zero" check below. Both are rejected here instead: a
+    // target file that describes four billion tiles because someone typed a
+    // minus sign is worse than one that fails to load.
+    if (!text.empty() && (text[0] == '-' || text[0] == '+')) {
+      errors.push_back("field '" + path + "': '" + text +
+                       "' is not a non-negative integer");
+      return false;
+    }
+    errno = 0;
     char *end = nullptr;
     const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
     if (end == text.c_str() || *end != '\0') {
       errors.push_back("field '" + path + "': '" + text + "' is not an integer");
+      return false;
+    }
+    if (errno == ERANGE || parsed > 4294967295UL) {
+      errors.push_back("field '" + path + "': '" + text +
+                       "' does not fit in 32 bits");
       return false;
     }
     out = static_cast<uint32_t>(parsed);
@@ -164,6 +182,14 @@ struct Reader {
     const double parsed = std::strtod(text.c_str(), &end);
     if (end == text.c_str() || *end != '\0') {
       errors.push_back("field '" + path + "': '" + text + "' is not a number");
+      return false;
+    }
+    // strtod accepts "inf" and "nan". Either one propagates silently through
+    // every energy and latency sum in the cost report, turning a typo into a
+    // results file full of NaN rather than into a diagnostic.
+    if (!std::isfinite(parsed)) {
+      errors.push_back("field '" + path + "': '" + text +
+                       "' is not a finite number");
       return false;
     }
     out = parsed;

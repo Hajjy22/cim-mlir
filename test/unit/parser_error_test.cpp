@@ -138,6 +138,24 @@ CIM_TEST(parser_rejects_every_malformed_document) {
        replaced("  persistent: true", "  persistent: maybe"),
        "not a boolean"},
 
+      // --- scalars that a naive strtoul/strtod would accept ---
+      // Found while building the PyYAML differential (test/python): each of
+      // these used to parse, and each produced a plausible-looking number
+      // that no downstream check could catch.
+      {"negative count", replaced("  count: 4", "  count: -1"),
+       "non-negative"},
+      {"explicitly signed count", replaced("  count: 4", "  count: +4"),
+       "non-negative"},
+      {"count beyond 32 bits",
+       replaced("  count: 4", "  count: 4294967296"), "32 bits"},
+      {"count far beyond any integer",
+       replaced("  count: 4", "  count: 99999999999999999999999"), "32 bits"},
+      {"infinite energy",
+       replaced("    energy_pj: 2000", "    energy_pj: inf"), "finite"},
+      {"nan bandwidth",
+       replaced("    bandwidth_gbps: 8.0", "    bandwidth_gbps: nan"),
+       "finite"},
+
       // --- semantically impossible devices ---
       // These parse cleanly but describe hardware that cannot exist.
       // Accepting them would produce confidently wrong cost numbers, which

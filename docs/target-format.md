@@ -79,13 +79,67 @@ against real hardware before the number appears in a paper. Until then,
 `provenance: estimated` on the Erbium file is doing exactly the job it
 exists for.
 
+## The supported YAML subset
+
+`lib/Target/TargetYAMLParser.cpp` is a hand-rolled reader, not a YAML
+implementation. Making the target file readable without an LLVM or libyaml
+dependency is worth the tradeoff, but it means the supported grammar has to
+be written down rather than inherited.
+
+**Supported:** nested block mappings of scalars, `#` comments (at the start
+of a line or after whitespace), blank lines, any consistent indentation
+width, any key order, and single- or double-quoted scalars.
+
+**Not supported, and rejected rather than guessed at:** sequences, flow
+collections (`{a: 1}`, `[1, 2]`), anchors and aliases, multi-line scalars,
+tabs for indentation, and documents that are not a single mapping.
+
+**Scalar forms.** Numbers are plain decimal. The reader rejects:
+
+| Form | Reason |
+| --- | --- |
+| `count: -1`, `count: +4` | `strtoul` negates a leading minus, so `-1` used to arrive as 4294967295 and pass the "must be greater than zero" check |
+| `count: 4294967296` | silent truncation to 32 bits produces a plausible wrong number |
+| `energy_pj: inf`, `nan` | accepted by `strtod`, and then every downstream sum is `inf`/`NaN` with no diagnostic |
+| `persistent: yes` | only `true`/`false` are booleans here |
+
+**Known divergences from PyYAML.** These are YAML 1.1 forms that a full
+implementation resolves differently. They are outside the subset and are
+pinned by `test/python/test_yaml_differential.py` so the list cannot grow
+silently:
+
+| Form | PyYAML (YAML 1.1) | This reader |
+| --- | --- | --- |
+| `012` | octal 10 | decimal 12 |
+| `1_0` | 10 (digit separator) | rejected |
+| `1e3` | the string `"1e3"` | the number 1000 |
+| `yes` / `no` / `on` / `off` | booleans | rejected |
+
+No shipped target file uses any of them, and a test enforces that.
+
+## How the reader is verified
+
+- `test/unit/parser_error_test.cpp` — a rejection table, one row per error
+  branch, each asserting the diagnostic names the actual problem.
+- `test/python/test_yaml_differential.py` — differential against PyYAML plus
+  an independently written schema (`test/python/schema.py`). It checks the
+  shipped files, hand-written mutations, and hypothesis-generated documents
+  that vary field presence, key order, indentation width, comments and
+  quoting. Both readers must agree on accept/reject *and* on every field
+  value after schema coercion.
+
+Run it with `pytest test/python` after a build (it drives
+`cim-bench dump-target`, so a build directory must exist).
+
 ## Adding a new target
 
 1. Copy `targets/erbium-8t.yaml` as a starting point.
 2. Fill in every field with real numbers where you have them; mark
    anything you don't with `provenance: estimated` at minimum, and note it
    inline per-field if provenance varies within the file.
-3. Validate it parses: `python3 -c "import yaml; yaml.safe_load(open('targets/your-target.yaml'))"`.
+3. Validate it against the real reader — not just against a YAML parser,
+   which says nothing about whether this repository can read it:
+   `cim-bench dump-target --target-file targets/your-target.yaml`.
 4. `cimrt_open("your-target", ...)` resolves to `targets/your-target.yaml`
    relative to the working directory in the v0.1 runtime (see the TODO in
    `runtime/src/simulator/simulator.cpp` about a real search path).

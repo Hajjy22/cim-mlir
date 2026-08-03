@@ -1,0 +1,13 @@
+# Differential-test dependencies (test/python).
+#
+# Deliberately minimal, and deliberately not required to build or to run the
+# C++ test suites -- these tests are an additional oracle, not the gate.
+#
+# PyYAML is the oracle for the target reader; numpy is the oracle for the
+# compiled pipeline's arithmetic. Both are here because they were written by
+# other people for other reasons, which is the only property that makes a
+# differential test worth running.
+pytest>=7.0
+PyYAML>=5.4
+numpy>=1.21
+hypothesis>=6.0

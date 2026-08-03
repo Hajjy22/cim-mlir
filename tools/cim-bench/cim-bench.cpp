@@ -47,7 +47,10 @@ struct Options {
 void printUsage() {
   std::cout
       << "cim-bench: cim-mlir benchmark harness\n\n"
-         "usage: cim-bench run --target <name> [--out <path>] [--inferences <n>]\n\n"
+         "usage: cim-bench run --target <name> [--out <path>] [--inferences <n>]\n"
+         "       cim-bench dump-target --target <name>\n\n"
+         "  dump-target        print the parsed target as canonical key=value\n"
+         "                     lines, for differential-testing the reader\n"
          "  --target <name>    target name; resolved to targets/<name>.yaml\n"
          "  --target-file <p>  explicit path to a target file (overrides --target)\n"
          "  --out <path>       results JSON destination (default results.json)\n"
@@ -64,9 +67,9 @@ bool parseArgs(int argc, char **argv, Options &opts) {
     printUsage();
     return false;
   }
-  if (opts.command != "run") {
+  if (opts.command != "run" && opts.command != "dump-target") {
     std::cerr << "cim-bench: unknown command '" << opts.command
-              << "' (only 'run' is implemented)\n";
+              << "' (expected 'run' or 'dump-target')\n";
     return false;
   }
 
@@ -163,6 +166,16 @@ std::string utcTimestamp() {
   return buf;
 }
 
+const char *targetClassName(TargetClass c) {
+  switch (c) {
+  case TargetClass::NearMemory: return "near_memory";
+  case TargetClass::DigitalCIM: return "digital_cim";
+  case TargetClass::AnalogCIM: return "analog_cim";
+  case TargetClass::DPU: return "dpu";
+  }
+  return "unknown";
+}
+
 const char *provenanceName(Provenance p) {
   switch (p) {
   case Provenance::Measured: return "measured";
@@ -197,6 +210,44 @@ int main(int argc, char **argv) {
   if (!parseTargetSpecFromFile(opts.targetFile, spec, &error)) {
     std::cerr << "cim-bench: " << error << "\n";
     return 1;
+  }
+
+  if (opts.command == "dump-target") {
+    // Canonical, sorted, one field per line. Deliberately not JSON: the
+    // point is a format a differential test can compare field by field
+    // without a parser of its own being a source of disagreement.
+    std::printf("name=%s\n", spec.name.c_str());
+    std::printf("class=%s\n", targetClassName(spec.targetClass));
+    std::printf("provenance=%s\n", provenanceName(spec.provenance));
+    std::printf("tiles.count=%u\n", spec.tiles.count);
+    std::printf("tiles.rows=%u\n", spec.tiles.rows);
+    std::printf("tiles.cols=%u\n", spec.tiles.cols);
+    std::printf("tiles.weight_dtype=%s\n", spec.tiles.weightDtype.c_str());
+    std::printf("tiles.activation_dtype=%s\n",
+                spec.tiles.activationDtype.c_str());
+    std::printf("tiles.accumulator_dtype=%s\n",
+                spec.tiles.accumulatorDtype.c_str());
+    std::printf("tiles.persistent=%s\n", spec.tiles.persistent ? "true" : "false");
+    std::printf("tiles.persistence=%s\n", spec.tiles.persistence.c_str());
+    std::printf("costs.program.latency_ns=%.10g\n", spec.costs.program.latencyNs);
+    std::printf("costs.program.energy_pj=%.10g\n", spec.costs.program.energyPj);
+    std::printf("costs.mvm.latency_ns=%.10g\n", spec.costs.mvm.latencyNs);
+    std::printf("costs.mvm.energy_pj=%.10g\n", spec.costs.mvm.energyPj);
+    std::printf("costs.transfer.bandwidth_gbps=%.10g\n",
+                spec.costs.transfer.bandwidthGbps);
+    std::printf("costs.transfer.energy_pj_per_byte=%.10g\n",
+                spec.costs.transfer.energyPjPerByte);
+    std::printf("costs.standby_leakage_uw_per_tile=%.10g\n",
+                spec.costs.standbyLeakageUwPerTile);
+    std::printf("precision.output_effective_bits=%u\n",
+                spec.precision.outputEffectiveBits);
+    std::printf("capabilities.double_buffer_program=%s\n",
+                spec.capabilities.doubleBufferProgram ? "true" : "false");
+    std::printf("capabilities.partial_sum_in_place=%s\n",
+                spec.capabilities.partialSumInPlace ? "true" : "false");
+    std::printf("capabilities.autonomous_control=%s\n",
+                spec.capabilities.autonomousControl ? "true" : "false");
+    return 0;
   }
 
   if (spec.provenance != Provenance::Measured) {

@@ -17,6 +17,6 @@ config.excludes = ["lit.cfg.py", "lit.site.cfg.py", "CMakeLists.txt",
 
 tool_dirs = [config.cim_tools_dir, config.llvm_tools_dir]
 # `not` is needed by tests that assert a pass fails.
-tools = ["cim-opt", "FileCheck", "not"]
+tools = ["cim-opt", "cim-run", "FileCheck", "not"]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

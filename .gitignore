@@ -20,3 +20,9 @@ cmake_install.cmake
 third_party/llvm-project/
 llvm-install/
 llvm-build/
+
+# Python differential tests (test/python)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
