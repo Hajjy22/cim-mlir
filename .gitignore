@@ -1,0 +1,22 @@
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.log
+.cache/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local LLVM checkouts used to satisfy MLIR_DIR/LLVM_DIR — never commit these.
+third_party/llvm-project/
+llvm-install/
+llvm-build/

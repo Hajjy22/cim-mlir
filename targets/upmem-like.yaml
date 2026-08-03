@@ -1,0 +1,43 @@
+# targets/upmem-like.yaml
+#
+# Placeholder DPU-class target modeled loosely on UPMEM's PIM DIMM (a wide,
+# programmable MVM per spec Sec. 3.2). Every number below is a placeholder,
+# not measured — see docs/target-format.md.
+
+name: upmem-like
+description: Placeholder UPMEM-style DPU-on-DIMM target
+version: 0.1
+
+class: dpu
+
+provenance: estimated  # placeholder, not measured — see docs/target-format.md
+
+tiles:
+  count: 64            # one "tile" modeled per DPU core, plausible placeholder
+  rows: 512
+  cols: 512
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: false
+  persistence: volatile
+
+costs:
+  program:
+    latency_ns: 2000    # DRAM-backed reload, cheaper than nonvolatile write
+    energy_pj: 60000
+  mvm:
+    latency_ns: 900
+    energy_pj: 5200
+  transfer:
+    bandwidth_gbps: 6.4  # DIMM-local bandwidth is the bottleneck resource
+    energy_pj_per_byte: 6.8
+  standby_leakage_uw_per_tile: 3.0
+
+precision:
+  output_effective_bits: 8
+
+capabilities:
+  double_buffer_program: false
+  partial_sum_in_place: false
+  autonomous_control: true   # DPU cores execute autonomously per spec 3.1

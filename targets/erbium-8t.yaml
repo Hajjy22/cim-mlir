@@ -1,0 +1,45 @@
+# targets/erbium-8t.yaml
+name: erbium-8t
+description: Erbium near-memory RISC-V + iRAM cluster, 8 tiles
+version: 0.1
+
+class: near_memory        # one of: near_memory | digital_cim | analog_cim | dpu
+
+# Provenance discipline (spec Sec. 7): every number in this file must carry
+# a source. For v0.1 all Erbium numbers below are ESTIMATED, not measured —
+# say so loudly in every plot generated from this file.
+provenance: estimated
+
+tiles:
+  count: 8
+  rows: 256
+  cols: 256
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: true
+  persistence: nonvolatile
+
+costs:
+  # Weight programming — the expensive asymmetric operation
+  program:
+    latency_ns: 12000
+    energy_pj: 480000
+  # One 256x256 by 256x1 matrix-vector multiply
+  mvm:
+    latency_ns: 640
+    energy_pj: 3100
+  # Per-byte host <-> near transfer
+  transfer:
+    bandwidth_gbps: 12.8
+    energy_pj_per_byte: 4.2
+  # Standby - the non-volatile advantage
+  standby_leakage_uw_per_tile: 0.0
+
+precision:
+  output_effective_bits: 8      # 8 = lossless digital; < 8 models ADC on analog
+
+capabilities:
+  double_buffer_program: false  # can program tile i+1 while computing on tile i
+  partial_sum_in_place: true
+  autonomous_control: true      # host-less execution supported

@@ -1,0 +1,45 @@
+# targets/generic-digital-cim.yaml
+#
+# Placeholder second-target-class file (spec M4: "add a second target file
+# of a different class, proving retargetability"). Digital SRAM bitline
+# macro: compute happens at the sense amps, not beside the bank like
+# Erbium's near-memory model. Every number below is a placeholder, not
+# measured — see docs/target-format.md.
+
+name: generic-digital-cim
+description: Placeholder digital SRAM CIM macro (sense-amp compute, not near-memory)
+version: 0.1
+
+class: digital_cim
+
+provenance: estimated  # placeholder, not measured — see docs/target-format.md
+
+tiles:
+  count: 16
+  rows: 128
+  cols: 128
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: false
+  persistence: volatile
+
+costs:
+  program:
+    latency_ns: 800        # SRAM reload is far cheaper than nonvolatile write
+    energy_pj: 20000
+  mvm:
+    latency_ns: 120
+    energy_pj: 900
+  transfer:
+    bandwidth_gbps: 25.6
+    energy_pj_per_byte: 2.1
+  standby_leakage_uw_per_tile: 4.5   # volatile SRAM leaks; no nonvolatile advantage
+
+precision:
+  output_effective_bits: 8
+
+capabilities:
+  double_buffer_program: true
+  partial_sum_in_place: true
+  autonomous_control: false   # host-driven offload, not host-less
