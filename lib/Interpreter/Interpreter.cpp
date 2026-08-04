@@ -80,8 +80,8 @@ bool isDeviceSpace(MemRefType type) {
 
 class Interpreter {
 public:
-  Interpreter(const InterpreterOptions &options, llvm::raw_ostream &out)
-      : options(options), out(out) {}
+  Interpreter(const InterpreterOptions &opts, llvm::raw_ostream &stream)
+      : options(opts), out(stream) {}
 
   ~Interpreter() {
     for (auto &entry : devices)

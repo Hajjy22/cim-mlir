@@ -65,6 +65,13 @@ LogicalResult TileType::verify(function_ref<InFlightDiagnostic()> emitError,
   for (int64_t dim : shape)
     if (dim <= 0)
       return emitError() << "cim.tile dimensions must be positive";
+  // A tile holds integer weights: the v0.1 contract (spec Sec. 2) is INT8
+  // matmul, and every cost number in a target file is quoted for an integer
+  // MVM. !cim.tile<4x4xf32> used to verify -- clang-tidy noticed that this
+  // verifier ignored its element-type argument entirely.
+  if (!llvm::isa<IntegerType>(elementType))
+    return emitError() << "cim.tile element type must be an integer type, got "
+                       << elementType;
   return success();
 }
 

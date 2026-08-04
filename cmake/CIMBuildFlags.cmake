@@ -13,6 +13,23 @@ set(CIM_SANITIZER "" CACHE STRING
 
 add_library(cim_build_flags INTERFACE)
 
+# Attach the flags to a cim target.
+#
+# `target_link_libraries(<lib> PUBLIC cim_build_flags)` is not enough for
+# anything built with add_mlir_library / add_mlir_dialect_library. Those
+# compile the sources into a separate OBJECT library named obj.<lib> and make
+# <lib> a thin wrapper around it, so usage requirements attached to the
+# wrapper never reach the compiler. The MLIR half of this project was
+# silently exempt from -Werror, from the sanitizers and from coverage
+# instrumentation until this function existed -- and it looked instrumented,
+# because the wrapper accepted the flags without complaint.
+function(cim_apply_build_flags target)
+  target_link_libraries(${target} PUBLIC cim_build_flags)
+  if(TARGET obj.${target})
+    target_link_libraries(obj.${target} PUBLIC cim_build_flags)
+  endif()
+endfunction()
+
 if(CIM_ENABLE_WERROR)
   target_compile_options(cim_build_flags INTERFACE
     -Wall -Wextra -Wshadow -Wno-unused-parameter -Werror)

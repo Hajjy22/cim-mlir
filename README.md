@@ -86,6 +86,39 @@ cmake --build build --target check-cim-opt   # dialect FileCheck suite
 
 If you have your own LLVM/MLIR build, point `MLIR_DIR` and `LLVM_DIR` at it instead.
 
+## Verification
+
+A compiler that produces plausible-looking IR is worth nothing; the question is
+always whether the numbers are right. Six suites answer different parts of that,
+and CI runs all of them.
+
+| Suite | What it would catch that nothing else does |
+| --- | --- |
+| `ctest` — `cim-unit-tests` | Placement, cost model, target reader and `cimrt` error branches. Includes a property test asserting Belady placement equals exhaustive-search optimal over ~4700 instances, and a mutation test of the schedule validator. |
+| `ctest` — `cim-mlir-tests` | Runs the real pass pipeline and then *executes* the emitted IR through the interpreter and `cimrt`, comparing against a C++ reference. Shapes matching is not arithmetic matching. |
+| `check-cim-opt` (lit/FileCheck) | Dialect round-tripping, verifier rejections, pass output structure, and `cim-run`'s refusals. |
+| `pytest test/python` | Differentials against oracles written by other people: the target reader vs PyYAML, and the compiled pipeline vs numpy. |
+| ASan + UBSan, valgrind | Memory and undefined-behaviour bugs that produce correct answers today. |
+| gcovr, clang-tidy, cppcheck | Untested branches and defects no test was written for. |
+
+```sh
+# Everything, on a build configured as above
+ctest --test-dir build --output-on-failure
+cmake --build build --target check-cim-opt
+pip install -r test/python/requirements.txt && pytest test/python
+
+# Instrumented builds (all default OFF; a release build is unaffected)
+cmake -S . -B build-asan -G Ninja -DCIM_SANITIZER=address,undefined \
+  -DCIM_ENABLE_WERROR=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=Debug
+```
+
+Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
+`lib/Interpreter` and `runtime/src` (currently 90.6% / 85.3%). `lib/Dialect` is
+mostly TableGen output and `lib/Transforms` is still five-eighths empty stubs,
+so both are reported and not gated — a threshold there would measure how many
+stubs exist rather than how well anything is tested.
+
 ## Repository layout
 
 The project splits in two: a core with no LLVM/MLIR dependency, and the MLIR layer on top
@@ -100,11 +133,17 @@ include/cim/Transforms/  ODS pass declarations               (MLIR)
 lib/Placement/           Belady/LRU/FIFO placement, cost model, workloads
 lib/Target/              target file reader
 lib/Dialect/, lib/Transforms/   dialect and lowering-pass implementations
+lib/Interpreter/         executes the emitted IR against cimrt (MLIR)
 runtime/                 cimrt C API: functional simulator, hardware backends
 tools/cim-bench/         benchmark harness   (core, no MLIR)
 tools/cim-opt/           the MLIR opt driver (MLIR)
+tools/cim-run/           runs a compiled module and prints its results (MLIR)
 test/unit/               unit tests for the core
+test/mlir/               numerical end-to-end test: compile, execute, compare
 test/Dialect/            FileCheck tests for every dialect op
+test/Transforms/         FileCheck tests for the lowering passes
+test/Run/                FileCheck tests for cim-run
+test/python/             differentials against PyYAML and numpy
 targets/                 hardware target description YAML files
 docs/                    abstraction model, dialect reference, target format, roadmap
 bench/                   benchmark workloads and plot scripts

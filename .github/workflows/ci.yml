@@ -4,10 +4,22 @@ on:
   push:
   pull_request:
 
+# Job layout follows the two-layer split in the source tree. The MLIR-free
+# core builds in seconds, so its jobs (including the slow instrumented ones)
+# stay cheap and report a broken algorithm immediately. The MLIR jobs install
+# Ubuntu's distro MLIR 18 rather than building LLVM from source: the
+# from-source route costs 45-90 minutes on a cold cache and buys nothing,
+# because the dialect only uses stable public MLIR APIs.
+
+env:
+  MLIR_CMAKE_ARGS: >-
+    -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir
+    -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+
 jobs:
-  # The core (placement engine, target reader, runtime, cim-bench) has no
-  # LLVM/MLIR dependency, so it builds and tests in seconds. Running it as a
-  # separate job means a broken algorithm is reported immediately.
+  # ---------------------------------------------------------------------
+  # Core: placement engine, target reader, runtime, cim-bench
+  # ---------------------------------------------------------------------
   core:
     runs-on: ubuntu-latest
     steps:
@@ -16,8 +28,12 @@ jobs:
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
+      # -Werror is on here and nowhere else in the release jobs: warnings are
+      # cheapest to fix where the build is fastest.
       - name: Configure (core only, no MLIR)
-        run: cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF -DCMAKE_BUILD_TYPE=Release
+        run: |
+          cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DCIM_ENABLE_WERROR=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -25,14 +41,18 @@ jobs:
       - name: Unit tests
         run: ctest --test-dir build --output-on-failure
 
-      - name: Benchmark smoke run
+      - name: Benchmark run
         run: |
-          ./build/bin/cim-bench run --target erbium-8t \
-            --out results-erbium-8t.json --inferences 100
-          ./build/bin/cim-bench run --target generic-digital-cim \
-            --out results-generic-digital-cim.json --inferences 100
-          ./build/bin/cim-bench run --target upmem-like \
-            --out results-upmem-like.json --inferences 100
+          for target in erbium-8t generic-digital-cim upmem-like; do
+            ./build/bin/cim-bench run --target "$target" \
+              --out "results-$target.json" --inferences 100
+          done
+
+      # Checking the exit code proves the tool did not crash and nothing
+      # else. A results file with zero workloads, or one where optimal
+      # placement lost to LRU, would have passed.
+      - name: Check benchmark results
+        run: python3 bench/check_results.py results-*.json
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -40,25 +60,59 @@ jobs:
           name: benchmark-results
           path: results-*.json
 
-  lint-targets:
+  core-asan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate target YAML files
-        run: |
-          python3 -c "
-          import glob, yaml
-          for f in sorted(glob.glob('targets/*.yaml')):
-              with open(f) as fh:
-                  yaml.safe_load(fh)
-              print(f'OK: {f}')
-          "
 
-  # The MLIR layer: dialect, lowering passes, cim-opt, and the FileCheck
-  # suite. Ubuntu ships MLIR 18 as a distro package, so this installs it
-  # rather than building LLVM from source -- the from-source route costs
-  # 45-90 minutes on a cold cache and buys nothing here, because the dialect
-  # only uses stable public MLIR APIs.
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # -fno-sanitize-recover=all is set by cmake/CIMBuildFlags.cmake, so a
+      # report fails the test rather than printing and carrying on.
+      - name: Configure with ASan + UBSan
+        run: |
+          cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCIM_SANITIZER=address,undefined -DCIM_ENABLE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests under sanitizers
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  core-valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build valgrind
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCIM_ENABLE_MLIR=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Valgrind rather than LeakSanitizer: the MLIR-linked binaries have to
+      # run with detect_leaks=0 (MLIR leaks its ManagedStatics and cl::opts
+      # by design), so the core is the only place a leak check means
+      # anything. Only `definite` kinds fail -- `still reachable` at exit is
+      # not a bug worth failing a build over.
+      - name: Unit tests under valgrind
+        run: |
+          valgrind --error-exitcode=9 --leak-check=full \
+            --errors-for-leak-kinds=definite -q ./build/bin/cim-unit-tests
+
+  # ---------------------------------------------------------------------
+  # MLIR layer: dialect, passes, interpreter, cim-opt, cim-run
+  # ---------------------------------------------------------------------
   mlir:
     runs-on: ubuntu-latest
     steps:
@@ -73,17 +127,210 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja \
-            -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
-            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+          cmake -S . -B build -G Ninja $MLIR_CMAKE_ARGS \
             -DLLVM_EXTERNAL_LIT="$(which lit)" \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release -DCIM_ENABLE_WERROR=ON
 
       - name: Build everything
         run: cmake --build build -j"$(nproc)"
 
-      - name: Core unit tests
+      - name: Unit tests (core + numerical end-to-end)
         run: ctest --test-dir build --output-on-failure
 
-      - name: Dialect tests (FileCheck)
+      - name: Dialect and run tests (FileCheck)
         run: cmake --build build --target check-cim-opt
+
+  mlir-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR 18 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            llvm-18-dev libmlir-18-dev mlir-18-tools
+          pip install lit
+
+      - name: Configure with ASan + UBSan
+        run: |
+          cmake -S . -B build -G Ninja $MLIR_CMAKE_ARGS \
+            -DLLVM_EXTERNAL_LIT="$(which lit)" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCIM_SANITIZER=address,undefined -DCIM_ENABLE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # detect_leaks=0 is not a workaround for our leaks: MLIR intentionally
+      # leaks ManagedStatic and cl::opt storage at exit. Per-frame
+      # suppressions were tried and are unmaintainable; core-valgrind covers
+      # the code we actually own.
+      - name: Tests under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: |
+          ctest --test-dir build --output-on-failure
+          cmake --build build --target check-cim-opt
+
+  # ---------------------------------------------------------------------
+  # Differential tests (test/python)
+  # ---------------------------------------------------------------------
+  #
+  # Replaces the old lint-targets job, which ran yaml.safe_load over
+  # targets/*.yaml. That proved the files are valid YAML and said nothing
+  # about the hand-rolled reader that consumes them. This runs both readers
+  # against each other, and runs the compiled pipeline against numpy.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR 18 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            llvm-18-dev libmlir-18-dev mlir-18-tools
+
+      - name: Install Python dependencies
+        run: pip install -r test/python/requirements.txt
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja $MLIR_CMAKE_ARGS \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # More hypothesis examples than the local default: CI can afford the
+      # subprocess round trips, and generated documents are the layer most
+      # likely to turn up something a hand-written case would not.
+      - name: Differential tests
+        env:
+          CIM_HYPOTHESIS_EXAMPLES: "200"
+          CIM_RANDOM_CASES: "60"
+        run: python3 -m pytest test/python -v
+
+  # ---------------------------------------------------------------------
+  # Coverage and static analysis
+  # ---------------------------------------------------------------------
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR 18 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            llvm-18-dev libmlir-18-dev mlir-18-tools
+          pip install lit gcovr
+          pip install -r test/python/requirements.txt
+
+      # A clean build directory is not optional: stale .gcda files from a
+      # different binary layout make gcov emit silently wrong numbers rather
+      # than an error.
+      - name: Configure with coverage instrumentation
+        run: |
+          rm -rf build
+          cmake -S . -B build -G Ninja $MLIR_CMAKE_ARGS \
+            -DLLVM_EXTERNAL_LIT="$(which lit)" \
+            -DCMAKE_BUILD_TYPE=Debug -DCIM_ENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Every suite, because they cover different code: the unit tests reach
+      # the core's error branches, lit and the differentials are the only
+      # things that execute cim-opt and cim-run as processes.
+      - name: Run every test suite
+        env:
+          CIM_BUILD_DIR: ${{ github.workspace }}/build
+        run: |
+          ctest --test-dir build --output-on-failure
+          cmake --build build --target check-cim-opt
+          python3 -m pytest test/python -q
+          ./build/bin/cim-bench run --target erbium-8t --out /dev/null \
+            --inferences 50
+
+      # --exclude-throw-branches and --exclude-unreachable-branches are load
+      # bearing, not cosmetic. Without them every std::string and std::vector
+      # call contributes an unreachable throw branch, the whole codebase
+      # reads around 55%, and the threshold below becomes noise rather than
+      # a signal.
+      #
+      # Gated: the code whose behaviour these tests are about. Reported but
+      # not gated: lib/Dialect (mostly TableGen-generated) and lib/Transforms
+      # (five of eight passes are empty stubs, so a threshold there measures
+      # how many stubs exist).
+      - name: Coverage report (gated directories)
+        run: |
+          gcovr --root . \
+            --exclude-throw-branches --exclude-unreachable-branches \
+            --filter 'lib/Placement/' --filter 'lib/Target/' \
+            --filter 'lib/Interpreter/' --filter 'runtime/src/' \
+            --fail-under-line 85 --fail-under-branch 78 \
+            --print-summary --txt --html-details coverage-gated.html
+
+      - name: Coverage report (whole project, informational)
+        if: always()
+        run: |
+          gcovr --root . \
+            --exclude-throw-branches --exclude-unreachable-branches \
+            --filter 'lib/' --filter 'runtime/src/' \
+            --print-summary --txt --html-details coverage-all.html
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage-*.html*
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR 18, clang and cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cppcheck \
+            llvm-18-dev libmlir-18-dev mlir-18-tools \
+            clang-18 clang-tidy-18
+
+      # Configured with clang, not GCC: LLVM's CMake adds GCC-only flags
+      # (-fno-lifetime-dse) that clang-tidy then rejects outright when it
+      # replays the compile command from compile_commands.json.
+      - name: Configure with clang
+        run: |
+          cmake -S . -B build -G Ninja $MLIR_CMAKE_ARGS \
+            -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      # clang-tidy needs the TableGen-generated headers to exist before it
+      # can parse anything that includes them.
+      - name: Build (generates the .inc headers clang-tidy needs)
+        run: cmake --build build -j"$(nproc)"
+
+      - name: clang-tidy
+        run: |
+          run-clang-tidy-18 -p build -quiet -warnings-as-errors='*' \
+            -j"$(nproc)" \
+            $(git ls-files | grep -E '^(lib|runtime|tools)/.*\.cpp$')
+
+      # cppcheck sees only the MLIR-free core. Pointed at the MLIR layer it
+      # cannot follow LLVM's casting machinery and reports null-dereferences
+      # on every dyn_cast, which is noise, not findings.
+      #
+      # No suppressions file: there is nothing to suppress today, and
+      # --inline-suppr means any future suppression is written next to the
+      # code it excuses, with its reason, rather than in a list nobody reads.
+      - name: cppcheck (MLIR-free core only)
+        run: |
+          cppcheck --error-exitcode=1 --enable=warning,performance,portability \
+            --inline-suppr --std=c++17 --quiet --check-level=exhaustive \
+            -I include -I runtime/include \
+            lib/Placement lib/Target runtime/src

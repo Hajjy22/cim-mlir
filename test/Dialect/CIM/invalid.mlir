@@ -131,3 +131,14 @@ func.func @tile_must_be_2d(%t: !cim.tile<256xi8>) {
 func.func @tile_dims_must_be_positive(%t: !cim.tile<0x256xi8>) {
   return
 }
+
+// -----
+
+// A tile holds integer weights. This verified until the element-type check
+// was added -- the verifier took the argument and never looked at it, so a
+// float tile produced structurally valid IR for a device that cannot hold
+// one.
+// expected-error @+1 {{cim.tile element type must be an integer type}}
+func.func @tile_element_type_must_be_integer(%t: !cim.tile<4x4xf32>) {
+  return
+}

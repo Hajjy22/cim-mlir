@@ -1,0 +1,79 @@
+# clang-tidy for cim-mlir.
+#
+# Selected for signal, not for coverage of the check list. Every check
+# enabled here has to be one whose warnings are worth acting on in this
+# codebase; a config that fires on idiomatic MLIR trains everyone to ignore
+# the output, which is worse than not running it.
+#
+# Deliberately NOT enabled:
+#
+#   readability-identifier-naming
+#     MLIR uses lowerCamelCase locals and UpperCamelCase types, LLVM style.
+#     Enabling this means hundreds of renames and zero bugs found.
+#
+#   modernize-use-trailing-return-type, modernize-avoid-c-arrays
+#     Style preferences that would rewrite the codebase without changing
+#     what it does.
+#
+#   cppcoreguidelines-*, hicpp-*
+#     Assume exceptions, RTTI and owning smart pointers everywhere. MLIR is
+#     built -fno-rtti -fno-exceptions and hands out raw Operation*, so these
+#     fire constantly on code that is correct by MLIR's own rules.
+#
+#   bugprone-easily-swappable-parameters
+#     Fires on every (rows, cols) and (latency, energy) pair in the cost
+#     model. The signature shapes are inherent to the domain.
+#
+#   misc-non-private-member-variables-in-classes
+#     Fires on every ODS-generated adaptor and on the plain data structs
+#     (TargetSpec, PlacementResult) that are meant to be aggregates.
+#
+#   bugprone-exception-escape
+#     The C runtime entry points in runtime/src are noexcept by ABI, and
+#     the check cannot see that the C++ they call does not throw.
+#
+#   clang-analyzer-core.StackAddressEscape
+#     Fires inside MLIR's own TypeSupport.h/AttributeSupport.h on the lambda
+#     that addTypes/addAttributes hands to the storage uniquer. The analyzer
+#     cannot see that the uniquer copies it, and HeaderFilterRegex does not
+#     suppress analyzer diagnostics reported at a header location. The other
+#     clang-analyzer checks stay on.
+#
+#   misc-const-correctness
+#     43 findings, all of the form "this local could be const". Every one is
+#     a style preference on a local variable; none can catch a bug, because
+#     a local that is never reassigned behaves identically either way. It
+#     fails the bar the rest of this list is held to.
+#
+#   bugprone-unchecked-optional-access
+#     Crashes clang-tidy 18 outright on mlir::FailureOr, which derives from
+#     std::optional -- its dataflow model segfaults inside
+#     UncheckedOptionalAccessModel::transfer. Not a style call: the check is
+#     unusable against this codebase on the pinned toolchain. Revisit when
+#     the MLIR version moves.
+Checks: >
+  bugprone-*,
+  misc-*,
+  performance-*,
+  readability-misleading-indentation,
+  readability-redundant-control-flow,
+  readability-simplify-boolean-expr,
+  clang-analyzer-*,
+  -bugprone-easily-swappable-parameters,
+  -clang-analyzer-core.StackAddressEscape,
+  -bugprone-exception-escape,
+  -bugprone-unchecked-optional-access,
+  -misc-non-private-member-variables-in-classes,
+  -misc-const-correctness,
+  -misc-no-recursion,
+  -misc-include-cleaner,
+  -misc-use-anonymous-namespace,
+  -performance-enum-size
+
+# Warnings from MLIR, LLVM and system headers are not ours to fix, and
+# there are thousands of them.
+HeaderFilterRegex: '(include/cim|lib|runtime|tools|test)/.*\.(h|cpp)$'
+
+# Not WarningsAsErrors here: the CI job passes --warnings-as-errors so the
+# same config can be run locally for exploration without failing the build.
+FormatStyle: none

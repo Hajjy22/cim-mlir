@@ -14,4 +14,5 @@ add_mlir_library(MLIRCIMInterpreter
 
 # Executing cim ops means calling the real runtime, not a mock: every byte
 # the IR says crosses an address-space boundary really crosses cimrt's.
-target_link_libraries(MLIRCIMInterpreter PUBLIC cimrt cim_build_flags)
+target_link_libraries(MLIRCIMInterpreter PUBLIC cimrt)
+cim_apply_build_flags(MLIRCIMInterpreter)
