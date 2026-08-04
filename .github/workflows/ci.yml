@@ -54,11 +54,17 @@ jobs:
       - name: Check benchmark results
         run: python3 bench/check_results.py results-*.json
 
+      # continue-on-error because an artifact is a convenience, never a gate.
+      # The step above is what decides whether these numbers are sound; if
+      # the account's artifact storage quota is full, that is a billing
+      # condition and not a reason to report a green build as broken.
       - name: Upload benchmark results
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: results-*.json
+          retention-days: 7
 
   core-asan:
     runs-on: ubuntu-latest
@@ -265,6 +271,10 @@ jobs:
       # not gated: lib/Dialect (mostly TableGen-generated) and lib/Transforms
       # (five of eight passes are empty stubs, so a threshold there measures
       # how many stubs exist).
+      # The summary also goes to $GITHUB_STEP_SUMMARY so the headline
+      # percentages are readable on the run page itself. An artifact that
+      # has to be downloaded to answer "did coverage move?" mostly does not
+      # get downloaded.
       - name: Coverage report (gated directories)
         run: |
           gcovr --root . \
@@ -272,7 +282,13 @@ jobs:
             --filter 'lib/Placement/' --filter 'lib/Target/' \
             --filter 'lib/Interpreter/' --filter 'runtime/src/' \
             --fail-under-line 85 --fail-under-branch 78 \
-            --print-summary --txt --html-details coverage-gated.html
+            --print-summary --txt coverage-gated.txt --html coverage-gated.html
+          {
+            echo '## Coverage: gated directories'
+            echo '```'
+            cat coverage-gated.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Coverage report (whole project, informational)
         if: always()
@@ -280,14 +296,31 @@ jobs:
           gcovr --root . \
             --exclude-throw-branches --exclude-unreachable-branches \
             --filter 'lib/' --filter 'runtime/src/' \
-            --print-summary --txt --html-details coverage-all.html
+            --print-summary --txt coverage-all.txt --html coverage-all.html
+          {
+            echo '## Coverage: whole project (not gated)'
+            echo '```'
+            cat coverage-all.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      # Single-page --html rather than --html-details: the latter writes one
+      # file per source file (31 of them here), and the numbers that matter
+      # are in the step summary above either way. Run gcovr locally for the
+      # line-by-line view.
+      #
+      # continue-on-error for the same reason as the core job: the gate is
+      # the gcovr threshold, not the upload.
       - name: Upload coverage reports
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: coverage
-          path: coverage-*.html*
+          path: |
+            coverage-*.html
+            coverage-*.txt
+          retention-days: 7
 
   static-analysis:
     runs-on: ubuntu-latest
