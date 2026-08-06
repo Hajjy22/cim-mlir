@@ -12,6 +12,7 @@ target_link_libraries(cim-run PRIVATE
   MLIRMemRefDialect
   MLIRArithDialect
   MLIRLinalgDialect
+  MLIRSCFDialect
 )
 
 mlir_check_all_link_libraries(cim-run)

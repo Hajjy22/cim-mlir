@@ -5,8 +5,11 @@
 #include "cim/Dialect/CIMOps.h"
 #include "cimrt.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
@@ -92,6 +95,7 @@ public:
 
 private:
   LogicalResult execute(Operation *op);
+  LogicalResult executeBlock(Block &block);
 
   // --- helpers ---
   FailureOr<MemRefValue> viewFromType(MemRefType type,
@@ -108,6 +112,14 @@ private:
 
   FailureOr<cimrt_device *> deviceFor(Operation *op, StringRef target);
 
+  /// A previously bound scalar index/integer value, or failure if `v` was
+  /// never computed by an op this interpreter models (arith.constant, or a
+  /// bound scf.for induction variable). Never guesses -- see runSubView.
+  FailureOr<int64_t> evalIndex(Value v) const;
+  /// Resolve one offset/size/stride entry of a subview: a compile-time
+  /// constant if the op encoded one, otherwise a lookup through evalIndex.
+  FailureOr<int64_t> resolveOffsetLike(OpFoldResult ofr) const;
+
   // --- op handlers ---
   LogicalResult runGetGlobal(memref::GetGlobalOp op);
   LogicalResult runAlloc(Operation *op, MemRefType type);
@@ -120,6 +132,8 @@ private:
   LogicalResult runMvm(MvmOp op);
   LogicalResult runReducePartial(ReducePartialOp op);
   LogicalResult runCimCopy(CopyOp op);
+  LogicalResult runArithConstant(arith::ConstantOp op);
+  LogicalResult runScfFor(scf::ForOp op);
 
   const InterpreterOptions &options;
   llvm::raw_ostream &out;
@@ -130,6 +144,10 @@ private:
   llvm::DenseMap<Value, cimrt_tile_id> tileValues;
   llvm::DenseMap<Value, Resident> residentValues;
   llvm::StringMap<cimrt_device *> devices;
+  /// Scalar index/integer SSA values the interpreter has computed: constants
+  /// and scf.for induction variables. Nothing here is inferred by folding
+  /// through arbitrary arithmetic -- see the note on runScfFor's scope.
+  llvm::DenseMap<Value, int64_t> indexValues;
 };
 
 /// Visit every index of a shape in row-major order.
@@ -278,6 +296,25 @@ FailureOr<cimrt_device *> Interpreter::deviceFor(Operation *op,
   return dev;
 }
 
+FailureOr<int64_t> Interpreter::evalIndex(Value v) const {
+  auto it = indexValues.find(v);
+  if (it == indexValues.end())
+    return failure();
+  return it->second;
+}
+
+FailureOr<int64_t> Interpreter::resolveOffsetLike(OpFoldResult ofr) const {
+  if (std::optional<int64_t> constant = getConstantIntValue(ofr))
+    return *constant;
+  // Not a compile-time constant: the only other thing an offset/size/stride
+  // operand can be is a Value, and the only Values this interpreter binds
+  // are constants and loop induction variables (see runScfFor). Anything
+  // else -- a value computed by arithmetic this interpreter does not model,
+  // or a genuinely runtime-dependent quantity -- is a hard error, not a
+  // guess: guessing an offset would silently read or write the wrong bytes.
+  return evalIndex(llvm::cast<Value>(ofr));
+}
+
 //===----------------------------------------------------------------------===//
 // Op handlers
 //===----------------------------------------------------------------------===//
@@ -339,17 +376,57 @@ LogicalResult Interpreter::runSubView(memref::SubViewOp op) {
   auto it = memrefs.find(op.getSource());
   if (it == memrefs.end())
     return op.emitError("subview of an unknown buffer");
+  const MemRefValue &src = it->second;
 
-  auto resultType = llvm::cast<MemRefType>(op.getType());
-  // Offsets and strides come from the result type, which MLIR has already
-  // composed against the source. A dynamic one is a hard error rather than
-  // a guess -- see the note in Interpreter.h.
-  auto view = viewFromType(resultType, it->second.alloc);
-  if (failed(view))
-    return op.emitError(
-        "memref.subview with a dynamic offset, size or stride is not "
-        "supported by the interpreter");
-  memrefs[op.getResult()] = *view;
+  // A subview's offset/size/stride operand list always has one entry per
+  // SOURCE dimension, regardless of how many dimensions the result drops --
+  // that is the invariant this composition relies on.
+  const SmallVector<OpFoldResult> mixedOffsets = op.getMixedOffsets();
+  const SmallVector<OpFoldResult> mixedSizes = op.getMixedSizes();
+  const SmallVector<OpFoldResult> mixedStrides = op.getMixedStrides();
+  if (mixedOffsets.size() != src.strides.size() ||
+      mixedSizes.size() != src.strides.size() ||
+      mixedStrides.size() != src.strides.size())
+    return op.emitError("cim interpreter: subview operand count does not "
+                        "match its source's rank");
+
+  // For an all-static subview this reproduces exactly what the old
+  // type-only path computed (MLIR composes the same arithmetic at compile
+  // time into the result type's strided<[...], offset: N>). What is new is
+  // resolving an offset that is a bound index value -- typically an
+  // enclosing scf.for's induction variable -- rather than refusing it. Any
+  // offset this interpreter cannot resolve is still a hard error: see
+  // resolveOffsetLike.
+  int64_t offsetElems = src.offsetElems;
+  SmallVector<int64_t> fullSizes(mixedSizes.size());
+  SmallVector<int64_t> fullStrides(mixedStrides.size());
+  for (size_t d = 0, e = mixedOffsets.size(); d < e; ++d) {
+    FailureOr<int64_t> resolvedOffset = resolveOffsetLike(mixedOffsets[d]);
+    FailureOr<int64_t> resolvedSize = resolveOffsetLike(mixedSizes[d]);
+    FailureOr<int64_t> resolvedStride = resolveOffsetLike(mixedStrides[d]);
+    if (failed(resolvedOffset) || failed(resolvedSize) ||
+        failed(resolvedStride))
+      return op.emitError(
+          "memref.subview offset, size or stride is not a compile-time "
+          "constant or a value the interpreter has bound (currently only "
+          "arith.constant and scf.for induction variables)");
+    offsetElems += *resolvedOffset * src.strides[d];
+    fullSizes[d] = *resolvedSize;
+    fullStrides[d] = src.strides[d] * *resolvedStride;
+  }
+
+  const llvm::SmallBitVector dropped = op.getDroppedDims();
+  MemRefValue result;
+  result.alloc = src.alloc;
+  result.offsetElems = offsetElems;
+  result.elemBytes = src.elemBytes;
+  for (size_t d = 0, e = fullSizes.size(); d < e; ++d) {
+    if (dropped.test(d))
+      continue;
+    result.sizes.push_back(fullSizes[d]);
+    result.strides.push_back(fullStrides[d]);
+  }
+  memrefs[op.getResult()] = result;
   return success();
 }
 
@@ -633,9 +710,64 @@ LogicalResult Interpreter::runCimCopy(CopyOp op) {
   return success();
 }
 
+LogicalResult Interpreter::runArithConstant(arith::ConstantOp op) {
+  // Only scalar integer/index constants are modelled -- what a loop bound
+  // or a subview offset can be. A float or vector constant falls through to
+  // the Default case in execute() and errors clearly rather than being
+  // silently skipped here.
+  if (!op.getType().isIndex() && !op.getType().isSignlessInteger())
+    return op.emitError(
+        "the interpreter only evaluates integer or index constants");
+  auto attr = llvm::dyn_cast<IntegerAttr>(op.getValue());
+  if (!attr)
+    return op.emitError("unsupported arith.constant value");
+  indexValues[op.getResult()] = attr.getValue().getSExtValue();
+  return success();
+}
+
+LogicalResult Interpreter::runScfFor(scf::ForOp op) {
+  // Loop-carried values would require merging a value across iterations,
+  // which nothing in the pipeline this interpreter executes needs -- every
+  // cim op sequence cim-partition emits communicates through side effects
+  // (device/tile state, memrefs) rather than through scf.for results.
+  if (op.getNumRegionIterArgs() != 0)
+    return op.emitError(
+        "the interpreter does not support scf.for with loop-carried values "
+        "(iter_args); cim-partition never emits any, so a loop that has "
+        "them did not come from this pipeline");
+
+  FailureOr<int64_t> lower = evalIndex(op.getLowerBound());
+  FailureOr<int64_t> upper = evalIndex(op.getUpperBound());
+  FailureOr<int64_t> step = evalIndex(op.getStep());
+  if (failed(lower) || failed(upper) || failed(step))
+    return op.emitError(
+        "scf.for bounds must be values the interpreter can evaluate "
+        "(currently only arith.constant); a dynamic trip count cannot be "
+        "executed without guessing how many times the loop runs");
+  if (*step <= 0)
+    return op.emitError("scf.for step must be positive");
+
+  const Value iv = op.getInductionVar();
+  Block &body = op.getRegion().front();
+  for (int64_t i = *lower; i < *upper; i += *step) {
+    indexValues[iv] = i;
+    if (failed(executeBlock(body)))
+      return failure();
+  }
+  indexValues.erase(iv);
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Dispatch
 //===----------------------------------------------------------------------===//
+
+LogicalResult Interpreter::executeBlock(Block &block) {
+  for (Operation &op : block)
+    if (failed(execute(&op)))
+      return failure();
+  return success();
+}
 
 LogicalResult Interpreter::execute(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
@@ -664,6 +796,18 @@ LogicalResult Interpreter::execute(Operation *op) {
       .Case<MvmOp>([&](auto o) { return runMvm(o); })
       .Case<ReducePartialOp>([&](auto o) { return runReducePartial(o); })
       .Case<CopyOp>([&](auto o) { return runCimCopy(o); })
+      .Case<arith::ConstantOp>([&](auto o) { return runArithConstant(o); })
+      .Case<scf::ForOp>([&](auto o) { return runScfFor(o); })
+      .Case<scf::YieldOp>([&](auto o) -> LogicalResult {
+        // A no-arg yield is the natural terminator of every loop body this
+        // interpreter runs, since iter_args (and therefore non-trivial
+        // yields) are refused in runScfFor.
+        if (o.getNumOperands() != 0)
+          return o.emitError(
+              "scf.yield with operands implies loop-carried values, which "
+              "runScfFor already refuses before reaching this terminator");
+        return success();
+      })
       .Case<BarrierOp>([&](BarrierOp o) -> LogicalResult {
         auto it = deviceValues.find(o.getDevice());
         if (it == deviceValues.end())
@@ -703,9 +847,8 @@ LogicalResult Interpreter::run(ModuleOp mod, StringRef entryName) {
   if (!entry.getBody().hasOneBlock())
     return entry.emitError("only single-block functions are supported");
 
-  for (Operation &op : entry.getBody().front())
-    if (failed(execute(&op)))
-      return failure();
+  if (failed(executeBlock(entry.getBody().front())))
+    return failure();
 
   if (options.dumpProfile && !devices.empty()) {
     cimrt_profile profile{};

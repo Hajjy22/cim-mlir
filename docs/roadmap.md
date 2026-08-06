@@ -7,16 +7,26 @@ nothing counts until it is public.
 real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
 per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
 transfers, and `cim-placement` now rewrites that IR from a Belady schedule --
-eliminating redundant weight programming and assigning tile ids from the
-solution rather than round-robin.
+eliminating redundant weight programming, assigning tile ids from the
+solution rather than round-robin, and hoisting loop-invariant `cim.program`
+ops out of an `scf.for` when doing so is provably safe.
 
-The gap that remains is loops. `cim-placement` finds reuse in straight-line
-code: across matmuls within a block, which is enough to show that a model
-fitting in tiles reprograms nothing after install. It does not hoist
-`cim.program` out of an `scf.for`, so the "1000 inferences" numbers in
-`bench/workloads/README.md` still come from the standalone simulator in
-`cim-bench`, not from compiled IR. Closing that is the next substantial piece
-of work.
+What "provably safe" means, precisely, because it is not the same problem
+`cim-bench`'s simulator solves: a `cim.program` is hoisted only when its
+physical tile is written by no other `cim.program` within one textual loop
+iteration, and only out of a loop whose trip count is a compile-time
+constant proven positive. This exactly reproduces the headline `mm-fit`
+result on real IR -- a model whose weights entirely fit in tiles reprograms
+once, however many inferences run. It does **not** reproduce `cim-bench`'s
+`mm-spill-*` numbers: those come from Belady solved over the *whole*
+flattened N-inference sequence, which can find reuse this pass's
+single-iteration, tile-local check cannot see. Under spill, hoisting still
+finds and moves whatever subset of tiles genuinely stays stable for a full
+iteration -- see `placement_partially_hoists_when_only_some_tiles_are_stable`
+in `test/mlir/pipeline_e2e_test.cpp` -- but the spill workloads in
+`bench/workloads/README.md` still describe what the standalone simulator
+computes, not what this pass emits. A full N-inference Belady solve on
+compiled IR, if it is ever wanted, is separate work from what landed here.
 
 ## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
@@ -90,9 +100,24 @@ module stays correct and is simply not offloaded:
   shape)`, not the SSA value: `cim-partition` emits a fresh `memref.subview`
   per block per matmul, so keying on the value would make every weight
   distinct and the pass would find no reuse while appearing to work.
-- [ ] Hoisting `cim.program` out of an inference loop. Reuse is currently
-  found in straight-line code only, so the per-inference claim is still
-  demonstrated by `cim-bench` rather than by the compiler.
+- [x] Hoisting `cim.program` out of an `scf.for` when it is the sole writer
+  of its physical tile within one loop iteration, and the loop's trip count
+  is a compile-time constant proven positive (never out of a loop that
+  might run zero times, and never out of a loop nested inside another --
+  v0.1 handles one level). `lib/Interpreter/Interpreter.cpp` gained real
+  `scf.for` execution (bound induction variable, static bounds only, no
+  `iter_args`) to make this checkable numerically rather than only
+  structurally -- see `test/mlir/pipeline_e2e_test.cpp`'s loop-hoisting
+  cases, `test/Transforms/cim-placement-loop.mlir` for the IR shape, and
+  `test/Run/placement-loop.mlir` for the `cimrt_profile` counters actually
+  moving. This is the `mm-fit` claim (fits entirely -> reprograms once) on
+  compiled IR; it is not a full N-inference Belady solve -- see the note
+  above the milestone list.
+- [ ] A full N-inference Belady solve on compiled IR, matching what
+  `cim-bench`'s simulator computes for the spill workloads. The current
+  hoist is deliberately more conservative (see above); closing this gap
+  means reasoning about the whole flattened use sequence across iterations,
+  not just whether one tile is stable within one.
 - [ ] Volatile-vs-non-volatile comparison plot showing that persistence
   changes the optimum, not just the magnitude.
 

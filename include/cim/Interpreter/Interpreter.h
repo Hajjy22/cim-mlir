@@ -20,6 +20,17 @@
 // space boundary really does cross the cimrt boundary, and the runtime is
 // exercised by construction rather than mocked.
 //
+// Control flow: scf.for is executed with a genuinely bound induction
+// variable, which is what makes cim-placement's loop hoisting checkable
+// numerically rather than only structurally. Scope is deliberately narrow --
+// bounds must be arith.constant (a dynamic trip count would have to be
+// guessed, which this interpreter never does), and the loop must carry no
+// iter_args (cim-partition's output never needs one; every cim op sequence
+// communicates through side effects, not through scf.for results). A
+// memref.subview's offset may now be a bound index value -- typically the
+// induction variable -- rather than only a compile-time constant; anything
+// else is still the same hard error it always was.
+//
 //===----------------------------------------------------------------------===//
 #ifndef CIM_INTERPRETER_INTERPRETER_H
 #define CIM_INTERPRETER_INTERPRETER_H

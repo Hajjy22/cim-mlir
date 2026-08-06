@@ -75,9 +75,21 @@ weights already resident in a tile are reused rather than reprogrammed.
 How far that currently reaches: reuse is found **within a block**, across
 matmuls that share weights. Two matmuls against one weight global on a device
 whose tiles fit them emit two `cim.program` ops instead of four, and under spill
-pressure Belady still beats what an LRU cache would do. Loops are not yet
-handled — hoisting `cim.program` out of an inference loop is separate work, so
-the per-inference figures in `bench/` still come from the standalone simulator.
+pressure Belady still beats what an LRU cache would do.
+
+Loops are handled too, but conservatively rather than by solving the same
+problem again at a larger scale. A `cim.program` is hoisted out of an
+`scf.for` when its tile is written by nothing else within one loop iteration
+and the loop's trip count is a compile-time constant proven positive — never
+out of a loop that might run zero times, never out of one nested inside
+another. This reproduces the project's headline claim on real IR for the
+first time: a model that fits entirely in tiles reprograms once, no matter
+how many inferences the loop runs. It does **not** reproduce a full
+N-inference Belady solve — `bench/`'s spill-workload figures still come from
+the standalone simulator, which solves over the whole flattened use sequence
+across iterations rather than asking, tile by tile, whether one iteration
+alone leaves it undisturbed. See `docs/roadmap.md`'s M3 section for exactly
+where that line is drawn and why.
 
 ## Memory spaces
 

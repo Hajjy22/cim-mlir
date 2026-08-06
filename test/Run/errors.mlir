@@ -6,6 +6,8 @@
 // RUN:   | FileCheck --check-prefix=EXTERNAL %s
 // RUN: not cim-run --target-yaml=%S/../targets/tiny-4x4.yaml --entry=unmodelled %s 2>&1 \
 // RUN:   | FileCheck --check-prefix=UNMODELLED %s
+// RUN: not cim-run --target-yaml=%S/../targets/tiny-4x4.yaml --entry=iter_args %s 2>&1 \
+// RUN:   | FileCheck --check-prefix=ITER-ARGS %s
 // RUN: not cim-run --target-yaml=%S/no-such-target.yaml --entry=opens_a_device %s 2>&1 \
 // RUN:   | FileCheck --check-prefix=BAD-TARGET %s
 // RUN: not cim-run %s 2>&1 | FileCheck --check-prefix=NO-TARGET %s
@@ -22,20 +24,45 @@ func.func @takes_args(%arg0: memref<4xi8>) {
 func.func private @declared_only()
 
 func.func @unmodelled() {
-  // arith.constant is perfectly valid IR that cim-partition never emits, so
-  // the interpreter has no model for it. It must say so rather than step
-  // over it.
-  %c = arith.constant 7 : i32
+  // arith.constant and scf.for are modelled now (loop hoisting needs both to
+  // be checkable numerically); arith.addi is not, and cim-partition never
+  // emits it either, so it stays a clean example of "valid IR the
+  // interpreter has no model for."
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %sum = arith.addi %c1, %c2 : i32
   return
 }
 
-// Not tested here: the interpreter's "memref.subview with a dynamic offset"
-// guard. It has no test because it currently has no reachable input. A
-// dynamic offset must come from an index-producing op, and every such op --
-// arith.constant included, as @unmodelled above shows -- is refused by the
-// .Default branch before the subview is ever reached. The guard stays as
-// defence in depth for when index-producing ops are modelled; it should get
-// a test in the same change that makes it reachable.
+func.func @iter_args() {
+  // cim-partition never emits a loop with loop-carried values -- every cim
+  // op sequence it produces communicates through side effects, not through
+  // scf.for results -- so the interpreter refuses rather than attempting to
+  // merge a value across iterations it was never designed to track.
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c3 = arith.constant 3 : index
+  %init = arith.constant 0 : i32
+  %r = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %init) -> i32 {
+    scf.yield %acc : i32
+  }
+  return
+}
+
+// Not tested here: "scf.for bounds must be values the interpreter can
+// evaluate" (runScfFor) and "memref.subview offset ... is not a
+// compile-time constant or a value the interpreter has bound" (runSubView,
+// the dynamic-offset case that is not a loop induction variable). Both
+// guards are real and stay as defence in depth, but neither has a reachable
+// input: the only way to produce an index-typed SSA value the interpreter
+// does NOT bind is a function argument, and cim-run requires a zero-argument
+// entry (see @takes_args above) -- so reaching either guard through
+// cim-run's CLI would first trip that check instead. Every op capable of
+// producing an index either resolves (arith.constant, a bound induction
+// variable) or is itself unmodelled and errors before its result could be
+// used (@unmodelled). They should get a test in the same change that adds
+// an index-producing op the interpreter models but does not track, e.g. if
+// arith.addi on index values is ever needed.
 
 func.func @opens_a_device() {
   %d = cim.device_open {target = "tiny-4x4"} : !cim.device<"tiny-4x4">
@@ -45,6 +72,7 @@ func.func @opens_a_device() {
 // NO-ENTRY: no such entry function: nope
 // ARGS: zero-argument entry functions
 // EXTERNAL: entry function has no body
-// UNMODELLED: operation not supported by the cim interpreter: arith.constant
+// UNMODELLED: operation not supported by the cim interpreter: arith.addi
+// ITER-ARGS: loop-carried values
 // BAD-TARGET: cimrt_open
 // NO-TARGET: --target-yaml is required

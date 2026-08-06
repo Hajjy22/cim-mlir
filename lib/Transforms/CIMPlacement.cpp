@@ -35,10 +35,42 @@
 // one -- which is what decision 1 is about, and what the multi-matmul cases in
 // test/mlir/pipeline_e2e_test.cpp check.
 //
-// SCOPE: straight-line code. Reuse is found across matmuls within a block, not
-// across iterations of a loop. The "a model that fits reprograms nothing per
-// inference" claim therefore still lives only in the cim-bench simulator;
-// hoisting cim.program out of an scf.for is separate work (docs/roadmap.md).
+// 3. CROSS-ITERATION REUSE IS A SEPARATE STEP: LOOP HOISTING. Step 1-2 above
+//    find reuse WITHIN one textual execution of a block. When that block is
+//    an scf.for's body, the block still executes once *textually* but many
+//    times *at runtime* -- reuse ACROSS those runtime executions is a
+//    different question, answered after every block has already been placed:
+//
+//    A surviving cim.program op (one Step-3 kept, i.e. not eliminated as an
+//    intra-iteration reuse) is a hoisting candidate iff it is the ONLY
+//    cim.program in its block writing to its physical tile. If two
+//    surviving programs share a tile id, that tile's content already
+//    changes WITHIN one iteration, so it cannot be assumed stable ACROSS
+//    iterations either -- the same argument as intra-block reuse, one level
+//    up. This is checked directly off `result.actions` (see
+//    hoistCandidates), not re-derived.
+//
+//    A candidate is only actually hoisted out of an enclosing scf.for when
+//    that loop's trip count is a compile-time-provable positive number
+//    (loopHasProvablyPositiveTripCount) -- a loop that might run zero times
+//    would make the hoisted cim.program fire even when the body never does,
+//    which changes nothing about any OUTPUT VALUE (an unused tile write is
+//    inert) but does spend energy/latency the original IR never spent, so it
+//    is refused rather than risked. Nested loops are left alone entirely for
+//    v0.1: only the innermost-relevant single level is reasoned about.
+//
+//    The mechanics are mlir::moveLoopInvariantCode (a stock MLIR utility),
+//    supplied with cim-specific predicates: cim.device_open, cim.tile_alloc,
+//    memref.get_global/subview/cast are always safe to hoist when their
+//    operands are loop-invariant (device_open and tile_alloc have no
+//    declared memory effects that forbid it and are idempotent by name/id;
+//    the memref ops are pure views), and cim.program is safe to hoist only
+//    when it is in `hoistCandidates`. Everything else -- cim.mvm,
+//    cim.reduce_partial, cim.copy, memref.copy -- is never in the allowed
+//    set, so activation-side computation (which genuinely differs every
+//    iteration) never moves; the operand-invariance check would refuse it
+//    anyway, since it reads a per-iteration value, but the op-kind
+//    allowlist is the belt to that suspenders.
 //
 //===----------------------------------------------------------------------===//
 
@@ -49,9 +81,14 @@
 #include "cim/Transforms/Passes.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -159,6 +196,24 @@ void eraseDeadViewChain(Value value) {
   }
 }
 
+/// True iff `forOp` is provably going to execute at least one iteration:
+/// bounds and step are all compile-time constants and lower < upper (step
+/// already assumed forward per scf.for's semantics; a non-positive step is
+/// treated as unprovable rather than reasoned about further).
+///
+/// A loop this returns false for is not incorrect to hoist out of -- an
+/// unused cim.program is inert, never wrong -- but it would spend energy and
+/// latency the original IR never spent for a loop that might run zero
+/// times, which the pass is not willing to risk without proof.
+bool loopHasProvablyPositiveTripCount(scf::ForOp forOp) {
+  APInt lower, upper, step;
+  if (!matchPattern(forOp.getLowerBound(), m_ConstantInt(&lower)) ||
+      !matchPattern(forOp.getUpperBound(), m_ConstantInt(&upper)) ||
+      !matchPattern(forOp.getStep(), m_ConstantInt(&step)))
+    return false;
+  return step.sgt(0) && lower.slt(upper);
+}
+
 struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -192,13 +247,84 @@ struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
     llvm::MapVector<Block *, SmallVector<ProgramOp>> byBlock;
     module.walk([&](ProgramOp op) { byBlock[op->getBlock()].push_back(op); });
 
+    // Populated by placeBlock with the cim.program ops proven safe for
+    // cross-iteration reuse -- see decision 3 in the file header. Collected
+    // across every block before any hoisting happens, so hoisting never
+    // interleaves with (and cannot disturb) the per-block rewrite above.
+    llvm::DenseSet<Operation *> hoistCandidates;
+
     for (auto &entry : byBlock)
-      if (failed(placeBlock(entry.second, spec)))
+      if (failed(placeBlock(entry.second, spec, hoistCandidates)))
         return signalPassFailure();
+
+    hoistFromLoops(module, hoistCandidates);
+  }
+
+  /// Move every hoisting candidate that survived placeBlock out of its
+  /// enclosing scf.for, when that loop provably runs. One level only: a
+  /// loop nested inside another scf.for is left untouched (its candidates,
+  /// if any, stay exactly where cim-partition put them) rather than reasoned
+  /// about multi-level, which is future work, not this pass's v0.1 scope.
+  void hoistFromLoops(ModuleOp module,
+                      const llvm::DenseSet<Operation *> &hoistCandidates) {
+    module.walk([&](scf::ForOp forOp) {
+      const bool nested = forOp->getParentOfType<scf::ForOp>() != nullptr;
+      const bool tripCountKnown = loopHasProvablyPositiveTripCount(forOp);
+
+      // Only warn when skipping cost this loop something real: most loops
+      // in the world have no cim.program in them at all, and flagging every
+      // one of those would be pure noise.
+      bool hasCandidate = false;
+      if (nested || !tripCountKnown)
+        forOp.getRegion().walk([&](ProgramOp op) {
+          if (hoistCandidates.contains(op.getOperation()))
+            hasCandidate = true;
+        });
+
+      if (nested) {
+        if (hasCandidate)
+          forOp.emitRemark(
+              "cim-placement: not hoisting cim.program out of a loop nested "
+              "inside another scf.for; only one level is handled in v0.1");
+        return;
+      }
+      if (!tripCountKnown) {
+        if (hasCandidate)
+          forOp.emitRemark(
+              "cim-placement: not hoisting cim.program out of this scf.for; "
+              "its trip count is not provably positive, and a loop that "
+              "might run zero times must not be assumed to run at all");
+        return;
+      }
+
+      Region &region = forOp.getRegion();
+      mlir::moveLoopInvariantCode(
+          {&region},
+          [](Value v, Region *r) {
+            return v.getParentRegion()->isProperAncestor(r);
+          },
+          [&](Operation *op, Region *) {
+            // device_open and tile_alloc declare no memory effects that
+            // forbid motion, and are idempotent (device_open by name --
+            // see Interpreter::deviceFor's cache -- tile_alloc by id, a
+            // pure lookup with no device-touching side effect). The memref
+            // ops are pure views. cim.program is the one case that
+            // genuinely needs proof, supplied by placeBlock's per-tile
+            // count, not by anything generic here.
+            if (isa<DeviceOpenOp, TileAllocOp, memref::GetGlobalOp,
+                    memref::SubViewOp, memref::CastOp>(op))
+              return true;
+            if (auto program = dyn_cast<ProgramOp>(op))
+              return hoistCandidates.contains(program.getOperation());
+            return false;
+          },
+          [&](Operation *op, Region *) { op->moveBefore(forOp); });
+    });
   }
 
   LogicalResult placeBlock(ArrayRef<ProgramOp> programs,
-                           const ::cim::TargetSpec &spec) {
+                           const ::cim::TargetSpec &spec,
+                           llvm::DenseSet<Operation *> &hoistCandidates) {
     // Step 1 -- recover the use sequence. Each cim.program in block order is
     // one use of the weight sub-matrix it programs. Because the model graph
     // is static, this order is fully known at compile time, which is exactly
@@ -246,6 +372,17 @@ struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
                << " evictions over " << problem.useSequence.size()
                << " steps (" << result.distinctWeights
                << " distinct weights, " << problem.numTiles << " tiles)\n");
+
+    // How many surviving cim.program ops target each physical tile within
+    // THIS block. A tile programmed more than once here has content that
+    // already changes mid-iteration, so nothing programmed into it can be
+    // assumed stable across iterations either -- see decision 3 in the file
+    // header. Computed once, off the schedule, rather than re-derived from
+    // the rewritten IR below.
+    llvm::DenseMap<::cim::TileId, unsigned> programCountPerTile;
+    for (const ::cim::PlacementAction &action : result.actions)
+      if (action.kind != ::cim::ActionKind::Reuse)
+        ++programCountPerTile[action.tile];
 
     // Step 3 -- rewrite. Walking forward in block order means the resident
     // value recorded for a tile was always produced by an earlier op, so it
@@ -296,6 +433,9 @@ struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
       tileAlloc.setId(static_cast<uint64_t>(action.tile));
       residentForTile[action.tile] = op.getResult();
       weightInTile[action.tile] = action.weight;
+
+      if (programCountPerTile.lookup(action.tile) == 1)
+        hoistCandidates.insert(op.getOperation());
     }
 
     return success();

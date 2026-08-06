@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 
@@ -58,7 +59,8 @@ int main(int argc, char **argv) {
 
   DialectRegistry registry;
   registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
-                  arith::ArithDialect, linalg::LinalgDialect>();
+                  arith::ArithDialect, linalg::LinalgDialect,
+                  scf::SCFDialect>();
   MLIRContext context(registry);
   context.loadAllAvailableDialects();
 

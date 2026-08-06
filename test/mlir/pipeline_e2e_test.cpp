@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
@@ -178,7 +179,8 @@ RunResult compileSource(const std::string &source, bool withPlacement,
 
   DialectRegistry registry;
   registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
-                  arith::ArithDialect, linalg::LinalgDialect>();
+                  arith::ArithDialect, linalg::LinalgDialect,
+                  scf::SCFDialect>();
   MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
@@ -517,6 +519,94 @@ void checkTwoMatmulValues(const char *label, const RunResult &result,
   }
 }
 
+/// One matmul inside an scf.for, iterating over `acts.size()` rows.
+///
+/// Weights are a single shared global, used identically by every runtime
+/// iteration -- loop-invariant by construction, matching what a real
+/// inference loop looks like (fixed weights, one activation per call).
+/// Activations are staged from a 2D global sliced by the induction
+/// variable, so their addressing genuinely depends on %i and must NOT be
+/// hoisted; this is what proves cim-placement's hoisting sweep discriminates
+/// weight-side from activation-side computation rather than moving anything
+/// invariant-looking.
+std::string buildLoopModule(const std::vector<int8_t> &w,
+                            const std::vector<std::vector<int8_t>> &acts,
+                            int n, int k) {
+  const int iters = static_cast<int>(acts.size());
+  std::ostringstream os;
+  os << "memref.global \"private\" constant @w : memref<" << n << "x" << k
+     << "xi8> = dense<[";
+  for (int i = 0; i < n; ++i) {
+    os << (i ? ", [" : "[");
+    for (int j = 0; j < k; ++j)
+      os << (j ? ", " : "") << static_cast<int>(w[i * k + j]);
+    os << "]";
+  }
+  os << "]>\n";
+
+  os << "memref.global \"private\" constant @acts : memref<" << iters << "x"
+     << k << "xi8> = dense<[";
+  for (int r = 0; r < iters; ++r)
+    os << (r ? ", [" : "[") << denseList(acts[static_cast<size_t>(r)]) << "]";
+  os << "]>\n";
+
+  os << "func.func private @cim_print_i32(memref<*xi32>)\n";
+  os << "func.func @main() {\n";
+  os << "  %w = memref.get_global @w : memref<" << n << "x" << k << "xi8>\n";
+  os << "  %acts = memref.get_global @acts : memref<" << iters << "x" << k
+     << "xi8>\n";
+  os << "  %out = memref.alloc() : memref<" << iters << "x" << n << "xi32>\n";
+  os << "  %c0 = arith.constant 0 : index\n";
+  os << "  %c1 = arith.constant 1 : index\n";
+  os << "  %cN = arith.constant " << iters << " : index\n";
+  os << "  scf.for %i = %c0 to %cN step %c1 {\n";
+  os << "    %actRow = memref.subview %acts[%i, 0] [1, " << k << "] [1, 1]"
+        " : memref<"
+     << iters << "x" << k << "xi8> to memref<1x" << k << "xi8, strided<["
+     << k << ", 1], offset: ?>>\n";
+  os << "    %actLocal = memref.alloc() : memref<1x" << k << "xi8>\n";
+  os << "    memref.copy %actRow, %actLocal : memref<1x" << k
+     << "xi8, strided<[" << k << ", 1], offset: ?>> to memref<1x" << k
+     << "xi8>\n";
+  os << "    %outRow = memref.subview %out[%i, 0] [1, " << n << "] [1, 1]"
+        " : memref<"
+     << iters << "x" << n << "xi32> to memref<1x" << n << "xi32, strided<["
+     << n << ", 1], offset: ?>>\n";
+  os << "    linalg.matmul_transpose_b ins(%actLocal, %w : memref<1x" << k
+     << "xi8>, memref<" << n << "x" << k << "xi8>) outs(%outRow : memref<1x"
+     << n << "xi32, strided<[" << n << ", 1], offset: ?>>)\n";
+  os << "    memref.dealloc %actLocal : memref<1x" << k << "xi8>\n";
+  os << "  }\n";
+  os << "  %cast = memref.cast %out : memref<" << iters << "x" << n
+     << "xi32> to memref<*xi32>\n";
+  os << "  func.call @cim_print_i32(%cast) : (memref<*xi32>) -> ()\n";
+  os << "  memref.dealloc %out : memref<" << iters << "x" << n << "xi32>\n";
+  os << "  return\n}\n";
+  return os.str();
+}
+
+/// buildLoopModule prints the whole `out` buffer once, after the loop, so
+/// there is exactly one print of iters*n values -- the per-iteration
+/// reference rows concatenated in order.
+void checkLoopValues(const char *label, const RunResult &result,
+                     const std::vector<int8_t> &w,
+                     const std::vector<std::vector<int8_t>> &acts, int n,
+                     int k) {
+  if (result.prints.size() != 1) {
+    CIM_FAIL(std::string(label) + ": expected exactly one printed buffer, "
+             "got " + std::to_string(result.prints.size()));
+    return;
+  }
+  std::vector<int32_t> want;
+  for (const std::vector<int8_t> &act : acts) {
+    const std::vector<int32_t> row = reference(w, act, n, k);
+    want.insert(want.end(), row.begin(), row.end());
+  }
+  if (result.prints[0] != want)
+    CIM_FAIL(std::string(label) +
+             ": loop output disagrees with the per-iteration reference");
+}
+
 } // namespace
 
 CIM_TEST(placement_never_changes_the_numbers_on_any_single_matmul_case) {
@@ -634,7 +724,8 @@ CIM_TEST(placement_assigns_only_tile_ids_the_target_declares) {
 
   DialectRegistry registry;
   registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
-                  arith::ArithDialect, linalg::LinalgDialect>();
+                  arith::ArithDialect, linalg::LinalgDialect,
+                  scf::SCFDialect>();
   MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
@@ -662,4 +753,158 @@ CIM_TEST(placement_assigns_only_tile_ids_the_target_declares) {
     CIM_EXPECT_GE(static_cast<int64_t>(op.getId()), int64_t(0));
   });
   CIM_EXPECT_GT(tiles, 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// cim-placement: loop hoisting
+//
+// Everything above proves reuse WITHIN one textual execution of a block.
+// These cases are the reason that was not enough: cim-partition's output
+// sits inside an scf.for whose body runs many times at runtime while
+// appearing once in the IR, and a cim.program textually inside the loop
+// still costs a real reprogram on every one of those runtime iterations
+// unless something hoists it out. This is the first place that cost is
+// checked on compiled IR rather than asserted about the standalone
+// simulator in cim-bench.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(placement_hoists_a_program_out_of_a_loop_when_weights_fit) {
+  // One 4x4 weight block, three loop iterations with different activations.
+  // Every iteration programs the SAME weights -- loop-invariant by
+  // construction -- so after hoisting the tile is programmed once and
+  // reused for the remaining two runtime iterations, even though there is
+  // only one cim.program in the textual IR either way.
+  const std::vector<int8_t> w = sequential(4 * 4, -8, 1);
+  const std::vector<std::vector<int8_t>> acts = {
+      {1, 2, 3, 4}, {10, 20, 30, 40}, {-1, -2, -3, -4}};
+
+  const auto [plain, placed] =
+      runBothWays("loop-fits", buildLoopModule(w, acts, 4, 4));
+  if (plain.programs == 0)
+    return;
+
+  // Without placement, one cim.program per textual instance -- the loop
+  // does not multiply it in the IR, but cim-run's profile counters (see
+  // test/Run/placement-loop.mlir) show it fires once per runtime iteration.
+  CIM_EXPECT_EQ(plain.programs, 1u);
+  CIM_EXPECT_EQ(placed.programs, 1u);
+  CIM_EXPECT_EQ(placed.mvms, 1u);
+  checkLoopValues("loop-fits", placed, w, acts, 4, 4);
+}
+
+CIM_TEST(placement_hoisting_does_not_scale_with_iteration_count) {
+  // The claim under test is specifically that hoisting decouples IR program
+  // count from how many times the loop runs -- not just that it works for
+  // one particular iteration count. Same weights, 6 iterations instead of 3.
+  const std::vector<int8_t> w = sequential(4 * 4, -8, 1);
+  std::vector<std::vector<int8_t>> acts;
+  for (int i = 0; i < 6; ++i)
+    acts.push_back(sequential(4, -3 + i, 1));
+
+  const auto [plain, placed] =
+      runBothWays("loop-fits-6", buildLoopModule(w, acts, 4, 4));
+  if (plain.programs == 0)
+    return;
+
+  CIM_EXPECT_EQ(placed.programs, 1u);
+  CIM_EXPECT_EQ(placed.mvms, 1u);
+  checkLoopValues("loop-fits-6", placed, w, acts, 4, 4);
+}
+
+CIM_TEST(placement_partially_hoists_when_only_some_tiles_are_stable) {
+  // 12x4 weights over 4x4 tiles is 3 distinct blocks on a 2-tile device.
+  // Within ONE iteration the use sequence [0,1,2] has no repeats -- nothing
+  // for intra-block Belady to reuse -- so all 3 programs survive per
+  // iteration regardless of placement. But 3 blocks on 2 tiles means one
+  // tile holds a block for the whole iteration (stable, hoistable) while
+  // the other is reprogrammed mid-iteration (not stable, not hoistable):
+  //
+  //   block0 -> tileA, block1 -> tileB, block2 -> evicts whichever of
+  //   {tileA, tileB} Belady picks (a tie: neither block0 nor block1 is used
+  //   again in THIS iteration) -- so one tile sees 2 programs/iteration,
+  //   the other sees exactly 1 and is the hoist candidate.
+  //
+  // Two iterations: baseline 3 programs/iteration x 2 = 6. With placement,
+  // the stable tile's program is hoisted once; the spilled tile's 2
+  // programs/iteration remain: 2*2 + 1 = 5.
+  const std::vector<int8_t> w = sequential(12 * 4, -24, 1);
+  const std::vector<std::vector<int8_t>> acts = {{1, 2, 3, 4},
+                                                 {10, 20, 30, 40}};
+
+  const auto [plain, placed] =
+      runBothWays("loop-spill", buildLoopModule(w, acts, 12, 4));
+  if (plain.programs == 0)
+    return;
+
+  CIM_EXPECT_EQ(plain.programs, 3u);
+  CIM_EXPECT_EQ(placed.programs, 3u); // 1 hoisted + 2 still in the loop body
+  CIM_EXPECT_EQ(placed.mvms, 3u);
+  checkLoopValues("loop-spill", placed, w, acts, 12, 4);
+}
+
+CIM_TEST(placement_leaves_a_zero_trip_count_loop_alone) {
+  // `scf.for %i = %c0 to %c0 step %c1` never runs -- lower == upper -- which
+  // loopHasProvablyPositiveTripCount must recognise and refuse, since
+  // hoisting a cim.program out of a loop that might never execute would
+  // spend energy the original IR never spent. A single fixed activation
+  // (not a per-iteration buffer sliced by %i) keeps this case narrowly about
+  // the trip-count guard rather than about buildLoopModule's zero-row
+  // machinery, which dense<> literals cannot express cleanly.
+  //
+  // What this test CANNOT catch, proven by mutation testing rather than
+  // assumed: `programs` (a module-wide op count) and the printed values are
+  // identical whether the program is hoisted above the loop or left inside
+  // it -- moving an op changes where it sits, not how many of it exist or
+  // what a loop that never runs computes. A `loopHasProvablyPositiveTripCount`
+  // that always returned true passes this test unchanged. The check that
+  // actually distinguishes "hoisted" from "not hoisted" is structural:
+  // test/Transforms/cim-placement-loop.mlir's zero_trip_count_is_left_alone
+  // asserts cim.program is still textually inside scf.for. This test stays
+  // for what it IS good for -- that the pipeline compiles and executes a
+  // zero-trip loop without crashing, and that a loop which never runs
+  // genuinely never writes its output.
+  std::string source = R"mlir(
+    memref.global "private" constant @w : memref<4x4xi8> = dense<1>
+    memref.global "private" constant @a : memref<1x4xi8> = dense<2>
+    func.func @main() {
+      %w = memref.get_global @w : memref<4x4xi8>
+      %aInit = memref.get_global @a : memref<1x4xi8>
+      %a = memref.alloc() : memref<1x4xi8>
+      memref.copy %aInit, %a : memref<1x4xi8> to memref<1x4xi8>
+      %out = memref.alloc() : memref<1x4xi32>
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      scf.for %i = %c0 to %c0 step %c1 {
+        linalg.matmul_transpose_b ins(%a, %w : memref<1x4xi8>, memref<4x4xi8>)
+          outs(%out : memref<1x4xi32>)
+      }
+      %u = memref.cast %out : memref<1x4xi32> to memref<*xi32>
+      func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+      memref.dealloc %a : memref<1x4xi8>
+      memref.dealloc %out : memref<1x4xi32>
+      return
+    }
+  )mlir";
+  source = "func.func private @cim_print_i32(memref<*xi32>)\n" + source;
+
+  std::string error;
+  const RunResult placed =
+      compileSource(source, /*withPlacement=*/true, &error);
+  // The matmul is inside a loop that never runs, so cim-partition never sees
+  // that -- it reasons about the IR structurally, not about trip counts --
+  // and offloads it exactly as it would outside a loop; the only question
+  // this case can answer is whether cim-placement hoisted the resulting
+  // cim.program out, which it must not.
+  if (!error.empty()) {
+    CIM_FAIL("placement_leaves_a_zero_trip_count_loop_alone: " + error);
+    return;
+  }
+  CIM_EXPECT_EQ(placed.programs, 1u);
+  // The loop never ran, so %out was never written by the mvm and reads back
+  // as the zero-fill every allocation starts with -- confirming this is
+  // genuinely testing "did not run", not merely "did not crash".
+  CIM_EXPECT_EQ(placed.prints.size(), size_t(1));
+  if (!placed.prints.empty())
+    for (int32_t value : placed.prints.front())
+      CIM_EXPECT_EQ(value, 0);
 }

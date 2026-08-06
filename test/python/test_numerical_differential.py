@@ -548,3 +548,151 @@ def test_placement_does_nothing_to_a_single_matmul(cim_opt, cim_run):
             f"{n}x{k}: a single matmul repeats no weights, so placement must "
             f"not change the program count ({plain_prof['programs']} -> "
             f"{placed_prof['programs']})")
+
+
+# ---------------------------------------------------------------------------
+# cim-placement loop hoisting: cross-iteration reuse
+# ---------------------------------------------------------------------------
+#
+# Everything above finds reuse WITHIN one textual execution of a block. A
+# cim.program inside an scf.for body still costs a real reprogram on every
+# runtime iteration unless something hoists it out -- which is a different
+# claim from anything checked above, and needs its own oracle comparison:
+# the printed values must match numpy across every iteration, and the
+# runtime program count must not scale with how many times the loop runs.
+
+
+def build_loop_module(w, acts, n, k):
+    """One matmul inside an scf.for over len(acts) iterations.
+
+    Weights are one shared global, used identically every runtime
+    iteration -- loop-invariant by construction. Activations are staged
+    from a 2D global sliced by the induction variable, so their addressing
+    genuinely depends on it and must never be hoisted.
+    """
+    iters = len(acts)
+    rows = ", ".join("[" + ", ".join(str(int(v)) for v in row) + "]" for row in w)
+    act_rows = ", ".join(
+        "[" + ", ".join(str(int(v)) for v in row) + "]" for row in acts)
+    return f"""\
+memref.global "private" constant @w : memref<{n}x{k}xi8> = dense<[{rows}]>
+memref.global "private" constant @acts : memref<{iters}x{k}xi8> = dense<[{act_rows}]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {{
+  %w = memref.get_global @w : memref<{n}x{k}xi8>
+  %acts = memref.get_global @acts : memref<{iters}x{k}xi8>
+  %out = memref.alloc() : memref<{iters}x{n}xi32>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %cN = arith.constant {iters} : index
+  scf.for %i = %c0 to %cN step %c1 {{
+    %actRow = memref.subview %acts[%i, 0] [1, {k}] [1, 1]
+      : memref<{iters}x{k}xi8> to memref<1x{k}xi8, strided<[{k}, 1], offset: ?>>
+    %actLocal = memref.alloc() : memref<1x{k}xi8>
+    memref.copy %actRow, %actLocal
+      : memref<1x{k}xi8, strided<[{k}, 1], offset: ?>> to memref<1x{k}xi8>
+    %outRow = memref.subview %out[%i, 0] [1, {n}] [1, 1]
+      : memref<{iters}x{n}xi32> to memref<1x{n}xi32, strided<[{n}, 1], offset: ?>>
+    linalg.matmul_transpose_b ins(%actLocal, %w : memref<1x{k}xi8>, memref<{n}x{k}xi8>)
+      outs(%outRow : memref<1x{n}xi32, strided<[{n}, 1], offset: ?>>)
+    memref.dealloc %actLocal : memref<1x{k}xi8>
+  }}
+  %cast = memref.cast %out : memref<{iters}x{n}xi32> to memref<*xi32>
+  func.call @cim_print_i32(%cast) : (memref<*xi32>) -> ()
+  memref.dealloc %out : memref<{iters}x{n}xi32>
+  return
+}}
+"""
+
+
+def check_loop_case(cim_opt, cim_run, w, acts, label):
+    """Both pipelines must match numpy row-by-row, match each other, and
+    placement must never increase programs or change mvms. Returns the two
+    profiles so callers can assert on the hoist itself."""
+    source = build_loop_module(w, acts, *w.shape)
+    (plain_out, plain_prof), (placed_out, placed_prof) = compile_both(
+        cim_opt, cim_run, source)
+
+    want = np.concatenate([reference(w, act) for act in acts])
+    for tag, outputs in (("unplaced", plain_out), ("placed", placed_out)):
+        assert len(outputs) == 1, f"{label} ({tag}): expected one printed buffer"
+        if not np.array_equal(outputs[0], want):
+            pytest.fail(
+                f"{label} ({tag}): loop output disagrees with numpy\n"
+                f"  ours  = {outputs[0]}\n  numpy = {want}\n  W =\n{w}")
+
+    # One mvm per tile-sized block per iteration -- tiny-4x4.yaml tiles are
+    # TILE x TILE, and every shape in these tests is an exact multiple of it.
+    n, k = w.shape
+    blocks_per_iteration = (n // TILE) * (k // TILE)
+    expected_mvms = blocks_per_iteration * len(acts)
+    assert placed_prof["mvms"] == plain_prof["mvms"] == expected_mvms, (
+        f"{label}: expected {expected_mvms} mvms ({blocks_per_iteration} "
+        f"block(s) x {len(acts)} iteration(s)) unchanged by placement, got "
+        f"unplaced={plain_prof['mvms']} placed={placed_prof['mvms']}")
+    assert placed_prof["programs"] <= plain_prof["programs"], (
+        f"{label}: placement INCREASED programs from "
+        f"{plain_prof['programs']} to {placed_prof['programs']}")
+    return plain_prof, placed_prof
+
+
+def test_loop_hoisting_keeps_the_numbers_on_random_weights(cim_opt, cim_run):
+    """Random weights and activations, several shapes and iteration counts,
+    checked against numpy row by row -- the main differential for hoisting."""
+    rng = random.Random(SEED ^ 0x105710)
+
+    for n, k in ((4, 4), (8, 4), (4, 8), (8, 8)):
+        for iters in (2, 3, 5):
+            w = np.array([rng.randint(-128, 127) for _ in range(n * k)],
+                        dtype=np.int8).reshape(n, k)
+            acts = np.array(
+                [[rng.randint(-128, 127) for _ in range(k)]
+                 for _ in range(iters)], dtype=np.int8)
+            check_loop_case(cim_opt, cim_run, w, acts, f"{n}x{k}x{iters}")
+
+
+def test_loop_hoisting_program_count_is_independent_of_iterations(cim_opt,
+                                                                   cim_run):
+    """The claim under test is specifically decoupling: with one weight
+    block that fits, programs must stay at 1 (hoisted) no matter how many
+    iterations run, while the unplaced pipeline scales 1:1 with iterations.
+    """
+    rng = random.Random(SEED ^ 0x105710)
+    w = np.array([rng.randint(-128, 127) for _ in range(4 * 4)],
+                dtype=np.int8).reshape(4, 4)
+
+    for iters in (1, 2, 5, 9):
+        acts = np.array(
+            [[rng.randint(-128, 127) for _ in range(4)] for _ in range(iters)],
+            dtype=np.int8)
+        plain_prof, placed_prof = check_loop_case(
+            cim_opt, cim_run, w, acts, f"iters={iters}")
+        assert plain_prof["programs"] == iters, (
+            f"iters={iters}: unplaced should reprogram once per runtime "
+            f"iteration, got {plain_prof['programs']}")
+        assert placed_prof["programs"] == 1, (
+            f"iters={iters}: hoisting should make this independent of "
+            f"iteration count, got {placed_prof['programs']}")
+
+
+def test_loop_hoisting_still_wins_partially_under_spill(cim_opt, cim_run):
+    """12x4 weights over 4x4 tiles is 3 distinct blocks on 2 tiles: one tile
+    is stable for a whole iteration (hoisted), the other is reprogrammed
+    mid-iteration (stays in the loop). See the worked schedule in
+    test/mlir/pipeline_e2e_test.cpp's
+    placement_partially_hoists_when_only_some_tiles_are_stable -- this is
+    the same case through the subprocess pipeline instead of in-process.
+    """
+    rng = random.Random(SEED ^ 0x105710)
+    for iters in (2, 4):
+        w = np.array([rng.randint(-128, 127) for _ in range(12 * 4)],
+                    dtype=np.int8).reshape(12, 4)
+        acts = np.array(
+            [[rng.randint(-128, 127) for _ in range(4)] for _ in range(iters)],
+            dtype=np.int8)
+        plain_prof, placed_prof = check_loop_case(
+            cim_opt, cim_run, w, acts, f"spill-loop iters={iters}")
+        assert plain_prof["programs"] == 3 * iters, plain_prof
+        # 1 hoisted (fires once total) + 2 that stay in the loop body
+        # (fire once per iteration each).
+        assert placed_prof["programs"] == 2 * iters + 1, placed_prof

@@ -55,9 +55,14 @@ where an LRU cache would save none. Every case is executed both with and without
 and the outputs must be **identical**: placement is an optimization and is not allowed to
 change an answer.
 
-Reuse is found in straight-line code — across matmuls within a block. Hoisting
-`cim.program` out of an inference loop is not implemented, so the per-inference figures
-below still come from the standalone simulator rather than from compiled IR.
+Reuse is found across matmuls within a block, and now across iterations of an `scf.for`
+too: a `cim.program` is hoisted above the loop when its tile is provably untouched by
+anything else for the whole iteration and the loop's trip count is a compile-time
+constant known positive. That reproduces the headline claim — a model that fits entirely
+reprograms once, no matter how many inferences the loop runs — on compiled IR, checked by
+executing the loop through a real interpreter, not just by inspecting its shape. It does
+**not** replicate a full N-inference Belady solve, which is what the spill-workload
+figures below still come from (`docs/roadmap.md`'s M3 section draws the exact line).
 
 The remaining five passes are registered but their bodies are `TODO` stubs, so nothing
 compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,

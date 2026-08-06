@@ -23,6 +23,7 @@ add_mlir_dialect_library(MLIRCIMTransforms
   MLIRMemRefDialect
   MLIRFuncDialect
   MLIRArithDialect
+  MLIRSCFDialect
 )
 
 # The passes delegate their actual algorithms to the MLIR-free core.

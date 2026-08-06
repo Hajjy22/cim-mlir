@@ -19,6 +19,7 @@ target_link_libraries(cim-mlir-tests PRIVATE
   MLIRMemRefDialect
   MLIRArithDialect
   MLIRLinalgDialect
+  MLIRSCFDialect
   cim_build_flags
 )
 

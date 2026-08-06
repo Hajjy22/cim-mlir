@@ -7,8 +7,10 @@ add_mlir_library(MLIRCIMInterpreter
   LINK_LIBS PUBLIC
   MLIRCIM
   MLIRIR
+  MLIRArithDialect
   MLIRFuncDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
   MLIRSupport
 )
 
