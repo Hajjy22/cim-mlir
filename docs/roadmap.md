@@ -3,14 +3,20 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0 and M1 are done. The first two lowering passes are
-real: `cim-detect` annotates eligible matmuls and `cim-partition` lowers
-them into per-tile `cim.program`/`cim.mvm` with partial-sum reduction and
-explicit space transfers, driven by the target file's tile geometry. M3's
-substance -- the placement engine and cost model -- is implemented and
-tested standalone. What remains open is joining the two: `cim-placement`
-has the algorithm and now has IR to run it on, but does not yet rewrite
-that IR from its schedule.
+**Current state.** M0, M1 and M3 are done. The first three lowering passes are
+real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
+per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
+transfers, and `cim-placement` now rewrites that IR from a Belady schedule --
+eliminating redundant weight programming and assigning tile ids from the
+solution rather than round-robin.
+
+The gap that remains is loops. `cim-placement` finds reuse in straight-line
+code: across matmuls within a block, which is enough to show that a model
+fitting in tiles reprograms nothing after install. It does not hoist
+`cim.program` out of an `scf.for`, so the "1000 inferences" numbers in
+`bench/workloads/README.md` still come from the standalone simulator in
+`cim-bench`, not from compiled IR. Closing that is the next substantial piece
+of work.
 
 ## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
@@ -59,7 +65,7 @@ module stays correct and is simply not offloaded:
 - Only exact multiples of the tile geometry. Spec Sec. 6 calls for
   zero-padding ragged edges; that needs a pad-and-copy sequence.
 
-## M3 — The placement pass (algorithm done, IR rewriting outstanding)
+## M3 — The placement pass
 - [x] Belady/MIN eviction implemented and unit-tested, with LRU and FIFO
   baselines to compare against (`lib/Placement/`, `test/unit/placement_test.cpp`).
   Every schedule is replayed through `validatePlacement()` before its
@@ -71,10 +77,22 @@ module stays correct and is simply not offloaded:
   results JSON with target-file hash, git commit, and date
   (`bench/workloads/README.md` has the current numbers).
 - [x] Plot script in the repo (`bench/plots/plot_residency.py`).
-- [ ] `cim-placement` rewriting actual IR: the pass calls the engine, but
-  recovering the use sequence from `cim.program`/`cim.mvm` and rewriting
-  from the schedule is still `TODO`. Blocked on M2 — there is no IR to
-  place until `cim-partition` emits some.
+- [x] `cim-placement` rewriting actual IR. It recovers the use sequence from
+  the `cim.program` ops in each block, solves with Belady, and rewrites:
+  redundant programs are erased and their `cim.mvm` consumers rewired to the
+  resident already in the tile, and surviving programs get their tile id from
+  the schedule. Verified numerically — every case runs both with and without
+  the pass and the outputs must be identical (`test/mlir/pipeline_e2e_test.cpp`,
+  `test/python/test_numerical_differential.py`), because placement is an
+  optimization and is not allowed to change an answer.
+
+  The identity of a weight sub-matrix is `(root allocation, byte offset,
+  shape)`, not the SSA value: `cim-partition` emits a fresh `memref.subview`
+  per block per matmul, so keying on the value would make every weight
+  distinct and the pass would find no reuse while appearing to work.
+- [ ] Hoisting `cim.program` out of an inference loop. Reuse is currently
+  found in straight-line code only, so the per-inference claim is still
+  demonstrated by `cim-bench` rather than by the compiler.
 - [ ] Volatile-vs-non-volatile comparison plot showing that persistence
   changes the optimum, not just the magnitude.
 

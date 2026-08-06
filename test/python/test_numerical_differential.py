@@ -82,13 +82,22 @@ class PipelineError(Exception):
     pass
 
 
-def compile_and_run(cim_opt, cim_run, w, act, target=TINY_TARGET):
-    """Run the real toolchain over one matmul; return (outputs, profile)."""
-    source = build_module(w, act)
+def compile_and_run(cim_opt, cim_run, w, act, target=TINY_TARGET,
+                    placement=False, source=None):
+    """Run the real toolchain over one matmul; return (outputs, profile).
 
-    compiled = run(
-        [cim_opt, "-", "--cim-detect", f"--cim-partition=target-yaml={target}"],
-        stdin=source)
+    `placement` appends cim-placement to the pipeline. `source` overrides the
+    generated single-matmul module, for callers that build their own.
+    """
+    if source is None:
+        source = build_module(w, act)
+
+    pipeline = [cim_opt, "-", "--cim-detect",
+                f"--cim-partition=target-yaml={target}"]
+    if placement:
+        pipeline.append(f"--cim-placement=target-yaml={target}")
+
+    compiled = run(pipeline, stdin=source)
     if compiled.returncode != 0:
         raise PipelineError(f"cim-opt failed:\n{compiled.stderr}\n{source}")
 
@@ -111,12 +120,22 @@ def compile_and_run(cim_opt, cim_run, w, act, target=TINY_TARGET):
 
 
 def parse_output(text):
+    outputs = parse_all_outputs(text)
+    return outputs[0]
+
+
+def parse_all_outputs(text):
+    """Every printed result, in order. A two-matmul module prints twice, and
+    checking only the first would let a bug in the second go unnoticed."""
+    outputs = []
     for line in text.splitlines():
         if line.startswith("cim_print_i32"):
             data = line.split("data=[", 1)[1].rstrip("]")
-            return np.array([int(t) for t in data.split(",") if t],
-                            dtype=np.int64)
-    raise PipelineError(f"no cim_print_i32 line in cim-run output:\n{text}")
+            outputs.append(np.array([int(t) for t in data.split(",") if t],
+                                    dtype=np.int64))
+    if not outputs:
+        raise PipelineError(f"no cim_print_i32 line in cim-run output:\n{text}")
+    return outputs
 
 
 def parse_profile(text):
@@ -338,3 +357,194 @@ def test_the_pipeline_reports_a_bad_target_instead_of_guessing(cim_opt):
     assert result.returncode != 0, (
         "cim-opt accepted a nonexistent target file; every cost number it "
         "then produced would be against an imaginary device")
+
+
+# ---------------------------------------------------------------------------
+# cim-placement: the same numbers, fewer weight writes
+# ---------------------------------------------------------------------------
+#
+# cim-placement removes cim.program ops it has proven redundant. That is a
+# semantic change to IR whose whole design goal is that weight writes are NOT
+# removable by generic passes -- cim.program carries MemoryEffects<[MemWrite]>
+# precisely so nothing else can touch it. So the pass needs the strongest
+# evidence available that it is right, and this is it: the same random
+# matmuls, compiled both ways, both checked against numpy.
+#
+# The C++ e2e suite already does an in-process version of this. What the
+# subprocess version adds is that it runs the shipped binaries over textual
+# IR, so the placed module survives a print/parse round trip -- a rewrite
+# that produced IR which only happened to work in memory would be caught here
+# and nowhere else.
+
+
+def build_two_matmul_module(w, act_a, act_b):
+    """Two matmuls in one block sharing one weight global.
+
+    A single matmul uses each weight block exactly once, so cim-placement has
+    nothing to reuse and running it proves nothing. Weight repetition is the
+    entire precondition for the pass doing any work.
+    """
+    n, k = w.shape
+    rows = ", ".join("[" + ", ".join(str(int(v)) for v in row) + "]" for row in w)
+    a1 = ", ".join(str(int(v)) for v in act_a)
+    a2 = ", ".join(str(int(v)) for v in act_b)
+    body = ""
+    for tag, init in (("1", "a1"), ("2", "a2")):
+        body += f"""\
+  %i{tag} = memref.get_global @{init} : memref<1x{k}xi8>
+  %s{tag} = memref.alloc() : memref<1x{k}xi8>
+  memref.copy %i{tag}, %s{tag} : memref<1x{k}xi8> to memref<1x{k}xi8>
+  %o{tag} = memref.alloc() : memref<1x{n}xi32>
+  linalg.matmul_transpose_b ins(%s{tag}, %w : memref<1x{k}xi8>, memref<{n}x{k}xi8>)
+    outs(%o{tag} : memref<1x{n}xi32>)
+  %u{tag} = memref.cast %o{tag} : memref<1x{n}xi32> to memref<*xi32>
+  func.call @cim_print_i32(%u{tag}) : (memref<*xi32>) -> ()
+  memref.dealloc %s{tag} : memref<1x{k}xi8>
+  memref.dealloc %o{tag} : memref<1x{n}xi32>
+"""
+    return f"""\
+memref.global "private" constant @w : memref<{n}x{k}xi8> = dense<[{rows}]>
+memref.global "private" constant @a1 : memref<1x{k}xi8> = dense<[[{a1}]]>
+memref.global "private" constant @a2 : memref<1x{k}xi8> = dense<[[{a2}]]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {{
+  %w = memref.get_global @w : memref<{n}x{k}xi8>
+{body}  return
+}}
+"""
+
+
+def compile_both(cim_opt, cim_run, source):
+    """Returns ((plain_outputs, plain_profile), (placed_outputs, placed_profile))."""
+    results = []
+    for placement in (False, True):
+        pipeline = [cim_opt, "-", "--cim-detect",
+                    f"--cim-partition=target-yaml={TINY_TARGET}"]
+        if placement:
+            pipeline.append(f"--cim-placement=target-yaml={TINY_TARGET}")
+        compiled = run(pipeline, stdin=source)
+        if compiled.returncode != 0:
+            raise PipelineError(f"cim-opt failed:\n{compiled.stderr}\n{source}")
+        if "cim.program" not in compiled.stdout:
+            raise PipelineError(
+                "no cim.program survived, so this case proves nothing:\n"
+                + compiled.stdout)
+        executed = run([cim_run, f"--target-yaml={TINY_TARGET}", "--profile",
+                        "-"], stdin=compiled.stdout)
+        if executed.returncode != 0:
+            raise PipelineError(
+                f"cim-run failed:\n{executed.stderr}\n--- IR ---\n"
+                f"{compiled.stdout}")
+        results.append((parse_all_outputs(executed.stdout),
+                        parse_profile(executed.stdout)))
+    return results[0], results[1]
+
+
+def check_placement_case(cim_opt, cim_run, w, act_a, act_b, label):
+    """Both pipelines must match numpy, match each other, and placement must
+    never increase the program count or change the mvm count."""
+    source = build_two_matmul_module(w, act_a, act_b)
+    (plain_out, plain_prof), (placed_out, placed_prof) = compile_both(
+        cim_opt, cim_run, source)
+
+    want = [reference(w, act_a), reference(w, act_b)]
+    for tag, outputs in (("unplaced", plain_out), ("placed", placed_out)):
+        assert len(outputs) == 2, f"{label} ({tag}): expected 2 prints"
+        for i, (got, expected) in enumerate(zip(outputs, want)):
+            if not np.array_equal(got, expected):
+                pytest.fail(
+                    f"{label} ({tag}): matmul {i} disagrees with numpy\n"
+                    f"  ours  = {got}\n  numpy = {expected}\n  W =\n{w}")
+
+    # Placement is an optimization. Fewer weight writes is the point; the same
+    # computation is the constraint.
+    assert placed_prof["mvms"] == plain_prof["mvms"], (
+        f"{label}: placement changed the mvm count from {plain_prof['mvms']} "
+        f"to {placed_prof['mvms']} -- it removes redundant weight writes, "
+        "never computation")
+    assert placed_prof["programs"] <= plain_prof["programs"], (
+        f"{label}: placement INCREASED programs from {plain_prof['programs']} "
+        f"to {placed_prof['programs']}")
+    return plain_prof, placed_prof
+
+
+def test_placement_keeps_the_numbers_on_random_shapes(cim_opt, cim_run):
+    """The main event: random weights, both pipelines, numpy as the judge."""
+    rng = random.Random(SEED ^ 0x91ace)
+
+    for n, k in SHAPES:
+        w = np.array([rng.randint(-128, 127) for _ in range(n * k)],
+                     dtype=np.int8).reshape(n, k)
+        act_a = np.array([rng.randint(-128, 127) for _ in range(k)], np.int8)
+        act_b = np.array([rng.randint(-128, 127) for _ in range(k)], np.int8)
+        check_placement_case(cim_opt, cim_run, w, act_a, act_b, f"{n}x{k}")
+
+
+def test_placement_eliminates_reprogramming_when_the_model_fits(cim_opt,
+                                                                 cim_run):
+    """8x4 over 4x4 tiles is 2 blocks and the target has 2 tiles.
+
+    Two matmuls give the use sequence [0,1,0,1]: after the first pass nothing
+    needs reprogramming. This is the project's headline claim, and until
+    cim-placement rewrote IR it was only ever demonstrated by the standalone
+    simulator in cim-bench, never by the compiler.
+    """
+    rng = random.Random(SEED)
+    w = np.array([rng.randint(-128, 127) for _ in range(8 * 4)],
+                 dtype=np.int8).reshape(8, 4)
+    act_a = np.array([rng.randint(-128, 127) for _ in range(4)], np.int8)
+    act_b = np.array([rng.randint(-128, 127) for _ in range(4)], np.int8)
+
+    plain, placed = check_placement_case(cim_opt, cim_run, w, act_a, act_b,
+                                         "fits")
+    assert plain["programs"] == 4, plain
+    assert placed["programs"] == 2, (
+        f"the weights fit in the tiles, so the second matmul must reprogram "
+        f"nothing, but {placed['programs']} programs survived")
+
+
+def test_placement_still_wins_under_spill(cim_opt, cim_run):
+    """8x8 over 4x4 tiles is 4 blocks on 2 tiles: [0,1,2,3,0,1,2,3].
+
+    Belady evicts the block whose next use is furthest away, so it keeps w0
+    across steps 2-3 and reuses it at step 4, then does the same for w3 --
+    6 programs instead of 8. LRU evicts w0 at step 2, exactly the block
+    needed two steps later, and pays all 8. The win under pressure is the
+    part of the argument that compile-time knowledge actually buys.
+    """
+    rng = random.Random(SEED ^ 0x5911)
+    w = np.array([rng.randint(-128, 127) for _ in range(8 * 8)],
+                 dtype=np.int8).reshape(8, 8)
+    act_a = np.array([rng.randint(-128, 127) for _ in range(8)], np.int8)
+    act_b = np.array([rng.randint(-128, 127) for _ in range(8)], np.int8)
+
+    plain, placed = check_placement_case(cim_opt, cim_run, w, act_a, act_b,
+                                         "spill")
+    assert plain["programs"] == 8, plain
+    assert placed["programs"] == 6, (
+        f"hand-derived Belady schedule saves exactly 2 of 8 programs here, "
+        f"got {placed['programs']}")
+
+
+def test_placement_does_nothing_to_a_single_matmul(cim_opt, cim_run):
+    """A single matmul uses each block once, so there is nothing to reuse.
+
+    Guards the other direction from the tests above: a pass that eliminated
+    programs too eagerly would show a saving here, and the numbers would be
+    wrong in a way only numpy notices.
+    """
+    rng = random.Random(SEED ^ 0x1)
+    for n, k in SHAPES:
+        w = np.array([rng.randint(-128, 127) for _ in range(n * k)],
+                     dtype=np.int8).reshape(n, k)
+        act = np.array([rng.randint(-128, 127) for _ in range(k)], np.int8)
+        source = build_module(w, act)
+        (plain_out, plain_prof), (placed_out, placed_prof) = compile_both(
+            cim_opt, cim_run, source)
+
+        assert np.array_equal(placed_out[0], reference(w, act)), f"{n}x{k}"
+        assert np.array_equal(plain_out[0], placed_out[0]), f"{n}x{k}"
+        assert plain_prof["programs"] == placed_prof["programs"], (
+            f"{n}x{k}: a single matmul repeats no weights, so placement must "
+            f"not change the program count ({plain_prof['programs']} -> "
+            f"{placed_prof['programs']})")

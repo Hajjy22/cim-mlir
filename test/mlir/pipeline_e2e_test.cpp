@@ -129,44 +129,64 @@ std::string buildModule(const std::vector<int8_t> &w,
   return os.str();
 }
 
-/// Parse a printed "cim_print_i32 shape=[...] data=[a,b,c]" line.
-std::vector<int32_t> parsePrinted(const std::string &text, std::string *error) {
-  const size_t dataPos = text.find("data=[");
-  if (dataPos == std::string::npos) {
+/// Parse every "cim_print_i32 shape=[...] data=[a,b,c]" line in the output.
+/// A module with two matmuls prints twice, and comparing only the first
+/// would let a bug in the second go unnoticed.
+std::vector<std::vector<int32_t>> parseAllPrinted(const std::string &text,
+                                                   std::string *error) {
+  std::vector<std::vector<int32_t>> prints;
+  size_t cursor = 0;
+  while ((cursor = text.find("data=[", cursor)) != std::string::npos) {
+    const size_t start = cursor + 6;
+    const size_t end = text.find(']', start);
+    if (end == std::string::npos) {
+      *error = "unterminated data= list";
+      return {};
+    }
+    std::vector<int32_t> values;
+    std::stringstream ss(text.substr(start, end - start));
+    std::string token;
+    while (std::getline(ss, token, ','))
+      if (!token.empty())
+        values.push_back(static_cast<int32_t>(std::stol(token)));
+    prints.push_back(std::move(values));
+    cursor = end;
+  }
+  if (prints.empty())
     *error = "no data= in interpreter output: " + text;
-    return {};
-  }
-  const size_t start = dataPos + 6;
-  const size_t end = text.find(']', start);
-  if (end == std::string::npos) {
-    *error = "unterminated data= list";
-    return {};
-  }
-  std::vector<int32_t> values;
-  std::stringstream ss(text.substr(start, end - start));
-  std::string token;
-  while (std::getline(ss, token, ','))
-    if (!token.empty())
-      values.push_back(static_cast<int32_t>(std::stol(token)));
-  return values;
+  return prints;
 }
 
-/// Compile and run one matmul, returning the computed output.
-std::vector<int32_t> compileAndRun(const std::vector<int8_t> &w,
-                                    const std::vector<int8_t> &act, int n,
-                                    int k, std::string *error) {
+/// What one compile-and-execute produced.
+struct RunResult {
+  std::vector<std::vector<int32_t>> prints;
+  /// cim.program ops surviving in the final IR. This is the quantity
+  /// cim-placement exists to reduce, so it is asserted, not just observed.
+  unsigned programs = 0;
+  unsigned mvms = 0;
+};
+
+/// Compile a module source through the pipeline and execute it.
+///
+/// `withPlacement` selects between detect+partition and
+/// detect+partition+placement. Running the *same* source both ways is what
+/// makes the invariance test below possible: placement is an optimization,
+/// so any difference in the numbers is a bug in placement by definition.
+RunResult compileSource(const std::string &source, bool withPlacement,
+                        std::string *error) {
+  RunResult result;
+
   DialectRegistry registry;
   registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
                   arith::ArithDialect, linalg::LinalgDialect>();
   MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
-  const std::string source = buildModule(w, act, n, k);
   OwningOpRef<ModuleOp> module =
       parseSourceString<ModuleOp>(source, &context);
   if (!module) {
     *error = "failed to parse the generated module";
-    return {};
+    return result;
   }
 
   PassManager pm(&context);
@@ -174,24 +194,34 @@ std::vector<int32_t> compileAndRun(const std::vector<int8_t> &w,
   auto partition = cim::createCIMPartitionPass();
   if (failed(partition->initializeOptions("target-yaml=" + tinyTarget()))) {
     *error = "failed to set cim-partition options";
-    return {};
+    return result;
   }
   pm.addPass(std::move(partition));
 
+  if (withPlacement) {
+    auto placement = cim::createCIMPlacementPass();
+    if (failed(placement->initializeOptions("target-yaml=" + tinyTarget()))) {
+      *error = "failed to set cim-placement options";
+      return result;
+    }
+    pm.addPass(std::move(placement));
+  }
+
   if (failed(pm.run(*module))) {
     *error = "pass pipeline failed";
-    return {};
+    return result;
   }
+
+  module->walk([&](cim::ProgramOp) { ++result.programs; });
+  module->walk([&](cim::MvmOp) { ++result.mvms; });
 
   // If cim-partition declined the candidate it would leave linalg in place
   // and the interpreter would reject it -- but check explicitly so the
   // failure says what actually happened.
-  bool sawProgram = false;
-  module->walk([&](cim::ProgramOp) { sawProgram = true; });
-  if (!sawProgram) {
-    *error = "cim-partition emitted no cim.program: the matmul was not "
+  if (result.programs == 0) {
+    *error = "the pipeline emitted no cim.program: the matmul was not "
              "offloaded, so this test would prove nothing";
-    return {};
+    return result;
   }
 
   std::string captured;
@@ -202,10 +232,79 @@ std::vector<int32_t> compileAndRun(const std::vector<int8_t> &w,
 
   if (failed(cim::run(*module, "main", options))) {
     *error = "interpreter failed to execute the compiled module";
-    return {};
+    return result;
   }
   stream.flush();
-  return parsePrinted(captured, error);
+  result.prints = parseAllPrinted(captured, error);
+  return result;
+}
+
+/// Two matmuls in ONE block against the SAME weight global.
+///
+/// This shape exists because cim-placement can only find reuse when a weight
+/// sub-matrix is used more than once, and a single matmul uses each of its
+/// blocks exactly once. Without a module like this the pass is a no-op by
+/// construction and every test of it would pass while proving nothing --
+/// the same trap that made eight e2e tests vacuous before the cim.program
+/// guard was added.
+///
+/// Both activations are staged through memref.alloc + memref.copy because
+/// cim-detect requires exactly one constant operand per matmul.
+std::string buildTwoMatmulModule(const std::vector<int8_t> &w,
+                                 const std::vector<int8_t> &actA,
+                                 const std::vector<int8_t> &actB, int n,
+                                 int k) {
+  std::ostringstream os;
+  os << "memref.global \"private\" constant @w : memref<" << n << "x" << k
+     << "xi8> = dense<[";
+  for (int i = 0; i < n; ++i) {
+    os << (i ? ", [" : "[");
+    for (int j = 0; j < k; ++j)
+      os << (j ? ", " : "") << static_cast<int>(w[i * k + j]);
+    os << "]";
+  }
+  os << "]>\n";
+  os << "memref.global \"private\" constant @a1 : memref<1x" << k
+     << "xi8> = dense<[[" << denseList(actA) << "]]>\n";
+  os << "memref.global \"private\" constant @a2 : memref<1x" << k
+     << "xi8> = dense<[[" << denseList(actB) << "]]>\n";
+  os << "func.func private @cim_print_i32(memref<*xi32>)\n";
+  os << "func.func @main() {\n";
+  os << "  %w = memref.get_global @w : memref<" << n << "x" << k << "xi8>\n";
+
+  for (const char *suffix : {"1", "2"}) {
+    os << "  %i" << suffix << " = memref.get_global @a" << suffix
+       << " : memref<1x" << k << "xi8>\n";
+    os << "  %a" << suffix << " = memref.alloc() : memref<1x" << k << "xi8>\n";
+    os << "  memref.copy %i" << suffix << ", %a" << suffix << " : memref<1x"
+       << k << "xi8> to memref<1x" << k << "xi8>\n";
+    os << "  %o" << suffix << " = memref.alloc() : memref<1x" << n
+       << "xi32>\n";
+    os << "  linalg.matmul_transpose_b ins(%a" << suffix << ", %w : memref<1x"
+       << k << "xi8>, memref<" << n << "x" << k << "xi8>) outs(%o" << suffix
+       << " : memref<1x" << n << "xi32>)\n";
+    os << "  %u" << suffix << " = memref.cast %o" << suffix << " : memref<1x"
+       << n << "xi32> to memref<*xi32>\n";
+    os << "  func.call @cim_print_i32(%u" << suffix
+       << ") : (memref<*xi32>) -> ()\n";
+  }
+  for (const char *suffix : {"1", "2"}) {
+    os << "  memref.dealloc %a" << suffix << " : memref<1x" << k << "xi8>\n";
+    os << "  memref.dealloc %o" << suffix << " : memref<1x" << n << "xi32>\n";
+  }
+  os << "  return\n}\n";
+  return os.str();
+}
+
+/// Compile and run one matmul, returning the computed output.
+std::vector<int32_t> compileAndRun(const std::vector<int8_t> &w,
+                                    const std::vector<int8_t> &act, int n,
+                                    int k, std::string *error) {
+  const RunResult result =
+      compileSource(buildModule(w, act, n, k), /*withPlacement=*/false, error);
+  if (!error->empty())
+    return {};
+  return result.prints.front();
 }
 
 /// Run one case and compare against the reference.
@@ -328,4 +427,239 @@ CIM_TEST(e2e_many_blocks_stress_reuse_in_both_dimensions) {
   const std::vector<int8_t> w = sequential(16 * 8, -64, 1);
   const std::vector<int8_t> act = sequential(8, -4, 1);
   checkCase("stress reuse", w, act, 16, 8);
+}
+
+//===----------------------------------------------------------------------===//
+// cim-placement: the flagship pass
+//
+// Until this section existed, cim-placement was unreachable dead code -- its
+// use sequence was never populated, so the engine was never called. These
+// tests are what make the claim "optimal placement eliminates redundant
+// reprogramming" a checked property of the compiler rather than a property
+// of the standalone simulator in cim-bench.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Run one source both ways and require the numbers to be identical.
+/// Returns the two results so callers can additionally assert on counts.
+std::pair<RunResult, RunResult> runBothWays(const char *label,
+                                            const std::string &source) {
+  std::string error;
+  const RunResult plain = compileSource(source, /*withPlacement=*/false,
+                                        &error);
+  if (!error.empty()) {
+    CIM_FAIL(std::string(label) + " (without placement): " + error);
+    return {};
+  }
+  const RunResult placed = compileSource(source, /*withPlacement=*/true,
+                                         &error);
+  if (!error.empty()) {
+    CIM_FAIL(std::string(label) + " (with placement): " + error);
+    return {};
+  }
+
+  // THE INVARIANT. cim-placement is an optimization: it may emit fewer
+  // cim.program ops, and it may not change a single output value. Every
+  // other assertion in this file is about how well it optimizes; this one
+  // is about whether it is allowed to run at all.
+  if (plain.prints.size() != placed.prints.size()) {
+    CIM_FAIL(std::string(label) + ": placement changed the number of printed "
+             "results from " + std::to_string(plain.prints.size()) + " to " +
+             std::to_string(placed.prints.size()));
+    return {};
+  }
+  for (size_t p = 0; p < plain.prints.size(); ++p) {
+    if (plain.prints[p].size() != placed.prints[p].size()) {
+      CIM_FAIL(std::string(label) + ": placement changed the width of print " +
+               std::to_string(p));
+      return {};
+    }
+    for (size_t i = 0; i < plain.prints[p].size(); ++i) {
+      if (plain.prints[p][i] != placed.prints[p][i]) {
+        CIM_FAIL(std::string(label) + ": placement changed print " +
+                 std::to_string(p) + " element " + std::to_string(i) +
+                 " from " + std::to_string(plain.prints[p][i]) + " to " +
+                 std::to_string(placed.prints[p][i]));
+        return {};
+      }
+    }
+  }
+
+  // mvms must never change: placement removes redundant weight writes, not
+  // computation. A pass that dropped an mvm would keep the printed values
+  // of an earlier output and look correct on a symmetric case.
+  if (plain.mvms != placed.mvms)
+    CIM_FAIL(std::string(label) + ": placement changed the mvm count from " +
+             std::to_string(plain.mvms) + " to " + std::to_string(placed.mvms));
+
+  return {plain, placed};
+}
+
+/// Reference for the two-matmul module: both matmuls share `w`.
+void checkTwoMatmulValues(const char *label, const RunResult &result,
+                          const std::vector<int8_t> &w,
+                          const std::vector<int8_t> &actA,
+                          const std::vector<int8_t> &actB, int n, int k) {
+  if (result.prints.size() != 2) {
+    CIM_FAIL(std::string(label) + ": expected 2 printed results, got " +
+             std::to_string(result.prints.size()));
+    return;
+  }
+  const std::vector<std::vector<int8_t>> acts = {actA, actB};
+  for (size_t p = 0; p < 2; ++p) {
+    const std::vector<int32_t> want = reference(w, acts[p], n, k);
+    if (result.prints[p] != want) {
+      CIM_FAIL(std::string(label) + ": matmul " + std::to_string(p) +
+               " disagrees with the reference");
+      return;
+    }
+  }
+}
+
+} // namespace
+
+CIM_TEST(placement_never_changes_the_numbers_on_any_single_matmul_case) {
+  // The invariance check applied to the same shapes the nine tests above
+  // cover. Placement finds no reuse in any of them -- each block is used
+  // once -- so this is specifically a test that a pass with nothing to do
+  // does nothing, including on the multi-block and tile-reuse cases where
+  // it has the most opportunity to corrupt tile assignment.
+  struct Case {
+    const char *label;
+    int n, k;
+  };
+  for (const Case &c : {Case{"4x4", 4, 4}, Case{"8x4", 8, 4}, Case{"4x8", 4, 8},
+                        Case{"8x8", 8, 8}, Case{"16x4", 16, 4},
+                        Case{"16x8", 16, 8}}) {
+    const std::vector<int8_t> w = sequential(c.n * c.k, -40, 1);
+    const std::vector<int8_t> act = sequential(c.k, -3, 2);
+    const auto [plain, placed] =
+        runBothWays(c.label, buildModule(w, act, c.n, c.k));
+    if (plain.programs == 0)
+      continue; // runBothWays already reported the failure
+    // Single matmul: every block distinct, so nothing can be reused.
+    if (placed.programs != plain.programs)
+      CIM_FAIL(std::string(c.label) +
+               ": a single matmul has no repeated weights, so placement must "
+               "not change the program count, but it went from " +
+               std::to_string(plain.programs) + " to " +
+               std::to_string(placed.programs));
+  }
+}
+
+CIM_TEST(placement_eliminates_reprogramming_when_the_weights_fit) {
+  // THE HEADLINE CLAIM, on real IR. 8x4 weights over 4x4 tiles is 2 blocks;
+  // the target has 2 tiles; two matmuls give the use sequence [0,1,0,1].
+  // Everything fits, so after the first pass nothing is reprogrammed: 4
+  // cim.program ops must become 2.
+  const std::vector<int8_t> w = sequential(8 * 4, -16, 1);
+  const std::vector<int8_t> actA = {10, 20, 30, 40};
+  const std::vector<int8_t> actB = {1, -2, 3, -4};
+
+  const auto [plain, placed] =
+      runBothWays("fits", buildTwoMatmulModule(w, actA, actB, 8, 4));
+  if (plain.programs == 0)
+    return;
+
+  CIM_EXPECT_EQ(plain.programs, 4u);
+  CIM_EXPECT_EQ(placed.programs, 2u);
+  CIM_EXPECT_EQ(placed.mvms, 4u);
+  checkTwoMatmulValues("fits", placed, w, actA, actB, 8, 4);
+}
+
+CIM_TEST(placement_still_wins_under_spill_pressure) {
+  // 8x8 over 4x4 tiles is 2 N-blocks x 2 K-blocks = 4 distinct weights on a
+  // 2-tile device; two matmuls give the use sequence [0,1,2,3,0,1,2,3].
+  //
+  // Worked by hand, because a test that just prints whatever the pass
+  // returns asserts nothing. Belady evicts the resident whose next use is
+  // furthest away:
+  //
+  //   step 0  w0 miss, free tile        program 1   resident {0}
+  //   step 1  w1 miss, free tile        program 2   resident {0,1}
+  //   step 2  w2 miss, full: next use of w0 is 4, of w1 is 5 -> evict w1
+  //                                     program 3   resident {0,2}
+  //   step 3  w3 miss, full: next use of w0 is 4, of w2 is 6 -> evict w2
+  //                                     program 4   resident {0,3}
+  //   step 4  w0 RESIDENT                           resident {0,3}
+  //   step 5  w1 miss, full: w0 never again         program 5   resident {1,3}
+  //   step 6  w2 miss, full: w1 never again         program 6   resident {2,3}
+  //   step 7  w3 RESIDENT
+  //
+  // 6 programs, 2 reuses. LRU on the same sequence reuses nothing at all --
+  // it evicts w0 at step 2, exactly the block needed two steps later -- and
+  // pays all 8. This case is the project's whole argument in miniature:
+  // compile-time knowledge of the use sequence is worth 25% of the
+  // reprogramming here, and it is worth it under spill, not only when
+  // everything fits.
+  const std::vector<int8_t> w = sequential(8 * 8, -32, 1);
+  const std::vector<int8_t> actA = sequential(8, 5, -1);
+  const std::vector<int8_t> actB = sequential(8, -4, 1);
+
+  const auto [plain, placed] =
+      runBothWays("spill", buildTwoMatmulModule(w, actA, actB, 8, 8));
+  if (plain.programs == 0)
+    return;
+
+  CIM_EXPECT_EQ(plain.programs, 8u);
+  CIM_EXPECT_EQ(placed.programs, 6u);
+  checkTwoMatmulValues("spill", placed, w, actA, actB, 8, 8);
+}
+
+CIM_TEST(placement_reuses_across_matmuls_of_a_single_block) {
+  // The minimal reuse case: one 4x4 block used twice. [0,0] -> 1 program.
+  const std::vector<int8_t> w = {1, 2, 3, 4, 5, 6, 7, 8,
+                                 -1, -2, -3, -4, 9, -9, 9, -9};
+  const std::vector<int8_t> actA = {2, -3, 5, -7};
+  const std::vector<int8_t> actB = {-128, 127, -128, 127};
+
+  const auto [plain, placed] =
+      runBothWays("single block", buildTwoMatmulModule(w, actA, actB, 4, 4));
+  if (plain.programs == 0)
+    return;
+
+  CIM_EXPECT_EQ(plain.programs, 2u);
+  CIM_EXPECT_EQ(placed.programs, 1u);
+  checkTwoMatmulValues("single block", placed, w, actA, actB, 4, 4);
+}
+
+CIM_TEST(placement_assigns_only_tile_ids_the_target_declares) {
+  // Spec Sec. 5.4 rule 5: tile ids must be within the target's declared
+  // count. TileAllocOp::verify cannot check this -- the count comes from the
+  // target file, which the verifier cannot see -- so cim-placement owning
+  // assignment is what makes the rule enforceable at all.
+  const std::vector<int8_t> w = sequential(16 * 8, -64, 1);
+  const std::vector<int8_t> act = sequential(8, -4, 1);
+
+  DialectRegistry registry;
+  registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
+                  arith::ArithDialect, linalg::LinalgDialect>();
+  MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(buildModule(w, act, 16, 8), &context);
+  CIM_EXPECT(module);
+  if (!module)
+    return;
+
+  PassManager pm(&context);
+  pm.addPass(cim::createCIMDetectPass());
+  auto partition = cim::createCIMPartitionPass();
+  CIM_EXPECT(succeeded(partition->initializeOptions("target-yaml=" + tinyTarget())));
+  pm.addPass(std::move(partition));
+  auto placement = cim::createCIMPlacementPass();
+  CIM_EXPECT(succeeded(placement->initializeOptions("target-yaml=" + tinyTarget())));
+  pm.addPass(std::move(placement));
+  CIM_EXPECT(succeeded(pm.run(*module)));
+
+  unsigned tiles = 0;
+  module->walk([&](cim::TileAllocOp op) {
+    ++tiles;
+    // tiny-4x4.yaml declares 2 tiles.
+    CIM_EXPECT_LT(static_cast<int64_t>(op.getId()), int64_t(2));
+    CIM_EXPECT_GE(static_cast<int64_t>(op.getId()), int64_t(0));
+  });
+  CIM_EXPECT_GT(tiles, 0u);
 }

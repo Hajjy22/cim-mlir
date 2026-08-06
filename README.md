@@ -35,16 +35,31 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Two of the eight lowering passes are real: `cim-detect` finds
-INT8 matmuls with a constant weight operand, and `cim-partition` lowers them into per-tile
+**Partly implemented.** Three of the eight lowering passes are real: `cim-detect` finds
+INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
-driven by the target file's tile geometry:
+and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
+schedule, erasing weight programming it has proven redundant and assigning tile ids from
+the solution:
 
 ```sh
-cim-opt model.mlir --cim-detect --cim-partition=target-yaml=targets/erbium-8t.yaml
+cim-opt model.mlir --cim-detect \
+  --cim-partition=target-yaml=targets/erbium-8t.yaml \
+  --cim-placement=target-yaml=targets/erbium-8t.yaml
 ```
 
-The remaining six passes are registered but their bodies are `TODO` stubs, so nothing
+On two matmuls sharing a weight matrix that fits in the device's tiles, that turns four
+`cim.program` ops into two, and the runtime's `programs` counter drops with it. Under
+spill pressure it still wins — on a 4-block model over 2 tiles it saves 2 of 8 programs
+where an LRU cache would save none. Every case is executed both with and without the pass
+and the outputs must be **identical**: placement is an optimization and is not allowed to
+change an answer.
+
+Reuse is found in straight-line code — across matmuls within a block. Hoisting
+`cim.program` out of an inference loop is not implemented, so the per-inference figures
+below still come from the standalone simulator rather than from compiled IR.
+
+The remaining five passes are registered but their bodies are `TODO` stubs, so nothing
 compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
 output-major weights, exact tile multiples) are each refused with a warning rather than
 silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).

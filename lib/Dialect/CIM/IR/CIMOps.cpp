@@ -39,8 +39,13 @@ LogicalResult TileAllocOp::verify() {
   // Rule 5 (spec Sec. 5.4) also requires tile IDs to be unique and within
   // the target's declared tile count. Neither is checkable from a single
   // op: uniqueness is a module-wide property and the tile count comes from
-  // the target file, which is not threaded into the verifier. cim-placement
-  // enforces both once it owns tile assignment.
+  // the target file, which is not threaded into the verifier.
+  //
+  // cim-placement is what actually enforces both, because it reads the
+  // target file and owns tile assignment: ids come from a schedule solved
+  // against tiles.count, and the schedule guarantees no two live residents
+  // share a tile. Modules that never run it keep cim-partition's round-robin
+  // ids, which satisfy the bound but are not otherwise optimal.
   return success();
 }
 

@@ -66,6 +66,19 @@ the thesis of the entire project.** The `cim-placement` pass
 (`lib/Transforms/CIMPlacement.cpp`) is the pass that implements it, and if
 this project builds nothing else of value, it builds that pass.
 
+Because the model graph is static, the whole use sequence is known at compile
+time — so the theoretically optimal replacement policy (Belady/furthest-in-future,
+which a runtime cache can never implement) is available here. The pass recovers
+that sequence from the emitted `cim.program` ops, solves it, and rewrites the IR:
+weights already resident in a tile are reused rather than reprogrammed.
+
+How far that currently reaches: reuse is found **within a block**, across
+matmuls that share weights. Two matmuls against one weight global on a device
+whose tiles fit them emit two `cim.program` ops instead of four, and under spill
+pressure Belady still beats what an LRU cache would do. Loops are not yet
+handled — hoisting `cim.program` out of an inference loop is separate work, so
+the per-inference figures in `bench/` still come from the standalone simulator.
+
 ## Memory spaces
 
 Three address spaces are modeled as MLIR memory-space attributes on

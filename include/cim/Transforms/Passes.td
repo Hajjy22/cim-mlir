@@ -64,6 +64,11 @@ def CIMPlacement : Pass<"cim-placement", "ModuleOp"> {
     reprogramming after the first pass.
   }];
   let constructor = "mlir::cim::createCIMPlacementPass()";
+  let options = [
+    Option<"targetYAML", "target-yaml", "std::string", "\"\"",
+           "Path to a target description YAML file (spec Sec. 7); supplies "
+           "tiles.count, the number of physical tiles to place into">
+  ];
 }
 
 def CIMSchedule : Pass<"cim-schedule", "ModuleOp"> {
