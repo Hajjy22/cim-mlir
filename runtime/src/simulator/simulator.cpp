@@ -1,1 +1,332 @@
-PLACEHOLDER
+//===- simulator.cpp - Functional simulator backend (spec Sec. 9.1) -*- C++ *-
+//
+// Pure integer arithmetic reference implementation of cimrt.h. Its only job
+// is correctness (does the compiled artifact compute the same result as a
+// reference torch.matmul?) — no cycle timing. Cost/energy accounting is
+// delegated to CostAccumulator (cost_model.h), which sums the target file's
+// declared costs analytically (spec Sec. 9.2), not simulated.
+//
+// `cimrt_open("erbium-8t", ...)` and any other target name both route here
+// in the M0/M1 skeleton state (see runtime/src/erbium/ for the real,
+// currently-stubbed, hardware backend).
+//
+//===----------------------------------------------------------------------===//
+
+#include "cimrt.h"
+#include "cim/Target/TargetSpec.h"
+#include "cost_model.h"
+#include "../erbium/erbium_backend.h"
+
+#include <cstring>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+using namespace cim;
+
+struct cimrt_device {
+  std::string name;
+  TargetSpec spec;
+  CostAccumulator cost{spec};
+  std::unordered_map<cimrt_tile_id, std::vector<uint8_t>> tileWeights;
+  // Snapshot of `cost`'s counters taken by cimrt_profile_start, so stop can
+  // report the delta for one window rather than the cumulative total since
+  // cimrt_open. Un-set (nullopt-by-flag) until start is actually called.
+  CostAccumulator::Snapshot profileBaseline{};
+  bool profilingActive = false;
+
+  // Every cimrt_buffer allocated from this device, so cimrt_close can
+  // orphan them instead of leaving a dangling back-pointer for the next
+  // cimrt_write/cimrt_read/cimrt_copy to dereference. A raw non-owning set:
+  // the buffers own their own lifetime via cimrt_free, this only needs to
+  // find and null them out.
+  std::unordered_set<cimrt_buffer *> liveBuffers;
+};
+
+struct cimrt_buffer {
+  std::vector<uint8_t> data;
+  cimrt_space space;
+  // Back-pointer to the owning device, for cost accounting. Nulled by
+  // cimrt_close when the device goes away first -- see the lifetime note on
+  // cimrt_close in cimrt.h. Every write site that reads `dev` must treat
+  // null as "orphaned", never assume it stays valid for the buffer's whole
+  // lifetime.
+  cimrt_device *dev = nullptr;
+};
+
+extern "C" {
+
+/// Resolve a target name to a file path. A name containing '/' or ending
+/// in ".yaml" is taken as a path, so callers that are not run from the repo
+/// root (the interpreter, tests) can still open a device.
+static std::string resolveTargetPath(const std::string &name) {
+  const bool looksLikePath =
+      name.find('/') != std::string::npos ||
+      (name.size() >= 5 && name.compare(name.size() - 5, 5, ".yaml") == 0);
+  return looksLikePath ? name : "targets/" + name + ".yaml";
+}
+
+cimrt_status cimrt_open(const char *target_name, cimrt_device **out) {
+  if (!target_name || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  *out = nullptr;
+
+  // A "-hw" suffix asks for real hardware, which is a different backend --
+  // not this functional simulator. Reporting NO_DEVICE here is what makes
+  // "no hardware attached" distinguishable from "simulator unavailable".
+  const std::string name = target_name;
+  if (name.size() >= 3 && name.compare(name.size() - 3, 3, "-hw") == 0)
+    return cim::erbium::open(out);
+
+  // A well-formed but adversarially large target spec (an absurd tile
+  // count/geometry) could in principle exhaust memory during parsing or
+  // construction; report it the same way an oversized cimrt_alloc is
+  // reported rather than letting an allocator exception cross the
+  // extern "C" boundary, which is undefined behaviour.
+  cimrt_device *dev = nullptr;
+  try {
+    dev = new cimrt_device();
+  } catch (const std::bad_alloc &) {
+    return CIMRT_ERR_OOM;
+  }
+  dev->name = name;
+
+  if (!parseTargetSpecFromFile(resolveTargetPath(name), dev->spec)) {
+    delete dev;
+    return CIMRT_ERR_NO_DEVICE;
+  }
+
+  *out = dev;
+  return CIMRT_OK;
+}
+
+void cimrt_close(cimrt_device *dev) {
+  if (!dev)
+    return;
+  // Orphan every buffer still allocated from this device -- see the
+  // lifetime note on cimrt_close in cimrt.h. `liveBuffers` is exactly the
+  // set of buffers whose `dev` still points here, so this cannot miss one
+  // or double-orphan one already freed (cimrt_free deregisters first).
+  for (cimrt_buffer *buf : dev->liveBuffers)
+    buf->dev = nullptr;
+  delete dev;
+}
+
+cimrt_status cimrt_query(cimrt_device *dev, cimrt_device_info *out) {
+  if (!dev || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  std::memset(out, 0, sizeof(*out));
+  std::strncpy(out->name, dev->name.c_str(), sizeof(out->name) - 1);
+  out->num_tiles = dev->spec.tiles.count;
+  out->tile_rows = dev->spec.tiles.rows;
+  out->tile_cols = dev->spec.tiles.cols;
+  out->persistent = dev->spec.tiles.persistent;
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_alloc(cimrt_device *dev, size_t bytes, cimrt_space space,
+                          cimrt_buffer **out) {
+  if (!dev || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  *out = nullptr;
+
+  cimrt_buffer *buf = nullptr;
+  try {
+    buf = new cimrt_buffer();
+    buf->data.resize(bytes, 0);
+  } catch (const std::bad_alloc &) {
+    delete buf;
+    return CIMRT_ERR_OOM;
+  } catch (const std::length_error &) {
+    // vector::resize throws this for a size past its max_size(), which is
+    // an unsatisfiable request rather than a transient allocator failure,
+    // but it is the same answer from the caller's side: cannot have it.
+    delete buf;
+    return CIMRT_ERR_OOM;
+  }
+  buf->space = space;
+  buf->dev = dev;
+  dev->liveBuffers.insert(buf);
+  *out = buf;
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_copy(cimrt_buffer *dst, const cimrt_buffer *src) {
+  if (!dst || !src)
+    return CIMRT_ERR_INVALID_ARG;
+  if (dst->data.size() != src->data.size())
+    return CIMRT_ERR_SHAPE_MISMATCH;
+  // An orphaned destination (its device already closed) cannot have this
+  // transfer costed, and costing it against nothing would make the cost
+  // model silently wrong rather than loudly unavailable -- see the
+  // cimrt_close lifetime note in cimrt.h.
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG;
+  dst->data = src->data;
+  dst->dev->cost.recordTransfer(dst->data.size());
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_write(cimrt_buffer *dst, size_t dst_offset, const void *src,
+                          size_t bytes) {
+  if (!dst || !src)
+    return CIMRT_ERR_INVALID_ARG;
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
+  // Checked against overflow rather than just `offset + bytes > size`,
+  // which wraps for adversarial offsets.
+  if (dst_offset > dst->data.size() || bytes > dst->data.size() - dst_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  std::memcpy(dst->data.data() + dst_offset, src, bytes);
+  dst->dev->cost.recordTransfer(bytes);
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_read(const cimrt_buffer *src, size_t src_offset, void *dst,
+                         size_t bytes) {
+  if (!src || !dst)
+    return CIMRT_ERR_INVALID_ARG;
+  if (!src->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
+  if (src_offset > src->data.size() || bytes > src->data.size() - src_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  std::memcpy(dst, src->data.data() + src_offset, bytes);
+  src->dev->cost.recordTransfer(bytes);
+  return CIMRT_OK;
+}
+
+void cimrt_free(cimrt_buffer *buf) {
+  if (!buf)
+    return;
+  // Deregister before deleting: a buffer freed while its device is still
+  // open must not leave a dangling entry in dev->liveBuffers for the next
+  // cimrt_close to walk and write through -- the mirror image of the
+  // use-after-free this registry exists to prevent.
+  if (buf->dev)
+    buf->dev->liveBuffers.erase(buf);
+  delete buf;
+}
+
+cimrt_status cimrt_program(cimrt_device *dev, cimrt_tile_id tile,
+                            const cimrt_buffer *weights) {
+  if (!dev || !weights)
+    return CIMRT_ERR_INVALID_ARG;
+  // A tile id the target does not have is a malformed call, not "busy":
+  // TILE_BUSY says "this tile exists and is not ready", which sends a
+  // caller looking for a scheduling problem that is not there.
+  if (tile >= dev->spec.tiles.count)
+    return CIMRT_ERR_INVALID_ARG;
+  size_t expected =
+      static_cast<size_t>(dev->spec.tiles.rows) * dev->spec.tiles.cols;
+  if (weights->data.size() != expected)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  // Verifier rule 3 (spec Sec.5.4) at the runtime layer: re-programming a
+  // tile simply replaces its resident weights; any !cim.resident SSA value
+  // referring to the old contents is a compile-time-invalid use, which
+  // cim-opt (not this runtime) is responsible for rejecting.
+  dev->tileWeights[tile] = weights->data;
+
+  dev->cost.recordProgram();
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
+                        const cimrt_buffer *act, cimrt_buffer *out,
+                        bool accumulate) {
+  if (!dev || !act || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  // Same distinction as cimrt_program: a tile id the target does not have
+  // is malformed, not "busy". Must be checked before the tileWeights
+  // lookup below, which cannot otherwise tell "out of range" apart from
+  // "in range but never programmed".
+  if (tile >= dev->spec.tiles.count)
+    return CIMRT_ERR_INVALID_ARG;
+
+  auto it = dev->tileWeights.find(tile);
+  if (it == dev->tileWeights.end())
+    return CIMRT_ERR_TILE_BUSY; // tile has never been cimrt_program'd
+
+  const uint32_t rows = dev->spec.tiles.rows;
+  const uint32_t cols = dev->spec.tiles.cols;
+  const std::vector<uint8_t> &weights = it->second;
+
+  // TODO(spec Sec.9.1): this reference implementation assumes i8 weights,
+  // i8 activations, i32 accumulation (the v0.1 contract's INT8 matmul).
+  // Other target-declared dtypes are unimplemented.
+  if (act->data.size() != cols)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+  if (out->data.size() != static_cast<size_t>(rows) * sizeof(int32_t))
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  // Accumulate in int64 and wrap explicitly on store. Accumulating straight
+  // into an int32_t is signed-overflow UB as soon as K is large enough --
+  // UBSan flags it, and the standard gives no guarantee about the result.
+  // The documented behaviour of this model is to WRAP, matching a
+  // fixed-width hardware accumulator, rather than to saturate.
+  auto *outI32 = reinterpret_cast<int32_t *>(out->data.data());
+  for (uint32_t r = 0; r < rows; ++r) {
+    int64_t acc = accumulate ? static_cast<int64_t>(outI32[r]) : 0;
+    for (uint32_t c = 0; c < cols; ++c) {
+      auto w = static_cast<int8_t>(weights[static_cast<size_t>(r) * cols + c]);
+      auto a = static_cast<int8_t>(act->data[c]);
+      acc += static_cast<int64_t>(w) * static_cast<int64_t>(a);
+    }
+    outI32[r] = static_cast<int32_t>(static_cast<uint32_t>(acc));
+  }
+
+  dev->cost.recordMvm();
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_barrier(cimrt_device *dev) {
+  if (!dev)
+    return CIMRT_ERR_INVALID_ARG;
+  // Functional simulator executes synchronously; nothing to wait on.
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_profile_start(cimrt_device *dev) {
+  if (!dev)
+    return CIMRT_ERR_INVALID_ARG;
+  dev->profileBaseline = dev->cost.snapshot();
+  dev->profilingActive = true;
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_profile_stop(cimrt_device *dev, cimrt_profile *out) {
+  if (!dev || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  // A stop with no matching start reports zero, not the cumulative total
+  // since cimrt_open (see the contract comment on cimrt_profile_start/stop
+  // in cimrt.h): baseline == current counters gives a zero delta below,
+  // which is exactly that "no window was opened" answer.
+  const CostAccumulator::Snapshot baseline =
+      dev->profilingActive ? dev->profileBaseline : dev->cost.snapshot();
+  const CostAccumulator::Snapshot now = dev->cost.snapshot();
+  out->programs_issued = now.programsIssued - baseline.programsIssued;
+  out->mvms_issued = now.mvmsIssued - baseline.mvmsIssued;
+  out->bytes_transferred = now.bytesTransferred - baseline.bytesTransferred;
+  out->estimated_energy_pj = now.energyPj - baseline.energyPj;
+  out->estimated_latency_ns = now.latencyNs - baseline.latencyNs;
+  dev->profilingActive = false;
+  return CIMRT_OK;
+}
+
+const char *cimrt_status_string(cimrt_status status) {
+  switch (status) {
+  case CIMRT_OK: return "ok";
+  case CIMRT_ERR_NO_DEVICE: return "no such device";
+  case CIMRT_ERR_TILE_BUSY: return "tile unavailable or not programmed";
+  case CIMRT_ERR_SHAPE_MISMATCH: return "buffer size does not match tile geometry";
+  case CIMRT_ERR_OOM: return "out of memory";
+  case CIMRT_ERR_INVALID_ARG: return "invalid argument";
+  }
+  return "unknown status";
+}
+
+} // extern "C"
