@@ -5,6 +5,7 @@ add_executable(cim-mlir-tests
   pipeline_e2e_test.cpp
   cost_report_e2e_test.cpp
   schedule_e2e_test.cpp
+  legalize_precision_e2e_test.cpp
 )
 
 target_include_directories(cim-mlir-tests PRIVATE

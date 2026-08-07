@@ -15,6 +15,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -149,6 +151,7 @@ private:
   LogicalResult runMvm(MvmOp op);
   LogicalResult runReducePartial(ReducePartialOp op);
   LogicalResult runCimCopy(CopyOp op);
+  LogicalResult runRequantize(RequantizeOp op);
   LogicalResult runArithConstant(arith::ConstantOp op);
   LogicalResult runScfFor(scf::ForOp op);
 
@@ -762,6 +765,96 @@ LogicalResult Interpreter::runCimCopy(CopyOp op) {
   return success();
 }
 
+LogicalResult Interpreter::runRequantize(RequantizeOp op) {
+  auto srcIt = memrefs.find(op.getInput());
+  if (srcIt == memrefs.end())
+    return op.emitError("cim.requantize on an unknown buffer");
+  const MemRefValue &src = srcIt->second;
+
+  auto inputType = llvm::cast<MemRefType>(op.getInput().getType());
+  auto resultType = llvm::cast<MemRefType>(op.getResult().getType());
+  auto inElem = llvm::dyn_cast<IntegerType>(inputType.getElementType());
+  auto outElem = llvm::dyn_cast<IntegerType>(resultType.getElementType());
+  if (!inElem || !outElem)
+    return op.emitError(
+        "cim.requantize input and result element types must both be "
+        "integers; the interpreter has no other accumulator representation "
+        "to read or produce");
+
+  FailureOr<unsigned> outElemBytesOr = elementByteWidth(outElem);
+  if (failed(outElemBytesOr))
+    return op.emitError(
+        "cim.requantize result element type is narrower than a byte (e.g. "
+        "i1/i4); the interpreter is byte-addressed and cannot represent it");
+  const unsigned outElemBytes = *outElemBytesOr;
+
+  const int64_t count = resultType.getNumElements();
+  if (count != src.numElements())
+    return op.emitError(
+        "cim.requantize must not change element count (this pins execution "
+        "semantics beyond what the verifier's shape check covers)");
+
+  std::vector<uint8_t> srcBytes;
+  if (failed(gather(src, srcBytes)))
+    return op.emitError("cim.requantize failed to read its input");
+  if (srcBytes.size() != static_cast<size_t>(count) * src.elemBytes)
+    return op.emitError("cim.requantize input has the wrong size");
+
+  const double scale = op.getScale().convertToDouble();
+  if (!(scale > 0.0))
+    return op.emitError("cim.requantize scale must be positive, got ")
+           << scale;
+  const int64_t zeroPoint = static_cast<int32_t>(op.getZeroPoint());
+  const uint32_t effectiveBits = op.getEffectiveBits();
+  // RequantizeOp::verify() already enforces 0 < effective_bits <= the result
+  // element width, so the shift below is always in range. The clamp models
+  // the readout path this op stands for (an analog ADC's real resolution,
+  // or a digital requantizer's narrower accumulator) -- the *signed* range
+  // that many bits can hold, regardless of whether the result element type
+  // is nominally wider than effective_bits.
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
+
+  std::vector<uint8_t> outBytes(static_cast<size_t>(count) * outElemBytes);
+  const unsigned inBits = inElem.getWidth();
+  for (int64_t i = 0; i < count; ++i) {
+    uint64_t raw = 0;
+    std::memcpy(&raw, srcBytes.data() + i * src.elemBytes, src.elemBytes);
+    // Sign-extend from the input's actual bit width (little-endian, as read
+    // by gather/readElement throughout this file).
+    int64_t value = static_cast<int64_t>(raw);
+    if (inBits < 64) {
+      const uint64_t signBit = static_cast<uint64_t>(1) << (inBits - 1);
+      value = static_cast<int64_t>((raw ^ signBit) - signBit);
+    }
+    // quantized = zero_point + round(value / scale), round-half-away-from-
+    // zero -- the one rounding mode that treats positive and negative
+    // accumulator values symmetrically, which matters because cim's i32
+    // accumulator is signed. Then clamp to what effective_bits can hold:
+    // that clamp is this op's whole point on a sub-8-bit target (spec
+    // Sec. 5.3), not a defensive afterthought.
+    const double scaled = static_cast<double>(value) / scale;
+    int64_t quantized = zeroPoint + static_cast<int64_t>(std::llround(scaled));
+    quantized = std::clamp(quantized, clampMin, clampMax);
+
+    const uint64_t bits = static_cast<uint64_t>(quantized);
+    std::memcpy(outBytes.data() + i * outElemBytes, &bits, outElemBytes);
+  }
+
+  cimrt_device *dev = devices.empty() ? nullptr : devices.begin()->second;
+  auto alloc = makeAllocation(resultType, outBytes.size(), dev);
+  if (!alloc)
+    return op.emitError("failed to allocate the requantize result");
+  auto view = viewFromType(resultType, alloc);
+  if (failed(view))
+    return op.emitError("unsupported layout on the requantize result");
+  if (failed(scatter(*view, outBytes)))
+    return op.emitError("failed to write the requantize result");
+
+  memrefs[op.getResult()] = *view;
+  return success();
+}
+
 LogicalResult Interpreter::runArithConstant(arith::ConstantOp op) {
   // Only scalar integer/index constants are modelled -- what a loop bound
   // or a subview offset can be. A float or vector constant falls through to
@@ -866,14 +959,7 @@ LogicalResult Interpreter::execute(Operation *op) {
           return o.emitError("cim.barrier on an unopened device");
         return success(cimrt_barrier(it->second) == CIMRT_OK);
       })
-      .Case<RequantizeOp>([&](RequantizeOp o) -> LogicalResult {
-        // Deliberately unimplemented rather than approximated: the rounding
-        // mode is not pinned down until cim-legalize-precision defines it,
-        // and guessing would produce numbers that look right.
-        return o.emitError(
-            "cim.requantize is not implemented by the interpreter yet "
-            "(cim-legalize-precision has not pinned the rounding mode)");
-      })
+      .Case<RequantizeOp>([&](auto o) { return runRequantize(o); })
       .Default([&](Operation *unknown) -> LogicalResult {
         // Never skip silently: an unmodelled op would yield a
         // wrong-but-plausible result, which is exactly what this

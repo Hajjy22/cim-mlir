@@ -35,7 +35,7 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Five of the eight lowering passes are real: `cim-detect` finds
+**Partly implemented.** Six of the eight lowering passes are real: `cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -89,11 +89,30 @@ barrier from a missing one — that is what the structural tests
 catch a broken scheduler that a numerical-only check would silently let through
 (`test/mlir/schedule_e2e_test.cpp` covers the "does not change the answer" half instead).
 
-The remaining three passes (`cim-insert-transfers`, `cim-legalize-precision`,
-`cim-lower-to-target`) are registered but their bodies are `TODO` stubs, so nothing
-compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
-output-major weights, exact tile multiples) are each refused with a warning rather than
-silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+`cim-legalize-precision` (Pass 6) inserts `cim.requantize` after every "terminal"
+accumulator — a `cim.reduce_partial` result, or a `cim.mvm` result no `cim.reduce_partial`
+consumes (the single-K-tile case) — using `scale=1.0`/`zero_point=0` always, since v0.1 has
+no per-layer calibration step anywhere in the pipeline to derive anything else from; what
+this legalizes is the op shape spec Sec. 6 calls for, and the clamp that
+`output_effective_bits` genuinely does encode. On a target declaring fewer than 8 effective
+bits it emits a warning naming exactly how many of the 256 i8 encodings are unreachable
+through that readout path, rather than silently degrading. The interpreter executes
+`cim.requantize` for real — round-half-away-from-zero, then clamp to the signed range
+`effective_bits` can hold — checked against an independent reference implementation over
+both a fractional scale/nonzero zero_point and the clamp itself in both directions
+(`test/mlir/legalize_precision_e2e_test.cpp`), since unlike `cim.barrier` this op genuinely
+changes values and there is no "does not change the answer" invariant to fall back on.
+Not yet wired into the live pipeline: `cim-partition` emits its own `cim.copy` back to a
+host buffer typed to match the original i32 accumulator, with no knowledge that this pass
+might requantize that value down to i8 first, so it is tested on hand-written IR shaped the
+way `cim-partition`'s output locally is (`test/Transforms/cim-legalize-precision.mlir`) —
+the same kind of documented v0.1 integration gap as `cim-insert-transfers` below.
+
+The remaining two passes (`cim-insert-transfers`, `cim-lower-to-target`) are registered but
+their bodies are `TODO` stubs, so nothing compiles a real model end to end yet.
+`cim-partition`'s scope limits (matrix-vector, output-major weights, exact tile multiples)
+are each refused with a warning rather than silently mislowered — see
+[`docs/roadmap.md`](docs/roadmap.md).
 
 `cimrt` (the C ABI everything above eventually calls through) went through a hardening
 pass: a use-after-free when a buffer outlived its device, an allocation failure that
@@ -169,8 +188,8 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 ```
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
-`lib/Interpreter` and `runtime/src` (currently 90.0% / 83.8%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still three-eighths empty stubs,
+`lib/Interpreter` and `runtime/src` (currently 90.3% / 83.3%). `lib/Dialect` is
+mostly TableGen output and `lib/Transforms` is still one-quarter empty stubs,
 so both are reported and not gated — a threshold there would measure how many
 stubs exist rather than how well anything is tested.
 

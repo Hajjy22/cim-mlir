@@ -3,7 +3,7 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. Five of the eight lowering passes are
+**Current state.** M0, M1 and M3 are done. Six of the eight lowering passes are
 real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
 per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
 transfers, `cim-placement` rewrites that IR from a Belady schedule --
@@ -12,7 +12,12 @@ solution rather than round-robin, and hoisting loop-invariant `cim.program`
 ops out of an `scf.for` when doing so is provably safe -- `cim-schedule`
 (Pass 4) inserts `cim.barrier` conservatively over that placed IR (see the M2
 entry below for the placement rule and why it needs to see inside a loop
-body, not just an `scf.for`'s own operand list), and `cim-cost-report`
+body, not just an `scf.for`'s own operand list), `cim-legalize-precision`
+(Pass 6) inserts `cim.requantize` after every terminal accumulator with
+`scale=1.0`/`zero_point=0` (no calibration step exists yet to derive anything
+else from) and warns when the target's `output_effective_bits` clamps below 8
+(see the Pass 6 entry below for the interpreter-side arithmetic and the known
+`cim-partition` integration gap), and `cim-cost-report`
 (Pass 8) walks the final placed IR and emits the project's publishable numbers,
 reusing `cim-bench`'s own `CostReport`/JSON format rather than a second cost
 path (see the M3 entry below for how it accounts for loop trip counts).
@@ -103,6 +108,52 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   mutation test (reverting the nested-region check) confirms the FileCheck
   suite fails while the numerical suite still silently passes, which is
   exactly why both exist.
+- [x] Pass 6 `cim-legalize-precision`: inserts `cim.requantize` after every
+  "terminal" i32 accumulator -- a `cim.reduce_partial` result, or a
+  `cim.mvm` result no `cim.reduce_partial` consumes (the single-K-tile
+  case, nothing to reduce). `scale=1.0`/`zero_point=0` always: v0.1 has no
+  per-layer calibration step anywhere in the pipeline to derive anything
+  else from, and inventing calibration data this pass has no way to
+  validate would be exactly the "silently produce a wrong-but-plausible
+  number" this project's passes refuse to do elsewhere. What lands here is
+  the op shape spec Sec. 6 calls for, and the clamp that
+  `output_effective_bits` genuinely does encode -- on a target declaring
+  fewer than 8 effective bits, the pass emits a warning naming exactly how
+  many of the 256 i8 encodings are unreachable through that readout path
+  (modeling analog ADC resolution loss, spec Sec. 5.3), rather than
+  silently degrading. Idempotent: a terminal value already read by a
+  `cim.requantize` is left alone rather than stacking a second one.
+
+  `lib/Interpreter/Interpreter.cpp` gained real execution of
+  `cim.requantize` -- round-half-away-from-zero (`quantized = zero_point +
+  round(value / scale)`), then clamp to the signed range `effective_bits`
+  can hold -- replacing what had been a deliberate "not implemented yet"
+  stub error (guessing a rounding mode before this pass pinned one down
+  would have produced numbers that looked right). Unlike `cim.barrier`,
+  `cim.requantize` genuinely changes values, so there is no "does not
+  change the answer" invariant to fall back on for verification: instead
+  `test/mlir/legalize_precision_e2e_test.cpp` checks the interpreter's
+  output against an independently-written reference implementation of the
+  same formula, over a fractional scale and nonzero zero_point, negative
+  rounding ties, and the `effective_bits` clamp hit from both directions.
+  `test/Transforms/cim-legalize-precision.mlir` covers pass-level structure
+  (which accumulators get requantized, which don't, idempotency, and the
+  sub-8-bit warning) via FileCheck, on hand-written IR rather than the live
+  pipeline -- see the integration-gap note below.
+
+  Not yet wired into the live pipeline: `cim-partition` always emits its
+  own `cim.copy` back to a host buffer typed to match the *original* i32
+  accumulator, with no knowledge that a later pass might requantize that
+  value down to i8. Running `cim-legalize-precision` after `cim-partition`
+  on real pipeline output changes a terminal value's type out from under
+  that already-emitted `cim.copy`, which the dialect's verifier correctly
+  rejects ("copy must not change element type") rather than silently
+  coercing. Fixing that needs `cim-partition` (or a dataflow pass between
+  the two) to know a downstream requantize is coming and size its own
+  host-side buffer for i8 -- a real, separate piece of work, not attempted
+  here. This is the same shape of gap as Pass 5's note below: the pass
+  itself is complete and tested in isolation, but the two passes do not
+  yet compose.
 - [ ] Passes 5 and 7 (`cim-insert-transfers`, `cim-lower-to-target`) are
   still stubs. `cim-partition` currently emits its own transfers, so
   pass 5 has little to do until multi-layer models arrive.

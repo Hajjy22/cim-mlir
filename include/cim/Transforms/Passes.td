@@ -111,8 +111,23 @@ def CIMLegalizePrecision : Pass<"cim-legalize-precision", "ModuleOp"> {
     Spec Sec. 6, Pass 6. If the target declares effective_bits < 8, emit a
     warning with the estimated accuracy impact rather than silently
     degrading.
+
+    Inserted after every "terminal" i32 accumulator: a cim.reduce_partial
+    result, or a cim.mvm result that no cim.reduce_partial consumes (the
+    single-tile case, where there is nothing to reduce). scale=1.0 and
+    zero_point=0 always -- v0.1 has no per-layer calibration step anywhere
+    in the pipeline to derive anything else from, so this legalizes the op
+    shape spec Sec. 6 calls for (every accumulator is requantized before
+    leaving the CIM domain) without inventing calibration data. Real
+    scale/zero_point derivation is spec M4 ("cim-legalize-precision with
+    real effective_bits modeling", docs/roadmap.md).
   }];
   let constructor = "mlir::cim::createCIMLegalizePrecisionPass()";
+  let options = [
+    Option<"targetYAML", "target-yaml", "std::string", "\"\"",
+           "Path to a target description YAML file (spec Sec. 7); supplies "
+           "precision.output_effective_bits">
+  ];
 }
 
 def CIMLowerToTarget : Pass<"cim-lower-to-target", "ModuleOp"> {
