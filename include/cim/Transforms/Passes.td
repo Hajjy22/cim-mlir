@@ -118,8 +118,25 @@ def CIMCostReport : Pass<"cim-cost-report", "ModuleOp"> {
   let description = [{
     Spec Sec. 6, Pass 8. Not an optimization pass — this is the pass that
     produces the project's publishable numbers (spec Sec. 17 worked example).
+
+    Every cim.program and cim.mvm op is weighted by the product of its
+    enclosing scf.for loops' compile-time-constant trip counts before being
+    counted: a cim.program hoisted above a loop by cim-placement executes
+    once regardless of position, while one left inside executes trip-count
+    times, so a plain walk-and-count would misreport exactly the IR
+    cim-placement now produces. An op under a loop whose trip count is not
+    a compile-time constant is reported as unknown rather than assumed to
+    be 1.
   }];
   let constructor = "mlir::cim::createCIMCostReportPass()";
+  let options = [
+    Option<"targetYAML", "target-yaml", "std::string", "\"\"",
+           "Path to a target description YAML file (spec Sec. 7); supplies "
+           "the cost table (energy_pj/latency_ns per program and mvm)">,
+    Option<"outputPath", "output", "std::string", "\"\"",
+           "Where to write the JSON report; empty (the default) means "
+           "stdout">
+  ];
 }
 
 #endif // CIM_TRANSFORMS_PASSES

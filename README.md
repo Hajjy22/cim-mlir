@@ -64,10 +64,32 @@ executing the loop through a real interpreter, not just by inspecting its shape.
 **not** replicate a full N-inference Belady solve, which is what the spill-workload
 figures below still come from (`docs/roadmap.md`'s M3 section draws the exact line).
 
-The remaining five passes are registered but their bodies are `TODO` stubs, so nothing
-compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
-output-major weights, exact tile multiples) are each refused with a warning rather than
-silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+`cim-cost-report` (Pass 8) also rewrites nothing but walks the final, already-placed IR
+and emits the project's publishable numbers as JSON — the same `CostReport`/`toJson`
+format `cim-bench` already prints, not a second cost model that could drift from it.
+Every `cim.program`/`cim.mvm` is weighted by the product of its enclosing loops'
+compile-time-constant trip counts before being counted, because a `cim.program` hoisted
+above an `scf.for` executes once regardless of where it sits textually while one left
+inside executes trip-count times — a plain walk-and-count would misreport exactly the IR
+`cim-placement`'s loop hoisting now produces. Checked against `cim-run --profile`'s real
+`cimrt` counters for straight-line, spill and loop-hoisted modules alike
+(`test/mlir/cost_report_e2e_test.cpp`): predicted and executed `programs`/`mvms` must
+agree exactly.
+
+The remaining four passes (`cim-schedule`, `cim-insert-transfers`,
+`cim-legalize-precision`, `cim-lower-to-target`) are registered but their bodies are
+`TODO` stubs, so nothing compiles a real model end to end yet. `cim-partition`'s scope
+limits (matrix-vector, output-major weights, exact tile multiples) are each refused with
+a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+
+`cimrt` (the C ABI everything above eventually calls through) went through a hardening
+pass: a use-after-free when a buffer outlived its device, an allocation failure that
+threw a C++ exception across the `extern "C"` boundary instead of returning
+`CIMRT_ERR_OOM`, misleading status codes, and a profiling window that never actually
+windowed anything are all fixed, each with a regression test that failed against the
+unfixed code first (`test/unit/cimrt_test.cpp`). The interpreter also gained a guard
+against sub-byte element types (`i1`/`i4`), which used to silently compute zero-byte
+allocations via `bitWidth / 8` truncating to zero.
 
 ## Quickstart
 
@@ -134,8 +156,8 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 ```
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
-`lib/Interpreter` and `runtime/src` (currently 90.6% / 85.3%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still five-eighths empty stubs,
+`lib/Interpreter` and `runtime/src` (currently 89.8% / 83.7%). `lib/Dialect` is
+mostly TableGen output and `lib/Transforms` is still four-eighths empty stubs,
 so both are reported and not gated — a threshold there would measure how many
 stubs exist rather than how well anything is tested.
 

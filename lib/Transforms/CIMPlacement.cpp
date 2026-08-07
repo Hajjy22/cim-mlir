@@ -78,15 +78,14 @@
 #include "cim/Dialect/CIMOps.h"
 #include "cim/Placement/Placement.h"
 #include "cim/Target/TargetSpec.h"
+#include "cim/Transforms/LoopAnalysis.h"
 #include "cim/Transforms/Passes.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
-#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
@@ -196,23 +195,11 @@ void eraseDeadViewChain(Value value) {
   }
 }
 
-/// True iff `forOp` is provably going to execute at least one iteration:
-/// bounds and step are all compile-time constants and lower < upper (step
-/// already assumed forward per scf.for's semantics; a non-positive step is
-/// treated as unprovable rather than reasoned about further).
-///
-/// A loop this returns false for is not incorrect to hoist out of -- an
-/// unused cim.program is inert, never wrong -- but it would spend energy and
-/// latency the original IR never spent for a loop that might run zero
-/// times, which the pass is not willing to risk without proof.
-bool loopHasProvablyPositiveTripCount(scf::ForOp forOp) {
-  APInt lower, upper, step;
-  if (!matchPattern(forOp.getLowerBound(), m_ConstantInt(&lower)) ||
-      !matchPattern(forOp.getUpperBound(), m_ConstantInt(&upper)) ||
-      !matchPattern(forOp.getStep(), m_ConstantInt(&step)))
-    return false;
-  return step.sgt(0) && lower.slt(upper);
-}
+// loopHasProvablyPositiveTripCount now lives in cim/Transforms/LoopAnalysis.h,
+// shared with cim-cost-report (spec Sec. 6, Pass 8), which needs the exact
+// trip count (getConstantTripCount) rather than just this boolean to weight
+// ops inside a loop.
+using ::mlir::cim::loopHasProvablyPositiveTripCount;
 
 struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
   void runOnOperation() override {

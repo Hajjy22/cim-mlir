@@ -3,13 +3,29 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. The first three lowering passes are
+**Current state.** M0, M1 and M3 are done. Four of the eight lowering passes are
 real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
 per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
-transfers, and `cim-placement` now rewrites that IR from a Belady schedule --
+transfers, `cim-placement` rewrites that IR from a Belady schedule --
 eliminating redundant weight programming, assigning tile ids from the
 solution rather than round-robin, and hoisting loop-invariant `cim.program`
-ops out of an `scf.for` when doing so is provably safe.
+ops out of an `scf.for` when doing so is provably safe -- and `cim-cost-report`
+(Pass 8) walks the final placed IR and emits the project's publishable numbers,
+reusing `cim-bench`'s own `CostReport`/JSON format rather than a second cost
+path (see the M3 entry below for how it accounts for loop trip counts).
+
+Separately, a full read-through of `cimrt` and the interpreter turned up seven
+real defects -- a use-after-free when a `cimrt_buffer` outlived its device, an
+allocation failure that threw a C++ exception across the `extern "C"`
+boundary instead of returning `CIMRT_ERR_OOM`, misleading `CIMRT_ERR_TILE_BUSY`
+on an out-of-range tile id, a profiling window that never actually windowed
+anything, an `erbium-hw` open path that could never succeed, an undocumented
+filesystem trust boundary, and a sub-byte element type (`i1`/`i4`) silently
+computing zero-byte allocations via `bitWidth / 8` truncating to zero. All
+seven are fixed, each with a regression test that failed against the unfixed
+code first and, for the two memory-safety ones, a mutation test confirming
+ASan actually catches the bug when the fix is reverted
+(`test/unit/cimrt_test.cpp`, `test/Run/errors.mlir`).
 
 What "provably safe" means, precisely, because it is not the same problem
 `cim-bench`'s simulator solves: a `cim.program` is hoisted only when its
@@ -118,6 +134,25 @@ module stays correct and is simply not offloaded:
   hoist is deliberately more conservative (see above); closing this gap
   means reasoning about the whole flattened use sequence across iterations,
   not just whether one tile is stable within one.
+- [x] `cim-cost-report` (Pass 8): walks the final, already-placed IR and
+  emits a JSON cost report, reusing `cim::CostReport`/`toJson`
+  (`lib/Placement/CostReport.cpp`) rather than a second cost model that
+  could drift from `cim-bench`'s. Every `cim.program`/`cim.mvm` is weighted
+  by the product of its enclosing loops' compile-time-constant trip counts
+  (`cim::getConstantTripCount`, `lib/Transforms/LoopAnalysis.cpp`, shared
+  with `cim-placement`'s hoisting check) before being counted: a hoisted
+  `cim.program` executes once regardless of where it sits textually, one
+  left inside an `scf.for` executes trip-count times, and a plain
+  walk-and-count would misreport exactly the IR loop hoisting now produces.
+  An op under a loop whose trip count is not a compile-time constant is
+  excluded from the totals and flagged (`trip-count-complete: false` in the
+  JSON header, plus a diagnostic) rather than assumed to fire once.
+  Verified against real execution, not just against itself:
+  `test/mlir/cost_report_e2e_test.cpp` asserts the predicted
+  `programs`/`mvms` equal what `cim-run --profile` actually reports from
+  `cimrt`'s own counters, for straight-line, spill, and both hoisted and
+  unhoisted loop cases -- and a mutation test (disabling the trip-count
+  weighting) confirms the loop cases actually fail without it.
 - [ ] Volatile-vs-non-volatile comparison plot showing that persistence
   changes the optimum, not just the magnitude.
 
