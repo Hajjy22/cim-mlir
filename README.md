@@ -35,7 +35,7 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Six of the eight lowering passes are real: `cim-detect` finds
+**Partly implemented.** Seven of the eight lowering passes are real: `cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -106,13 +106,29 @@ Not yet wired into the live pipeline: `cim-partition` emits its own `cim.copy` b
 host buffer typed to match the original i32 accumulator, with no knowledge that this pass
 might requantize that value down to i8 first, so it is tested on hand-written IR shaped the
 way `cim-partition`'s output locally is (`test/Transforms/cim-legalize-precision.mlir`) —
-the same kind of documented v0.1 integration gap as `cim-insert-transfers` below.
+the same kind of documented v0.1 integration gap `cim-insert-transfers` has too.
 
-The remaining two passes (`cim-insert-transfers`, `cim-lower-to-target`) are registered but
-their bodies are `TODO` stubs, so nothing compiles a real model end to end yet.
-`cim-partition`'s scope limits (matrix-vector, output-major weights, exact tile multiples)
-are each refused with a warning rather than silently mislowered — see
-[`docs/roadmap.md`](docs/roadmap.md).
+`cim-insert-transfers` (Pass 5) inserts a `cim.copy` wherever a `cim.mvm`'s activation
+operand is not already `#cim.space<near>` (spec Sec. 3.4) and rewires the `mvm` to read the
+copy's result, then hoists that copy above an enclosing `scf.for` when the source is
+loop-invariant with respect to it — inserted once before the loop rather than once per
+iteration, and shared by every `mvm` inside that loop reading the exact same invariant
+source rather than duplicated per site. On today's real pipeline this pass has nothing to
+do: `cim-partition` already stages every activation into near space itself before this pass
+would ever see it, so — like `cim-legalize-precision` above — it is tested on hand-written
+IR that manufactures the space mismatch `cim-partition`'s current output never produces
+(`test/Transforms/cim-insert-transfers.mlir`). `cim.copy` is a faithful byte-for-byte move,
+not a value-changing operation, so the numerical side of verification is an invariance
+check like `cim-schedule`'s: `test/mlir/insert_transfers_e2e_test.cpp` confirms running a
+module with and without the pass computes identical numbers, while
+`test/Transforms/cim-insert-transfers.mlir`'s structural checks are what actually catch a
+broken hoist — a mutation reverting the loop-invariance check produces correct numbers with
+redundant copies inside the loop, which the numerical suite alone would silently accept.
+
+The remaining pass (`cim-lower-to-target`) is registered but its body is a `TODO` stub, so
+nothing compiles a real model end to end yet. `cim-partition`'s scope limits
+(matrix-vector, output-major weights, exact tile multiples) are each refused with a warning
+rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
 
 `cimrt` (the C ABI everything above eventually calls through) went through a hardening
 pass: a use-after-free when a buffer outlived its device, an allocation failure that
@@ -189,7 +205,7 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
 `lib/Interpreter` and `runtime/src` (currently 90.3% / 83.3%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still one-quarter empty stubs,
+mostly TableGen output and `lib/Transforms` is still one-eighth empty stubs,
 so both are reported and not gated — a threshold there would measure how many
 stubs exist rather than how well anything is tested.
 

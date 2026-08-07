@@ -3,16 +3,22 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. Six of the eight lowering passes are
-real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
-per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
-transfers, `cim-placement` rewrites that IR from a Belady schedule --
+**Current state.** M0, M1 and M3 are done. Seven of the eight lowering passes
+are real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them
+into per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit
+space transfers, `cim-placement` rewrites that IR from a Belady schedule --
 eliminating redundant weight programming, assigning tile ids from the
 solution rather than round-robin, and hoisting loop-invariant `cim.program`
 ops out of an `scf.for` when doing so is provably safe -- `cim-schedule`
 (Pass 4) inserts `cim.barrier` conservatively over that placed IR (see the M2
 entry below for the placement rule and why it needs to see inside a loop
-body, not just an `scf.for`'s own operand list), `cim-legalize-precision`
+body, not just an `scf.for`'s own operand list), `cim-insert-transfers`
+(Pass 5) inserts `cim.copy` wherever a `cim.mvm`'s activation is not already
+`#cim.space<near>` and hoists that copy above an enclosing `scf.for` when the
+source is loop-invariant (see the Pass 5 entry below -- on today's real
+pipeline `cim-partition` already stages every activation into near space
+itself, so this pass has nothing to do there and is tested on hand-written
+IR instead), `cim-legalize-precision`
 (Pass 6) inserts `cim.requantize` after every terminal accumulator with
 `scale=1.0`/`zero_point=0` (no calibration step exists yet to derive anything
 else from) and warns when the target's `output_effective_bits` clamps below 8
@@ -154,9 +160,44 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   here. This is the same shape of gap as Pass 5's note below: the pass
   itself is complete and tested in isolation, but the two passes do not
   yet compose.
-- [ ] Passes 5 and 7 (`cim-insert-transfers`, `cim-lower-to-target`) are
-  still stubs. `cim-partition` currently emits its own transfers, so
-  pass 5 has little to do until multi-layer models arrive.
+- [x] Pass 5 `cim-insert-transfers`: `cim.mvm`'s activations operand must
+  live in `#cim.space<near>` (spec Sec. 3.4) -- not yet enforced by
+  `MvmOp::verify()` itself, precisely because this is the pass responsible
+  for making it true. Wherever an activation is not already near-space,
+  inserts a `cim.copy` and rewires the `mvm` to read the copy's result.
+  Followed by the "small dataflow analysis to hoist redundant copies out of
+  loops" spec Sec. 6 also calls for: when the activation being copied is
+  loop-invariant with respect to the `mvm`'s nearest enclosing `scf.for`
+  (its home region is not the loop body or anything nested inside it), the
+  copy is inserted once, immediately before the loop, rather than once per
+  `mvm` per iteration -- and shared by every `mvm` inside that loop reading
+  the exact same invariant source, rather than duplicated per site.
+  Idempotent: an activation already in near space is left alone, which is
+  also what makes re-running the pass a no-op.
+
+  `cim-partition`'s own output already stages every activation into near
+  space itself (see its file header) before this pass would ever see it,
+  so on today's real pipeline there is nothing for it to do -- the same
+  shape of gap as `cim-legalize-precision`'s own isolation from
+  `cim-partition`'s output, above. Tested on hand-written IR that
+  manufactures the space mismatch cim-partition's current output never
+  produces (`test/Transforms/cim-insert-transfers.mlir`): a host-space
+  activation gets a copy, an already-near one is left alone, a
+  loop-invariant activation is hoisted above the loop exactly once and
+  reused by every `mvm` in that loop sharing it, and a loop-variant
+  activation (computed from the induction variable via a `memref.subview`)
+  stays inside the loop, right before its `mvm`. `cim.copy` is a faithful
+  byte-for-byte move, not a value-changing operation, so numerical
+  verification is an invariance check like `cim-schedule`'s rather than an
+  arithmetic differential: `test/mlir/insert_transfers_e2e_test.cpp`
+  confirms running a module with and without the pass computes identical
+  numbers. That invariance is necessary but not sufficient on its own,
+  same as `cim-schedule`'s barrier placement: a mutation reverting the
+  loop-invariance check produces correct numbers with a redundant copy
+  re-inserted inside the loop on every iteration, which the numerical
+  suite alone would silently accept -- only the structural FileCheck
+  suite catches it.
+- [ ] Pass 7 `cim-lower-to-target` is still a stub.
 - [ ] End-to-end: an ONNX INT8 matmul compiles and produces numerically
   correct output vs. PyTorch. Nothing yet connects the compiled IR to the
   simulator, so there is no numerical check across the whole pipeline.

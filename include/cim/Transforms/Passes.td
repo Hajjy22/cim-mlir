@@ -98,8 +98,20 @@ def CIMInsertTransfers : Pass<"cim-insert-transfers", "ModuleOp"> {
   let summary = "Insert cim.copy wherever an op needs an operand in a "
                 "different #cim.space than it currently lives in";
   let description = [{
-    Spec Sec. 6, Pass 5. Followed by a small dataflow analysis to hoist
-    redundant copies out of loops.
+    Spec Sec. 6, Pass 5. cim.mvm's activations operand must live in
+    #cim.space<near> (spec Sec. 3.4); wherever it does not, this pass
+    inserts a cim.copy and rewires the mvm to read the copy's result.
+
+    Followed by a small dataflow analysis to hoist redundant copies out of
+    loops: when the activation being copied is loop-invariant with respect
+    to its nearest enclosing scf.for, the copy is inserted once, immediately
+    before the loop, rather than once per mvm per iteration, and shared by
+    every mvm inside that loop reading the exact same invariant source.
+
+    cim-partition's own output already stages every activation into near
+    space itself, so this pass has nothing to do on today's real pipeline --
+    it is exercised on hand-written IR that manufactures the space mismatch
+    cim-partition's current output never produces.
   }];
   let constructor = "mlir::cim::createCIMInsertTransfersPass()";
 }
