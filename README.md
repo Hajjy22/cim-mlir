@@ -35,7 +35,8 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Seven of the eight lowering passes are real: `cim-detect` finds
+**Partly implemented.** All eight lowering passes are real, though the last one
+(`cim-lower-to-target`) covers a deliberately scoped slice — see below. `cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -125,10 +126,26 @@ module with and without the pass computes identical numbers, while
 broken hoist — a mutation reverting the loop-invariance check produces correct numbers with
 redundant copies inside the loop, which the numerical suite alone would silently accept.
 
-The remaining pass (`cim-lower-to-target`) is registered but its body is a `TODO` stub, so
-nothing compiles a real model end to end yet. `cim-partition`'s scope limits
-(matrix-vector, output-major weights, exact tile multiples) are each refused with a warning
-rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+`cim-lower-to-target` (Pass 7) is the pass that turns compiled IR into something that can
+actually run on (real or simulated) hardware rather than only inside this project's own
+interpreter: it converts `cim.device_open`/`cim.tile_alloc`/`cim.program`/`cim.mvm`/
+`cim.copy`/`cim.barrier` into `func.call`s against `cimrt.h`'s real C ABI, with every
+`cimrt_status` checked via `cf.assert` rather than ignored, so the result can go through
+MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and come out
+as a real binary. v0.1's scope is deliberately straight-line, single-tile code: `cim.
+reduce_partial`, `cim.requantize`, and any `cim` op nested inside a loop are refused with a
+diagnostic rather than mislowered, matching the same "refuse rather than guess" discipline
+as `cim-partition`'s own scope limits below. Verified two ways: `test/Transforms/
+cim-lower-to-target.mlir`'s structural FileCheck suite covers every op, every `cim.copy`
+space combination, and every refusal; beyond that, this pass's output for a representative
+case was taken all the way through the real conversion pipeline, `mlir-translate`, `clang`,
+and linked against `runtime/libcimrt.a`, then actually **run** as a native binary — it
+computed the correct `cim.mvm` result against the real (simulated) hardware backend, not
+the interpreter (manually verified once; not part of the automated suite, since it needs a
+linker and a target triple that suite has no business depending on — see the pass's own
+file header). `cim-partition`'s own scope limits (matrix-vector, output-major weights,
+exact tile multiples) are each refused with a warning rather than silently mislowered — see
+[`docs/roadmap.md`](docs/roadmap.md).
 
 `cimrt` (the C ABI everything above eventually calls through) went through a hardening
 pass: a use-after-free when a buffer outlived its device, an allocation failure that
@@ -205,9 +222,11 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
 `lib/Interpreter` and `runtime/src` (currently 90.3% / 83.3%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still one-eighth empty stubs,
-so both are reported and not gated — a threshold there would measure how many
-stubs exist rather than how well anything is tested.
+mostly TableGen output, and `lib/Transforms` is exercised primarily through the
+FileCheck/lit suite rather than line-by-line unit tests (a pass is a rewrite
+over IR shapes, not a library of branches a unit test calls directly) — both
+are reported and not gated, since a line-coverage threshold would measure the
+wrong thing for either.
 
 ## Repository layout
 

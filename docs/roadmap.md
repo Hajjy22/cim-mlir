@@ -3,8 +3,9 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. Seven of the eight lowering passes
-are real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them
+**Current state.** M0, M1 and M3 are done. All eight lowering passes are real,
+though the last one covers a deliberately scoped slice (see below):
+`cim-detect` annotates eligible matmuls, `cim-partition` lowers them
 into per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit
 space transfers, `cim-placement` rewrites that IR from a Belady schedule --
 eliminating redundant weight programming, assigning tile ids from the
@@ -23,7 +24,14 @@ IR instead), `cim-legalize-precision`
 `scale=1.0`/`zero_point=0` (no calibration step exists yet to derive anything
 else from) and warns when the target's `output_effective_bits` clamps below 8
 (see the Pass 6 entry below for the interpreter-side arithmetic and the known
-`cim-partition` integration gap), and `cim-cost-report`
+`cim-partition` integration gap), `cim-lower-to-target`
+(Pass 7) converts straight-line, single-tile cim ops into real `func.call`s
+against `cimrt.h`'s C ABI so the result can go through MLIR's standard
+`--convert-to-llvm` pipeline and come out as a real, linkable binary -- the
+first pass in this project that has ever needed to CALL cimrt from generated
+code rather than execute it from C++ (see the Pass 7 entry below for the
+memory model this needed and the real-binary verification), and
+`cim-cost-report`
 (Pass 8) walks the final placed IR and emits the project's publishable numbers,
 reusing `cim-bench`'s own `CostReport`/JSON format rather than a second cost
 path (see the M3 entry below for how it accounts for loop trip counts).
@@ -197,7 +205,80 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   re-inserted inside the loop on every iteration, which the numerical
   suite alone would silently accept -- only the structural FileCheck
   suite catches it.
-- [ ] Pass 7 `cim-lower-to-target` is still a stub.
+- [x] Pass 7 `cim-lower-to-target`: converts cim ops into real `func.call`s
+  against cimrt.h's actual C ABI, so the result can go through MLIR's
+  standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker,
+  and come out as a real binary. Nothing else in this project had needed to
+  CALL cimrt from generated code before this -- the interpreter executes
+  cim ops by calling cimrt directly from C++, one op at a time, as it
+  walks the IR; this pass is that same job done at compile time, reusing
+  the interpreter's own staging model (fresh scratch buffer per call,
+  freed once its one use is done) for the same reason.
+
+  v0.1 scope is deliberately narrow, agreed with before starting rather
+  than discovered partway through: straight-line code only (any cim op
+  nested inside a region -- an `scf.for` body, exactly what
+  `cim-placement`'s own loop hoisting produces -- is refused with a
+  diagnostic, since a buffer this pass allocated would either leak every
+  iteration or need a hoisting analysis of its own, neither designed
+  here), and `cim.reduce_partial`/`cim.requantize` are refused outright
+  rather than mislowered (multi-tile K-reduction and requantization both
+  need their own buffer-lifetime story this pass does not have).
+
+  Memory model: a `#cim.space<near|insitu>` memref is not a real memref
+  after this pass runs -- cimrt's buffers are opaque handles, incompatible
+  with the raw-pointer descriptor standard memref-to-llvm lowering
+  assumes -- so every such SSA value is replaced end-to-end by the
+  `!llvm.ptr` (a `cimrt_buffer*`) `cimrt_alloc` returned for it, while
+  `#cim.space<host>` memrefs stay real, with bytes reaching cimrt only via
+  `cimrt_write`/`cimrt_read` and an extracted raw pointer. Rewriting
+  happens strictly in program order with each op erased as it is lowered,
+  so a downstream op's operand is already the new value by the time this
+  pass inspects it -- which is also what makes an operand's current type
+  self-describing (still a memref means real host memory; already
+  `!llvm.ptr` means an already-staged device buffer, the common case on
+  real pipeline output since `cim-partition` already stages activations
+  into near space itself) with no separate bookkeeping needed, except for
+  one thing an operand's type genuinely cannot recover: which device a
+  bare i32 tile id belongs to. A `memref.dealloc` on a device-space value
+  becomes `cimrt_free`; a still-live device-space value with no such
+  dealloc anywhere in the IR leaks, exactly as it would in hand-written C
+  using cimrt directly with no free -- a known, documented limitation (no
+  liveness analysis here), not an oversight.
+
+  A real bug this design surfaced during its own gate run, worth keeping
+  in mind for any future pass that touches already-rewritten operands: the
+  ODS-generated typed accessors for a dialect-fixed operand type (e.g.
+  `TileAllocOp::getDevice()`, `MvmOp::getWeights()`, and -- less
+  obviously -- *any* `AnyMemRef`-constrained accessor too, such as
+  `CopyOp::getSource()`) perform an unconditional cast to that declared
+  type. Once this pass has replaced the actual value behind such an
+  operand with a `!llvm.ptr`, calling the typed accessor is undefined
+  behavior: silently fine in a release build (assertions compiled out),
+  an immediate crash in a debug build (assertions on). It passed every
+  release-build test and still crashed the first time it ran under
+  `build-cov`'s Debug configuration. Fixed by reading every such operand
+  through `op->getOperand(N)` instead, wherever the operand might already
+  have been rewritten by an earlier op this same pass lowered.
+
+  Verified two ways: `test/Transforms/cim-lower-to-target.mlir`'s
+  structural FileCheck suite covers every real op, every `cim.copy` space
+  combination (host->device, device->host, device->device, host->host),
+  the device-space-dealloc-to-`cimrt_free` translation, and every refusal
+  diagnostic. Beyond that -- the strongest verification available for a
+  pass whose entire point is producing something a compiler pipeline can
+  run for real -- this pass's output for a case shaped like the
+  straight-line FileCheck test was taken all the way through MLIR's
+  standard `--convert-to-llvm` pipeline, `mlir-translate`, `clang`, and
+  linked against the real `runtime/libcimrt.a`, then actually **run** as a
+  native binary: it computed the correct `cim.mvm` result against real
+  (simulated) hardware, not the interpreter, and a deliberately wrong
+  expected value in that same check made the binary genuinely trap
+  (`cf.assert` firing a real `SIGABRT`) rather than silently pass. That
+  round-trip is manually verified once, not automated (it needs a linker
+  and a target triple this suite has no business depending on as a build
+  requirement) -- documented in the pass's own file header rather than
+  claimed as CI-gated coverage it is not.
 - [ ] End-to-end: an ONNX INT8 matmul compiles and produces numerically
   correct output vs. PyTorch. Nothing yet connects the compiled IR to the
   simulator, so there is no numerical check across the whole pipeline.
@@ -282,6 +363,11 @@ module stays correct and is simply not offloaded:
   second-class target file; needs real (or better-estimated) numbers and a
   working lowering to prove retargetability.
 - `cim-legalize-precision` with real `effective_bits` modeling.
+- `cim-lower-to-target` beyond its v0.1 straight-line, single-tile slice:
+  lowering `cim.reduce_partial` and `cim.requantize`, and lowering a cim op
+  inside an `scf.for` (needs a real buffer-lifetime story across loop
+  iterations, not just within one straight-line block) -- see the Pass 7
+  entry above for exactly what is and is not covered today.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

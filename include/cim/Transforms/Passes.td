@@ -149,11 +149,30 @@ def CIMLowerToTarget : Pass<"cim-lower-to-target", "ModuleOp"> {
     file header note on why this is one parameterized pass here). For v0.1,
     lowers straight to cimrt runtime calls — a separate target dialect is
     premature until there are two real targets (spec M4).
+
+    v0.1 SCOPE (see the file's header comment for the full design note):
+    straight-line, single-tile code only. cim.device_open, cim.tile_alloc,
+    cim.tile_free, cim.program, cim.mvm, cim.copy and cim.barrier lower to
+    real cimrt_* calls, with every status checked via cf.assert rather than
+    ignored. cim.reduce_partial, cim.requantize, and any cim op inside an
+    scf.for are refused with a diagnostic rather than mislowered -- neither
+    the multi-tile reduction nor per-iteration buffer lifetime has a design
+    here yet. A memref.dealloc on a device-space value becomes a
+    cimrt_free; a still-live device-space value that nothing frees is a
+    known, documented limitation (no liveness analysis here), distinct from
+    the staging buffers this pass allocates and frees itself within a
+    single op's lowering.
   }];
   let constructor = "mlir::cim::createCIMLowerToTargetPass()";
+  let dependentDialects = [
+    "mlir::LLVM::LLVMDialect",
+    "mlir::cf::ControlFlowDialect",
+    "mlir::memref::MemRefDialect"
+  ];
   let options = [
     Option<"targetYAML", "target-yaml", "std::string", "\"\"",
-           "Path to a target description YAML file (spec Sec. 7)">
+           "Path to a target description YAML file (spec Sec. 7); supplies "
+           "tiles.count for compile-time tile-id range validation">
   ];
 }
 
