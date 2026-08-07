@@ -3,13 +3,16 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. Four of the eight lowering passes are
+**Current state.** M0, M1 and M3 are done. Five of the eight lowering passes are
 real: `cim-detect` annotates eligible matmuls, `cim-partition` lowers them into
 per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit space
 transfers, `cim-placement` rewrites that IR from a Belady schedule --
 eliminating redundant weight programming, assigning tile ids from the
 solution rather than round-robin, and hoisting loop-invariant `cim.program`
-ops out of an `scf.for` when doing so is provably safe -- and `cim-cost-report`
+ops out of an `scf.for` when doing so is provably safe -- `cim-schedule`
+(Pass 4) inserts `cim.barrier` conservatively over that placed IR (see the M2
+entry below for the placement rule and why it needs to see inside a loop
+body, not just an `scf.for`'s own operand list), and `cim-cost-report`
 (Pass 8) walks the final placed IR and emits the project's publishable numbers,
 reusing `cim-bench`'s own `CostReport`/JSON format rather than a second cost
 path (see the M3 entry below for how it accounts for loop trip counts).
@@ -74,6 +77,32 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   hardcoded constant.
 - [x] Functional simulator + `cimrt` runtime with a real INT8 MVM reference
   implementation (`runtime/src/simulator/simulator.cpp`).
+- [x] Pass 4 `cim-schedule`: v0.1 keeps source order and inserts
+  `cim.barrier` conservatively rather than reordering or overlapping
+  anything (double-buffering `cim.program`/`cim.mvm` is v0.2, gated on the
+  target's `capabilities.double_buffer_program`, `docs/target-format.md`).
+  Tracks one open, un-barriered run of results per `!cim.device`, and
+  flushes it (a `cim.barrier` immediately before the dependent op) the
+  moment anything actually reads one of those results -- as a direct
+  operand, or from inside a region a candidate op owns. That second case is
+  load-bearing, not defensive: an `scf.for`'s own operand list is just its
+  bounds, never a value only its body references, so a hoisted
+  `cim.program`'s resident being read by a `cim.mvm` inside the loop is
+  invisible to a check of the `scf.for` op's direct operands alone, and
+  missing it would put the barrier after the loop instead of before it --
+  exactly the bug a first pass at this algorithm had, caught by
+  `test/Transforms/cim-schedule.mlir` before it shipped. Verified two ways
+  that do not overlap: the FileCheck suite pins exact barrier placement
+  (including the "barrier before the loop AND once per iteration inside
+  it" case above, and that unrelated bookkeeping -- a fresh `memref.alloc`,
+  a `cim.tile_alloc` on a different device -- never forces an unnecessary
+  flush), and `test/mlir/schedule_e2e_test.cpp` confirms scheduling never
+  changes a computed value. Numerical invariance is necessary but not
+  sufficient here: `cim.barrier` is a no-op in the functional simulator, so
+  a broken scheduler and a correct one compute identical numbers -- a
+  mutation test (reverting the nested-region check) confirms the FileCheck
+  suite fails while the numerical suite still silently passes, which is
+  exactly why both exist.
 - [ ] Passes 5 and 7 (`cim-insert-transfers`, `cim-lower-to-target`) are
   still stubs. `cim-partition` currently emits its own transfers, so
   pass 5 has little to do until multi-layer models arrive.

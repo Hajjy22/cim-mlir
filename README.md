@@ -35,7 +35,7 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Three of the eight lowering passes are real: `cim-detect` finds
+**Partly implemented.** Five of the eight lowering passes are real: `cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -76,11 +76,24 @@ inside executes trip-count times — a plain walk-and-count would misreport exac
 (`test/mlir/cost_report_e2e_test.cpp`): predicted and executed `programs`/`mvms` must
 agree exactly.
 
-The remaining four passes (`cim-schedule`, `cim-insert-transfers`,
-`cim-legalize-precision`, `cim-lower-to-target`) are registered but their bodies are
-`TODO` stubs, so nothing compiles a real model end to end yet. `cim-partition`'s scope
-limits (matrix-vector, output-major weights, exact tile multiples) are each refused with
-a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+`cim-schedule` (Pass 4) keeps source order — v0.1 never reorders or overlaps anything,
+that is v0.2's double-buffering work — and inserts `cim.barrier` conservatively: a device's
+outstanding `cim.program`/`cim.mvm` work is tracked as an open, un-synchronized run until
+something actually depends on its result (a direct operand, or a use nested inside an
+`scf.for` body — the loop op itself never lists a value only its body references, which is
+exactly the case that needs a barrier *before* the loop, not just inside it), at which
+point a barrier is inserted immediately before the dependent op. `cim.barrier` is a no-op
+in the functional simulator, so a numerical differential cannot tell a correctly-placed
+barrier from a missing one — that is what the structural tests
+(`test/Transforms/cim-schedule.mlir`) are for, and a mutation test confirms they actually
+catch a broken scheduler that a numerical-only check would silently let through
+(`test/mlir/schedule_e2e_test.cpp` covers the "does not change the answer" half instead).
+
+The remaining three passes (`cim-insert-transfers`, `cim-legalize-precision`,
+`cim-lower-to-target`) are registered but their bodies are `TODO` stubs, so nothing
+compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
+output-major weights, exact tile multiples) are each refused with a warning rather than
+silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
 
 `cimrt` (the C ABI everything above eventually calls through) went through a hardening
 pass: a use-after-free when a buffer outlived its device, an allocation failure that
@@ -156,8 +169,8 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 ```
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
-`lib/Interpreter` and `runtime/src` (currently 89.8% / 83.7%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still four-eighths empty stubs,
+`lib/Interpreter` and `runtime/src` (currently 90.0% / 83.8%). `lib/Dialect` is
+mostly TableGen output and `lib/Transforms` is still three-eighths empty stubs,
 so both are reported and not gated — a threshold there would measure how many
 stubs exist rather than how well anything is tested.
 

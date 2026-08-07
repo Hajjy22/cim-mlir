@@ -74,6 +74,23 @@ def CIMPlacement : Pass<"cim-placement", "ModuleOp"> {
 def CIMSchedule : Pass<"cim-schedule", "ModuleOp"> {
   let summary = "Order emitted cim ops, inserting barriers conservatively "
                 "(v0.1) or overlapping program/mvm via double-buffering (v0.2+)";
+  let description = [{
+    Spec Sec. 6, Pass 4. v0.1 never reorders or overlaps anything -- that is
+    v0.2's double-buffering work, gated on the target's
+    capabilities.double_buffer_program (spec Sec. 7) -- so the only question
+    this pass answers is where a cim.barrier must sit.
+
+    Each !cim.device accumulates an open, un-synchronized run of
+    cim.program/cim.mvm results until something actually depends on one of
+    them -- directly as an operand, or from inside a region the dependent op
+    owns (an scf.for body referencing a resident defined outside the loop is
+    exactly this case: the loop op's own operands are just its bounds). At
+    that point a cim.barrier is inserted immediately before the dependent
+    op, never after. A block's outstanding work is also always fully
+    flushed right before that block's own terminator, which is what gives a
+    hoisted cim.program's dependents a fresh barrier on every runtime
+    iteration of an scf.for, not just once total.
+  }];
   let constructor = "mlir::cim::createCIMSchedulePass()";
 }
 
