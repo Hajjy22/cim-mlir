@@ -36,7 +36,23 @@ round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck te
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
 **Partly implemented.** All eight lowering passes are real, though the last one
-(`cim-lower-to-target`) covers a deliberately scoped slice — see below. `cim-detect` finds
+(`cim-lower-to-target`) covers a deliberately scoped slice — see below. Two real
+composition breaks between them have been closed: `cim-legalize-precision` now retypes
+the downstream `cim.copy`/`memref.copy` chain where it owns the type, and falls back to
+a width-preserving requantize (the value is still genuinely clamped) where it doesn't —
+see `lib/Transforms/CIMLegalizePrecision.cpp`'s file header. `cim-lower-to-target` now
+folds an identity `memref.subview` of a device-space value through to its source handle,
+exactly the shape `cim-partition` emits slicing a staged activation for a single K-tile,
+and still refuses a genuine (non-identity) slice rather than mislowering it. One boundary
+remains and is **not** a composition bug: `cim-legalize-precision` always inserts a real
+`cim.requantize`, and `cim-lower-to-target` refuses `cim.requantize` outright as a matter
+of its documented v0.1 scope (real requantize lowering is M4). So those two passes cannot
+both sit in a chain that also reaches `cim-lower-to-target` until that lands —
+`test/Transforms/cim-pipeline-full.mlir` and `test/mlir/pipeline_e2e_test.cpp`'s
+`e2e_full_pipeline_through_precision_legalization_composes` exercise the two chains that
+actually do compose today: passes 1–6 plus `cim-cost-report`, and passes 1–5 plus
+`cim-cost-report` and `cim-lower-to-target` (skipping precision legalization).
+`cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -141,9 +157,15 @@ space combination, and every refusal; beyond that, this pass's output for a repr
 case was taken all the way through the real conversion pipeline, `mlir-translate`, `clang`,
 and linked against `runtime/libcimrt.a`, then actually **run** as a native binary — it
 computed the correct `cim.mvm` result against the real (simulated) hardware backend, not
-the interpreter (manually verified once; not part of the automated suite, since it needs a
-linker and a target triple that suite has no business depending on — see the pass's own
-file header). `cim-partition`'s own scope limits (matrix-vector, output-major weights,
+the interpreter — first verified once by hand, now reproducible on demand as
+`test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs
+`mlir-opt`/`mlir-translate`/`clang` and a linker the main suite has no business depending
+on to configure): two binaries built from the same source differing only in a constant a
+`cf.assert` checks a real `cim.mvm` result against, run via `ctest -R real-target` —
+the correct one must exit 0 and the wrong one must genuinely crash, so a broken assertion
+that "always passes" would be caught, not just a broken one that never fires.
+
+`cim-partition`'s own scope limits (matrix-vector, output-major weights,
 exact tile multiples) are each refused with a warning rather than silently mislowered — see
 [`docs/roadmap.md`](docs/roadmap.md).
 

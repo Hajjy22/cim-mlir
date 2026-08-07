@@ -19,6 +19,7 @@
 #include "cim/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -37,7 +38,14 @@ int main(int argc, char **argv) {
                   mlir::arith::ArithDialect,
                   mlir::linalg::LinalgDialect,
                   mlir::tensor::TensorDialect,
-                  mlir::scf::SCFDialect>();
+                  mlir::scf::SCFDialect,
+                  // cim-lower-to-target (Pass 7) is the only pass that
+                  // emits cf.assert, and until now only ever as PASS
+                  // OUTPUT (checked via FileCheck's string matching, which
+                  // never re-parses it). The opt-in real-target e2e suite
+                  // (test/real-target) is the first thing that hand-writes
+                  // cf.assert as actual INPUT syntax for cim-opt to parse.
+                  mlir::cf::ControlFlowDialect>();
 
   // Generic utility passes (canonicalize, cse, ...) are worth having when
   // debugging a pipeline by hand.

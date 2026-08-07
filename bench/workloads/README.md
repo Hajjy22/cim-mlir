@@ -57,6 +57,19 @@ correctness, which is the functional simulator's job
 `validatePlacement()` before its number is reported, and `cim-bench` exits
 non-zero if any schedule fails.
 
+One more line to draw, because it is easy to read this table as "what the
+compiler does" when it is actually "what the standalone simulator computes":
+these numbers come from `cim-bench`'s own Belady/LRU/FIFO solve over a
+generated workload, not from running `cim-placement` on compiled MLIR.
+`cim-placement` on real compiled IR does reproduce the `mm-fit` result above
+— a model whose weights entirely fit in tiles reprograms once, however many
+inferences run, checked by executing hoisted IR through a real interpreter
+(`test/mlir/pipeline_e2e_test.cpp`) — but it does **not** reproduce the
+`mm-spill-2x`/`mm-spill-8x`/`mlp-3layer`/`bert-ffn` figures: those come from
+Belady solved over the whole flattened N-inference sequence, which can find
+reuse that `cim-placement`'s single-iteration, tile-local hoisting check
+cannot see. `docs/roadmap.md`'s M3 section has the full explanation.
+
 ## Still to come
 
 - ONNX ingestion, so the shapes come from a real model file rather than

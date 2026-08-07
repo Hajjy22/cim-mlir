@@ -179,6 +179,59 @@ func.func @copy_host_to_host_uses_plain_memref_copy(%src: memref<4xi8>) {
 
 // -----
 
+// An IDENTITY memref.subview (offset 0, full extent, unit stride) of a
+// device-space value folds straight through to the same handle -- exactly
+// the shape cim-partition emits slicing a staged activation for a single
+// K-tile (test/Transforms/cim-pipeline-full.mlir exercises this against
+// real cim-partition output). No cimrt call is needed for the subview
+// itself, and cim.mvm reads the very same pointer cimrt_alloc/cimrt_write
+// produced for the copy, not a second buffer.
+// CHECK-LABEL: func.func @identity_subview_of_a_device_value_folds
+func.func @identity_subview_of_a_device_value_folds(%act: memref<4xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %t = cim.tile_alloc %dev {id = 0 : i64} : (!cim.device<"t">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w2 : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %near = cim.copy %act : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  %slice = memref.subview %near[0] [4] [1]
+           : memref<4xi8, #cim.space<near>> to memref<4xi8, strided<[1]>, #cim.space<near>>
+  %out = cim.mvm %r, %slice : (!cim.resident<4x4xi8>, memref<4xi8, strided<[1]>, #cim.space<near>>) -> memref<4xi32>
+  memref.dealloc %out : memref<4xi32>
+  return
+}
+// The weight is staged and programmed first (cim.program precedes cim.copy
+// in program order here), then the activation is staged into its own
+// buffer -- %[[ACTBUF]] is the SAME value cimrt_mvm below reads from,
+// captured right after the one cimrt_alloc/cimrt_write pair the copy
+// causes.
+// CHECK: call @cimrt_program
+// CHECK: %[[ACTPTR:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// CHECK: call @cimrt_write(%[[ACTPTR]]
+// CHECK-NOT: memref.subview
+// CHECK: call @cimrt_mvm(%{{.*}}, %{{.*}}, %[[ACTPTR]]
+// CHECK-NOT: cim.mvm
+memref.global "private" constant @w2 : memref<4x4xi8> = dense<1>
+
+// -----
+
+// A NON-identity memref.subview (a real slice, offset nonzero) of a
+// device-space value is refused -- cimrt_mvm has no offset/sub-buffer
+// concept, so folding it the way the identity case does would silently
+// read the wrong bytes. This is the real multi-K-tile case, deferred to
+// M4 (docs/roadmap.md), not mislowered here.
+func.func @non_identity_subview_is_refused(%act: memref<8xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %near = cim.copy %act : memref<8xi8> to memref<8xi8, #cim.space<near>>
+  // expected-error @+1 {{not an identity slice}}
+  %slice = memref.subview %near[4] [4] [1]
+           : memref<8xi8, #cim.space<near>> to memref<4xi8, strided<[1], offset: 4>, #cim.space<near>>
+  memref.dealloc %slice : memref<4xi8, strided<[1], offset: 4>, #cim.space<near>>
+  return
+}
+
+// -----
+
 // A tile id outside the target's declared tile count is refused at compile
 // time against -target-yaml, not deferred to a runtime cimrt_query.
 // tiny-4x4.yaml declares 2 tiles (ids 0 and 1); id 5 is out of range.

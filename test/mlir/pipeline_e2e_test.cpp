@@ -37,6 +37,8 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -173,8 +175,25 @@ struct RunResult {
 /// detect+partition+placement. Running the *same* source both ways is what
 /// makes the invariance test below possible: placement is an optimization,
 /// so any difference in the numbers is a bug in placement by definition.
+///
+/// `withPrecisionPipeline` extends the chain with cim-schedule,
+/// cim-insert-transfers and cim-legalize-precision -- passes 4 through 6 --
+/// on top of whatever detect/partition/placement already ran. This is the
+/// composition-hardening regression test (Part 4 of the plan that closed
+/// blockers in cim-legalize-precision and cim-lower-to-target): before that
+/// work, running cim-legalize-precision on real cim-partition output failed
+/// with "copy must not change element type" (see
+/// lib/Transforms/CIMLegalizePrecision.cpp's file header) -- this is that
+/// same composition, but checked against the interpreter's actual numbers
+/// rather than only structurally (test/Transforms/cim-pipeline-full.mlir is
+/// the structural half). cim-schedule and cim-insert-transfers are true
+/// no-ops on real cim-partition output (see their own file headers) and are
+/// included anyway because a regression test for "the chain composes"
+/// should run the actual chain, not a shortcut that happens to reach the
+/// same place.
 RunResult compileSource(const std::string &source, bool withPlacement,
-                        std::string *error) {
+                        std::string *error,
+                        bool withPrecisionPipeline = false) {
   RunResult result;
 
   DialectRegistry registry;
@@ -207,6 +226,17 @@ RunResult compileSource(const std::string &source, bool withPlacement,
       return result;
     }
     pm.addPass(std::move(placement));
+  }
+
+  if (withPrecisionPipeline) {
+    pm.addPass(cim::createCIMSchedulePass());
+    pm.addPass(cim::createCIMInsertTransfersPass());
+    auto legalize = cim::createCIMLegalizePrecisionPass();
+    if (failed(legalize->initializeOptions("target-yaml=" + tinyTarget()))) {
+      *error = "failed to set cim-legalize-precision options";
+      return result;
+    }
+    pm.addPass(std::move(legalize));
   }
 
   if (failed(pm.run(*module))) {
@@ -334,6 +364,58 @@ void checkCase(const char *label, const std::vector<int8_t> &w,
   }
 }
 
+/// Independent reference for cim.requantize's arithmetic -- the same
+/// formula legalize_precision_e2e_test.cpp checks the interpreter against
+/// directly, recomputed here from first principles (not called from that
+/// file) so a bug shared between the two would not be invisible to both.
+/// round-half-away-from-zero, then clamp to the signed range effectiveBits
+/// can hold (Interpreter.cpp's runRequantize's own contract).
+int32_t expectedRequantize(int32_t value, uint32_t effectiveBits) {
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
+  int64_t quantized = std::llround(static_cast<double>(value)); // scale=1.0
+  quantized = std::clamp(quantized, clampMin, clampMax);
+  return static_cast<int32_t>(quantized);
+}
+
+/// Run one case through the FULL composed pipeline (detect, partition,
+/// placement, schedule, insert-transfers, legalize-precision) and compare
+/// against the matmul reference put through expectedRequantize element-wise
+/// -- tiny-4x4.yaml declares output_effective_bits: 8, matching the target
+/// this pipeline runs against.
+void checkPrecisionCase(const char *label, const std::vector<int8_t> &w,
+                        const std::vector<int8_t> &act, int n, int k) {
+  std::string error;
+  const RunResult result = compileSource(buildModule(w, act, n, k),
+                                         /*withPlacement=*/true, &error,
+                                         /*withPrecisionPipeline=*/true);
+  if (!error.empty()) {
+    CIM_FAIL(std::string(label) + ": " + error);
+    return;
+  }
+  if (result.prints.empty()) {
+    CIM_FAIL(std::string(label) + ": interpreter printed nothing");
+    return;
+  }
+  const std::vector<int32_t> &got = result.prints.front();
+  const std::vector<int32_t> raw = reference(w, act, n, k);
+  if (got.size() != raw.size()) {
+    CIM_FAIL(std::string(label) + ": expected " + std::to_string(raw.size()) +
+             " outputs, got " + std::to_string(got.size()));
+    return;
+  }
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const int32_t want = expectedRequantize(raw[i], /*effectiveBits=*/8);
+    if (got[i] != want) {
+      CIM_FAIL(std::string(label) + ": output[" + std::to_string(i) +
+               "] = " + std::to_string(got[i]) + ", requantized reference says " +
+               std::to_string(want) + " (raw matmul value was " +
+               std::to_string(raw[i]) + ")");
+      return;
+    }
+  }
+}
+
 std::vector<int8_t> sequential(int count, int start, int step) {
   std::vector<int8_t> v;
   v.reserve(count);
@@ -381,6 +463,25 @@ CIM_TEST(e2e_zero_weights_produce_zero) {
   const std::vector<int8_t> w(16, 0);
   const std::vector<int8_t> act = {1, 2, 3, 4};
   checkCase("zeros", w, act, 4, 4);
+}
+
+CIM_TEST(e2e_full_pipeline_through_precision_legalization_composes) {
+  // Part 4's numerical regression test for Parts 2 and 3 of the
+  // composition-hardening work: detect, partition, placement, schedule,
+  // insert-transfers and legalize-precision chained together and actually
+  // EXECUTED, not just structurally checked (that is
+  // test/Transforms/cim-pipeline-full.mlir's job). Weights and activation
+  // are chosen so the raw dot product overflows an 8-bit clamp for two of
+  // the four outputs (40000 and -40000, both far outside [-128, 127]) and
+  // stays within it for the other two -- proving cim.requantize's clamp is
+  // doing real work inside a real composed pipeline, not just passing
+  // values through unchanged.
+  const std::vector<int8_t> w = {100, 100, 100, 100,
+                                  -100, -100, -100, -100,
+                                  1, 0, 0, 0,
+                                  0, 0, 0, 1};
+  const std::vector<int8_t> act = {100, 100, 100, 100};
+  checkPrecisionCase("precision pipeline", w, act, 4, 4);
 }
 
 //===----------------------------------------------------------------------===//

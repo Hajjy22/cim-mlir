@@ -25,6 +25,17 @@ include(CIMBuildFlags)
 # its unit tests, and a working cim-bench, rather than a configure error.
 option(CIM_ENABLE_MLIR "Build the MLIR dialect, passes, and cim-opt" ON)
 option(CIM_INCLUDE_TESTS "Build the cim-mlir test suites" ON)
+# Default OFF and deliberately not part of the main test suite: this drives
+# cim-lower-to-target's output all the way through mlir-opt, mlir-translate
+# and a real linker to produce and RUN a native binary against
+# runtime/libcimrt.a -- the strongest evidence this project has that its
+# output is a working artifact, not just structurally well-shaped IR (see
+# test/real-target/CMakeLists.txt). It needs a linker and a target triple
+# the main suite has no business depending on to build at all, which is
+# exactly why it is opt-in rather than folded into CIM_INCLUDE_TESTS.
+option(CIM_ENABLE_REAL_TARGET_E2E
+       "Build and run the opt-in real-binary verification for cim-lower-to-target (needs mlir-opt, mlir-translate and a linker)"
+       OFF)
 
 # Put every tool in <build>/bin. Without this, add_llvm_executable and
 # add_executable scatter binaries across their source-relative build

@@ -127,6 +127,50 @@ FailureOr<int64_t> byteSizeOf(MemRefType type) {
   return type.getNumElements() * *elemBytes;
 }
 
+/// True iff `view` slices its entire source with zero offset, unit stride,
+/// and no rank reduction -- i.e. it is a no-op view, not a genuine slice.
+/// Every field is checked against its STATIC value; a dynamic offset, size,
+/// or stride (a runtime operand this function cannot see the value of)
+/// always fails this check rather than being assumed to be the identity --
+/// this is the "must be verified, not assumed" case the identity-subview
+/// fold exists to get right (see checkAllowedConsumers below).
+///
+/// Must only be called while `view`'s source operand is still a real
+/// memref: it uses SubViewOp's own typed accessors (getSourceType(), which
+/// is built on the same kind of unconditional cast as the ODS accessors
+/// lowerTileAlloc's comment warns about), which are unsafe once this pass
+/// has rewritten that operand to something else. checkAllowedConsumers,
+/// the only caller, always runs before any such rewriting happens.
+bool isIdentitySubview(memref::SubViewOp view) {
+  MemRefType srcType = view.getSourceType();
+  ArrayRef<int64_t> srcShape = srcType.getShape();
+  // No rank reduction: static_offsets/sizes/strides always have one entry
+  // per SOURCE dimension regardless of whether the result is rank-reduced
+  // (a rank-reducing subview just drops some of those dimensions from the
+  // RESULT's own shape), so the only direct way to rule that out is
+  // comparing the result's actual declared rank to the source's.
+  if (view.getType().getRank() != static_cast<int64_t>(srcShape.size()))
+    return false;
+  ArrayRef<int64_t> offsets = view.getStaticOffsets();
+  ArrayRef<int64_t> sizes = view.getStaticSizes();
+  ArrayRef<int64_t> strides = view.getStaticStrides();
+  if (offsets.size() != srcShape.size() || sizes.size() != srcShape.size() ||
+      strides.size() != srcShape.size())
+    return false;
+  for (int64_t off : offsets)
+    if (off != 0)
+      return false;
+  for (int64_t stride : strides)
+    if (stride != 1)
+      return false;
+  for (auto [size, dim] : llvm::zip_equal(sizes, srcShape)) {
+    if (ShapedType::isDynamic(size) || ShapedType::isDynamic(dim) ||
+        size != dim)
+      return false;
+  }
+  return true;
+}
+
 /// Lowers one function's straight-line cim ops to cimrt_* calls. One
 /// instance per function so tileDevices never leaks across functions that
 /// do not share SSA values.
@@ -324,15 +368,39 @@ private:
   /// use. Called right before the replacement, so an op with no defined
   /// lowering here is reported clearly instead of silently becoming
   /// ill-typed IR that only the post-pass verifier would catch, confusingly.
+  ///
+  /// A memref.subview user is allowed only when it is an IDENTITY slice
+  /// (isIdentitySubview) -- exactly what cim-partition emits when slicing a
+  /// staged activation for a single K-tile (spec Sec. 6's single-tile v0.1
+  /// case): offset 0, full extent, unit stride, so the "slice" carves out
+  /// the whole buffer and is safe to fold straight through to the same
+  /// handle once lowerSubview reaches it (see that function). A genuine,
+  /// non-identity slice is refused with its own diagnostic: cimrt_mvm takes
+  /// whole buffers, with no offset or sub-buffer concept in the ABI, so
+  /// slicing a real device-space buffer needs an actual ABI decision this
+  /// v0.1 slice does not make (tracked as M4 in docs/roadmap.md), not a
+  /// guess here.
   LogicalResult checkAllowedConsumers(Value deviceValue) {
     for (Operation *user : deviceValue.getUsers()) {
       if (isa<ProgramOp, MvmOp, CopyOp, memref::DeallocOp>(user))
         continue;
+      if (auto view = dyn_cast<memref::SubViewOp>(user)) {
+        if (isIdentitySubview(view))
+          continue;
+        return user->emitError(
+            "cim-lower-to-target: this memref.subview of a "
+            "#cim.space<near|insitu> value is not an identity slice "
+            "(offset 0, full extent, unit stride) -- cimrt_mvm has no "
+            "offset/sub-buffer concept, so a genuine slice of a "
+            "device-space buffer has no lowering in this v0.1 slice (see "
+            "the M4 roadmap entry)");
+      }
       return user->emitError(
           "cim-lower-to-target: this op consumes a #cim.space<near|insitu> "
           "value with no lowering defined for that use in this v0.1 slice "
-          "(only cim.program, cim.mvm, cim.copy and memref.dealloc "
-          "consuming a device-space value are supported)");
+          "(only cim.program, cim.mvm, cim.copy, memref.dealloc and an "
+          "identity memref.subview consuming a device-space value are "
+          "supported)");
     }
     return success();
   }
@@ -366,9 +434,11 @@ private:
           "this file's header comment)");
     if (auto o = dyn_cast<memref::DeallocOp>(op))
       return lowerDealloc(o);
-    // Not a cim op and not memref.dealloc: none of this pass' concern
-    // (memref.alloc, memref.get_global, arith.constant, a cim_print_* call,
-    // ...) -- left exactly as it was.
+    if (auto o = dyn_cast<memref::SubViewOp>(op))
+      return lowerSubview(o);
+    // Not a cim op and not memref.dealloc/memref.subview: none of this
+    // pass' concern (memref.alloc, memref.get_global, arith.constant, a
+    // cim_print_* call, ...) -- left exactly as it was.
     return success();
   }
 
@@ -719,6 +789,34 @@ private:
       return success(); // a real memref: an ordinary dealloc, untouched.
     OpBuilder b(op);
     freeBuffer(b, op.getLoc(), operand);
+    op.erase();
+    return success();
+  }
+
+  /// Folds an identity memref.subview of an already-lowered device-space
+  /// handle straight through to that same handle. Raw operand access, not
+  /// op.getSource() -- same asserting-cast hazard as lowerDealloc's
+  /// operand access, and for the same reason: this op may be looking at an
+  /// operand already rewritten to !llvm.ptr.
+  ///
+  /// Reaching this function with a ptrTy source at all means
+  /// checkAllowedConsumers already proved, back when the source was still
+  /// a real memref and its typed accessors were still safe to call, that
+  /// this specific subview is the identity (see isIdentitySubview) --
+  /// checkAllowedConsumers is the only gate that ever lets a
+  /// memref.subview become a consumer of a device-space value, and it
+  /// refuses (failing the whole pass) on anything else before this
+  /// function is ever reached. So no shape re-checking is needed here:
+  /// this is a plain, unconditional fold once that invariant holds.
+  ///
+  /// A memref.subview whose source is NOT device-space (the ordinary case
+  /// -- e.g. cim-partition's own slicing of a host output buffer) is left
+  /// exactly as it was, same as every other op this pass does not own.
+  LogicalResult lowerSubview(memref::SubViewOp op) {
+    Value src = op->getOperand(0);
+    if (src.getType() != ptrTy)
+      return success();
+    op.getResult().replaceAllUsesWith(src);
     op.erase();
     return success();
   }

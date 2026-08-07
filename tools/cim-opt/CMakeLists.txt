@@ -18,6 +18,7 @@ target_link_libraries(cim-opt PRIVATE
   MLIRLinalgDialect
   MLIRTensorDialect
   MLIRSCFDialect
+  MLIRControlFlowDialect
 )
 
 mlir_check_all_link_libraries(cim-opt)

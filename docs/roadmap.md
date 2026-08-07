@@ -66,6 +66,31 @@ in `test/mlir/pipeline_e2e_test.cpp` -- but the spill workloads in
 computes, not what this pass emits. A full N-inference Belady solve on
 compiled IR, if it is ever wanted, is separate work from what landed here.
 
+**Composition hardening.** Individually-real passes are not the same claim
+as a pipeline that composes, and for a while this project made the former
+claim while only the latter was true up to Pass 5. Two real composition
+breaks got fixed (see the Pass 6 and Pass 7 entries above for the actual
+fixes): `cim-legalize-precision` retyping a downstream `cim.copy`/
+`memref.copy` chain where it safely can and falling back to a
+width-preserving requantize where it can't (rather than tripping the
+dialect verifier), and `cim-lower-to-target` folding an identity
+`memref.subview` of a device-space value through to its source handle
+(rather than refusing the exact shape `cim-partition` emits for a
+single-K-tile activation). A third boundary was found along the way and is
+NOT a composition bug: `cim-legalize-precision` always inserts a real
+`cim.requantize`, and `cim-lower-to-target` refuses `cim.requantize`
+outright as a matter of its documented v0.1 scope (M4). So the two passes
+genuinely cannot both sit in a chain that also reaches
+`cim-lower-to-target` until requantize lowering is implemented --
+`test/Transforms/cim-pipeline-full.mlir` proves the two chains that
+actually do compose today (through `cim-legalize-precision` and
+`cim-cost-report`, or through `cim-cost-report` and `cim-lower-to-target`
+skipping `cim-legalize-precision`) rather than asserting a single 8-pass
+chain that cannot exist yet. `test/mlir/pipeline_e2e_test.cpp`'s
+`e2e_full_pipeline_through_precision_legalization_composes` is the same
+claim checked numerically: the composed chain's requantize clamp is
+checked against an independently computed reference, not just its shape.
+
 ## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
 - [x] `cim-opt` compiles and runs against MLIR 18. Note: no from-source LLVM
@@ -155,19 +180,36 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   sub-8-bit warning) via FileCheck, on hand-written IR rather than the live
   pipeline -- see the integration-gap note below.
 
-  Not yet wired into the live pipeline: `cim-partition` always emits its
+  Composes with `cim-partition`'s output. `cim-partition` always emits its
   own `cim.copy` back to a host buffer typed to match the *original* i32
   accumulator, with no knowledge that a later pass might requantize that
-  value down to i8. Running `cim-legalize-precision` after `cim-partition`
-  on real pipeline output changes a terminal value's type out from under
-  that already-emitted `cim.copy`, which the dialect's verifier correctly
-  rejects ("copy must not change element type") rather than silently
-  coercing. Fixing that needs `cim-partition` (or a dataflow pass between
-  the two) to know a downstream requantize is coming and size its own
-  host-side buffer for i8 -- a real, separate piece of work, not attempted
-  here. This is the same shape of gap as Pass 5's note below: the pass
-  itself is complete and tested in isolation, but the two passes do not
-  yet compose.
+  value down to i8 -- naively rewiring that copy's operand to a narrower
+  result would leave its declared result type stale and trip the dialect
+  verifier ("copy must not change element type"). Rather than teach
+  `cim-partition` to anticipate a requantize that may never run (coupling
+  two otherwise-independent passes and misreporting buffer sizes whenever
+  this pass is absent), `cim-legalize-precision` looks at what is actually
+  downstream of each terminal before deciding how to narrow it: if every
+  consumer is something the pass is free to retype in place (another
+  `cim.copy`, or a `memref.copy` into a `memref.alloc` it owns, or a
+  `memref.dealloc`, which has no separate declared type to go stale), it
+  narrows all the way to i8 and retypes that whole local chain to match.
+  Otherwise -- the case on real `cim-partition` output, where the
+  copy-back's ultimate destination is a subview of the function's own
+  output argument, a type this pass has no license to change -- it falls
+  back to a requantize whose result type matches the terminal's *original*
+  element type exactly. That is not a lesser form of legalization:
+  `cim.requantize`'s clamp to `effective_bits` is a value-range operation
+  (`Interpreter.cpp`'s `runRequantize` already supports any integer result
+  width), so the readout-path accuracy loss spec Sec. 5.3 cares about is
+  modeled correctly either way -- only the storage container's width
+  differs, and only when narrowing it would require changing a type this
+  pass does not own. Both shapes are covered by
+  `test/Transforms/cim-legalize-precision.mlir`
+  (`narrows_through_a_locally_owned_copy_chain` and
+  `falls_back_when_the_sink_is_not_owned`), and the composed case against
+  real `cim-detect`/`cim-partition` output is exercised end to end by
+  `test/Transforms/cim-pipeline-full.mlir`.
 - [x] Pass 5 `cim-insert-transfers`: `cim.mvm`'s activations operand must
   live in `#cim.space<near>` (spec Sec. 3.4) -- not yet enforced by
   `MvmOp::verify()` itself, precisely because this is the pass responsible
@@ -185,9 +227,10 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
 
   `cim-partition`'s own output already stages every activation into near
   space itself (see its file header) before this pass would ever see it,
-  so on today's real pipeline there is nothing for it to do -- the same
-  shape of gap as `cim-legalize-precision`'s own isolation from
-  `cim-partition`'s output, above. Tested on hand-written IR that
+  so on today's real pipeline there is nothing for it to do -- unlike Pass
+  6's note above, this is not a composition gap to close: there is
+  genuinely no near-space-staging work left for this pass on real
+  `cim-partition` output, by design. Tested on hand-written IR that
   manufactures the space mismatch cim-partition's current output never
   produces (`test/Transforms/cim-insert-transfers.mlir`): a host-space
   activation gets a copy, an already-near one is left alone, a
@@ -246,6 +289,31 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   using cimrt directly with no free -- a known, documented limitation (no
   liveness analysis here), not an oversight.
 
+  Composes with `cim-partition`'s output. Slicing a staged activation per
+  K-tile (the single-tile v0.1 case: `cim-partition` still emits a
+  `memref.subview` even when there is only one tile) initially broke
+  composition independently of Pass 6's own gap: `checkAllowedConsumers`
+  only recognized `cim.program`/`cim.mvm`/`cim.copy`/`memref.dealloc` as
+  consumers of a device-space value, so the subview tripped its refusal.
+  Fixed by recognizing an IDENTITY subview specifically (offset 0, full
+  extent, unit stride, no rank reduction -- verified against the source's
+  actual static shape, never assumed) and folding it straight through to
+  the same handle once the pass reaches it in program order, rather than
+  allocating a second buffer or attempting a real device-side slice.
+  Reached only via `checkAllowedConsumers`, which is what lets `lowerSubview`
+  fold unconditionally once a subview's operand is already `!llvm.ptr`: any
+  non-identity subview -- the real multi-K-tile case -- is refused there,
+  with its own diagnostic, before `lowerSubview` is ever reached, rather
+  than silently reading the wrong bytes. `cimrt_mvm` has no offset or
+  sub-buffer concept in its ABI, so a genuine slice of a device-space
+  buffer needs a real ABI decision (a sub-buffer notion, or staging each
+  slice separately) that is real, separate work -- tracked as M4, not
+  attempted here. `test/Transforms/cim-lower-to-target.mlir`'s
+  `identity_subview_of_a_device_value_folds` and
+  `non_identity_subview_is_refused` cover both directions, and
+  `test/Transforms/cim-pipeline-full.mlir` exercises the fold against real
+  `cim-partition` output.
+
   A real bug this design surfaced during its own gate run, worth keeping
   in mind for any future pass that touches already-rewritten operands: the
   ODS-generated typed accessors for a dialect-fixed operand type (e.g.
@@ -274,11 +342,22 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
   native binary: it computed the correct `cim.mvm` result against real
   (simulated) hardware, not the interpreter, and a deliberately wrong
   expected value in that same check made the binary genuinely trap
-  (`cf.assert` firing a real `SIGABRT`) rather than silently pass. That
-  round-trip is manually verified once, not automated (it needs a linker
-  and a target triple this suite has no business depending on as a build
-  requirement) -- documented in the pass's own file header rather than
-  claimed as CI-gated coverage it is not.
+  (`cf.assert` firing a real `SIGABRT`) rather than silently pass. First
+  verified once by hand, that round trip is now reproducible on demand as
+  `test/real-target/` (`-DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF --
+  it needs `mlir-opt`, `mlir-translate` and `clang` specifically, a linker
+  and a target triple the main suite has no business depending on to
+  configure at all): a `cim.mvm` against an identity weight, with a
+  `cf.assert` baked directly into the source MLIR checking one element of
+  the real result against a compile-time constant, built into two
+  binaries that differ only in that constant. `ctest -R real-target` runs
+  both -- the correct-value binary must exit 0, and the wrong-value one
+  must genuinely crash (a `sh -c '! ...'` wrapper, since CTest's
+  `WILL_FAIL` explicitly does not invert a signal-terminated failure) --
+  so both directions of "the assertion works" stay checked, not just the
+  happy path. Still not part of the main gate or CI (same reasoning as
+  before: a linker and target triple this suite should not require to
+  configure), but no longer only documented in a file header either.
 - [ ] End-to-end: an ONNX INT8 matmul compiles and produces numerically
   correct output vs. PyTorch. Nothing yet connects the compiled IR to the
   simulator, so there is no numerical check across the whole pipeline.

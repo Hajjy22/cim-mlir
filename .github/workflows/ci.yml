@@ -267,10 +267,13 @@ jobs:
       # reads around 55%, and the threshold below becomes noise rather than
       # a signal.
       #
-      # Gated: the code whose behaviour these tests are about. Reported but
-      # not gated: lib/Dialect (mostly TableGen-generated) and lib/Transforms
-      # (five of eight passes are empty stubs, so a threshold there measures
-      # how many stubs exist).
+      # Gated: the code whose behaviour these tests are about, including all
+      # eight lib/Transforms lowering passes (cim-detect through
+      # cim-lower-to-target). Reported but not gated: lib/Dialect, which is
+      # mostly TableGen-generated. lib/Transforms' floor is lower than the
+      # other gated directories (70 branch vs. 78) because that is where
+      # measured coverage actually sits today (89.6% line / 75.3% branch) --
+      # a gate is a floor that is true now, not an aspiration to grow into.
       # The summary also goes to $GITHUB_STEP_SUMMARY so the headline
       # percentages are readable on the run page itself. An artifact that
       # has to be downloaded to answer "did coverage move?" mostly does not
@@ -283,10 +286,20 @@ jobs:
             --filter 'lib/Interpreter/' --filter 'runtime/src/' \
             --fail-under-line 85 --fail-under-branch 78 \
             --print-summary --txt coverage-gated.txt --html coverage-gated.html
+          gcovr --root . \
+            --exclude-throw-branches --exclude-unreachable-branches \
+            --filter 'lib/Transforms/' \
+            --fail-under-line 85 --fail-under-branch 70 \
+            --print-summary --txt coverage-gated-transforms.txt \
+            --html coverage-gated-transforms.html
           {
             echo '## Coverage: gated directories'
             echo '```'
             cat coverage-gated.txt
+            echo '```'
+            echo '## Coverage: gated directories (lib/Transforms)'
+            echo '```'
+            cat coverage-gated-transforms.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
