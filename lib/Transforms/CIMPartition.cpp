@@ -157,8 +157,18 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     // paddedK == k and every branch below that only fires "when padded"
     // is simply dead, so the exact-multiple case emits identical IR to
     // before this padding support existed.
-    const int64_t paddedN = llvm::divideCeil(n, tileRows) * tileRows;
-    const int64_t paddedK = llvm::divideCeil(k, tileCols) * tileCols;
+    //
+    // llvm::divideCeil takes and returns uint64_t; n/k/tileRows/tileCols
+    // are shape dimensions and therefore never negative (MLIR shapes are
+    // non-negative by construction), so the explicit cast back to int64_t
+    // here is exactly the widen-then-narrow round trip that is always
+    // value-preserving for this input, not a silent truncation risk --
+    // spelled out rather than left implicit, which is what
+    // bugprone-narrowing-conversions is flagging.
+    const int64_t paddedN =
+        static_cast<int64_t>(llvm::divideCeil(n, tileRows) * tileRows);
+    const int64_t paddedK =
+        static_cast<int64_t>(llvm::divideCeil(k, tileCols) * tileCols);
     const bool needsPadding = paddedN != n || paddedK != k;
 
     OpBuilder builder(op);
