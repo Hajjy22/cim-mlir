@@ -14,7 +14,9 @@
 
 #include "cimrt.h"
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -68,6 +70,59 @@ std::vector<int32_t> referenceMvm(const std::vector<int8_t> &w,
     for (int c = 0; c < cols; ++c)
       acc += static_cast<int64_t>(w[r * cols + c]) * act[c];
     out[r] = static_cast<int32_t>(static_cast<uint32_t>(acc));
+  }
+  return out;
+}
+
+/// Independent reference for cimrt_requantize's arithmetic -- the same
+/// formula documented in cimrt.h and implemented in simulator.cpp,
+/// computed here a second, independent way (not by calling into the
+/// implementation under test) so a bug shared between the two would not be
+/// invisible to this test: round-half-away-from-zero, then clamp to the
+/// signed range effective_bits can hold.
+int64_t expectedRequantize(int64_t value, float scale, int32_t zeroPoint,
+                            uint32_t effectiveBits) {
+  const double scaled =
+      static_cast<double>(value) / static_cast<double>(scale);
+  int64_t quantized =
+      static_cast<int64_t>(zeroPoint) + static_cast<int64_t>(std::llround(scaled));
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
+  if (quantized < clampMin)
+    quantized = clampMin;
+  if (quantized > clampMax)
+    quantized = clampMax;
+  return quantized;
+}
+
+/// Packs `values` as `bytes`-wide little-endian signed integers (matching
+/// this platform's native layout, the same assumption every raw-byte path
+/// in this project already makes) for cimrt_write.
+std::vector<uint8_t> packSigned(const std::vector<int64_t> &values,
+                                 uint32_t bytes) {
+  std::vector<uint8_t> out(values.size() * bytes);
+  for (size_t i = 0; i < values.size(); ++i) {
+    uint64_t bits = static_cast<uint64_t>(values[i]);
+    std::memcpy(out.data() + i * bytes, &bits, bytes);
+  }
+  return out;
+}
+
+/// Inverse of packSigned, sign-extending each `bytes`-wide element back to
+/// int64_t -- for reading a cimrt_requantize result back out regardless of
+/// its container width.
+std::vector<int64_t> unpackSigned(const std::vector<uint8_t> &raw,
+                                   uint32_t bytes) {
+  std::vector<int64_t> out(raw.size() / bytes);
+  for (size_t i = 0; i < out.size(); ++i) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, raw.data() + i * bytes, bytes);
+    const uint32_t width = bytes * 8;
+    if (width < 64) {
+      const uint64_t signBit = static_cast<uint64_t>(1) << (width - 1);
+      bits = (bits ^ signBit) - signBit;
+    }
+    out[i] = static_cast<int64_t>(bits);
   }
   return out;
 }
@@ -195,6 +250,161 @@ CIM_TEST(cimrt_copy_requires_matching_sizes) {
   CIM_EXPECT(in == out);
 
   CIM_EXPECT_EQ(cimrt_copy(small.buf, a.buf), CIMRT_ERR_SHAPE_MISMATCH);
+}
+
+//===----------------------------------------------------------------------===//
+// requantize: cim-lower-to-target's real device-side readout/clamp
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(cimrt_requantize_matches_hand_computed_values) {
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+
+  // Same width in and out (i32 -> i32, cim-legalize-precision's
+  // width-preserving fallback shape): values chosen to exercise the clamp
+  // in both directions and to leave one value untouched.
+  const std::vector<int64_t> values = {1000, -1000, 0, 50};
+  Buffer in, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &in.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packed = packSigned(values, 4);
+  CIM_EXPECT_EQ(cimrt_write(in.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, values.size(),
+                                 /*in_bits=*/32, /*out_bits=*/32,
+                                 /*scale=*/1.0f, /*zero_point=*/0,
+                                 /*effective_bits=*/8),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(values.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  for (size_t i = 0; i < values.size(); ++i)
+    CIM_EXPECT_EQ(got[i], expectedRequantize(values[i], 1.0f, 0, 8));
+}
+
+CIM_TEST(cimrt_requantize_narrows_the_output_container) {
+  // i32 in, i8 out -- the shape cim-legalize-precision's normal
+  // tile-native-precision narrowing produces.
+  Device dev;
+  Buffer in, out;
+  const std::vector<int64_t> values = {127, -128, 5, -5};
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &in.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size(), CIMRT_SPACE_NEAR, &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packed = packSigned(values, 4);
+  CIM_EXPECT_EQ(cimrt_write(in.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, values.size(),
+                                 /*in_bits=*/32, /*out_bits=*/8,
+                                 /*scale=*/1.0f, /*zero_point=*/0,
+                                 /*effective_bits=*/8),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(values.size(), 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 1);
+  for (size_t i = 0; i < values.size(); ++i)
+    CIM_EXPECT_EQ(got[i], expectedRequantize(values[i], 1.0f, 0, 8));
+}
+
+CIM_TEST(cimrt_requantize_widens_the_output_container) {
+  // i8 in, i32 out, effective_bits narrower than the container -- the
+  // clamp must key on effective_bits, not on out_bits.
+  Device dev;
+  Buffer in, out;
+  const std::vector<int64_t> values = {40, -40, 10, -10};
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size(), CIMRT_SPACE_NEAR, &in.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packed = packSigned(values, 1);
+  CIM_EXPECT_EQ(cimrt_write(in.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, values.size(),
+                                 /*in_bits=*/8, /*out_bits=*/32,
+                                 /*scale=*/1.0f, /*zero_point=*/0,
+                                 /*effective_bits=*/6),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(values.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  for (size_t i = 0; i < values.size(); ++i)
+    // effective_bits=6 clamps to [-32, 31]: 40->31, -40->-32, 10 and -10
+    // are untouched.
+    CIM_EXPECT_EQ(got[i], expectedRequantize(values[i], 1.0f, 0, 6));
+}
+
+CIM_TEST(cimrt_requantize_rounds_half_away_from_zero_with_scale_and_zero_point) {
+  Device dev;
+  Buffer in, out;
+  const std::vector<int64_t> values = {5, -5, 7, -7}; // /2.0 -> .5 ties
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &in.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size() * 4, CIMRT_SPACE_NEAR,
+                            &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packed = packSigned(values, 4);
+  CIM_EXPECT_EQ(cimrt_write(in.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, values.size(),
+                                 /*in_bits=*/32, /*out_bits=*/32,
+                                 /*scale=*/2.0f, /*zero_point=*/3,
+                                 /*effective_bits=*/8),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(values.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  for (size_t i = 0; i < values.size(); ++i)
+    CIM_EXPECT_EQ(got[i], expectedRequantize(values[i], 2.0f, 3, 8));
+  // Pin the actual numbers too, not just agreement with the reference --
+  // 5/2=2.5 rounds away from zero to 3, -5/2=-2.5 rounds to -3, both then
+  // offset by zero_point=3.
+  CIM_EXPECT_EQ(got[0], 6);  // round(2.5)=3, +3
+  CIM_EXPECT_EQ(got[1], 0);  // round(-2.5)=-3, +3
+}
+
+CIM_TEST(cimrt_requantize_rejects_invalid_arguments) {
+  Device dev;
+  Buffer in, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &in.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &out.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_requantize(nullptr, in.buf, out.buf, 2, 32, 32, 1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, nullptr, out.buf, 2, 32, 32, 1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, nullptr, 2, 32, 32, 1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  // Not a whole-byte width.
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 5, 32, 1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 32, 0, 1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  // effective_bits must be positive and not exceed out_bits.
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 32, 32, 1.0f, 0, 0),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 32, 8, 1.0f, 0, 16),
+                CIMRT_ERR_INVALID_ARG);
+  // scale must be positive.
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 32, 32, 0.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 2, 32, 32, -1.0f, 0, 8),
+                CIMRT_ERR_INVALID_ARG);
+  // Buffer sizes must match count * bits/8 on each side: `in`/`out` are
+  // both 8 bytes, so count=2 at 32 bits (8 bytes) fits but count=4 does not.
+  CIM_EXPECT_EQ(cimrt_requantize(dev.dev, in.buf, out.buf, 4, 32, 32, 1.0f, 0, 8),
+                CIMRT_ERR_SHAPE_MISMATCH);
 }
 
 //===----------------------------------------------------------------------===//

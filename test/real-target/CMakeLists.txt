@@ -5,8 +5,10 @@
 # documented in lib/Transforms/CIMLowerToTarget.cpp's file header, now
 # reproducible with one build instead of by hand.
 #
-# Two variants of the same MLIR source (see check.mlir.in), differing only
-# in the constant a cf.assert checks a real mvm result against:
+# Two variant PAIRS, each built from its own MLIR template (check.mlir.in
+# for cim.mvm, check-requantize.mlir.in for cim.requantize -- see that
+# file's own header), differing only in the constant a cf.assert checks a
+# real result against:
 #   correct -- the true value; the binary must exit 0.
 #   wrong   -- a deliberately false value; cf.assert must fire, so the
 #              binary must genuinely crash (SIGABRT), not exit cleanly.
@@ -37,19 +39,20 @@ endif()
 set(CIM_REAL_TARGET_YAML "${PROJECT_SOURCE_DIR}/test/targets/tiny-4x4.yaml")
 
 # Runs the whole cim-opt -> mlir-opt -> mlir-translate -> clang chain for
-# one variant (NAME is "correct" or "wrong"), producing an object file at
-# ${CIM_REAL_TARGET_OBJ_<NAME>} that add_real_target_binary links below.
-# One function, not copy-pasted per variant, so the two variants cannot
-# silently drift apart in how they are built -- only in EXPECTED_VALUE,
-# which is the whole point of having two.
-function(add_real_target_object NAME EXPECTED_VALUE)
+# one variant (NAME, e.g. "correct" or "requantize-wrong"), configured from
+# TEMPLATE, producing an object file at ${CIM_REAL_TARGET_OBJ_<NAME>} that
+# the executable loop below links. One function, not copy-pasted per
+# variant, so variants sharing a template cannot silently drift apart in
+# how they are built -- only in EXPECTED_VALUE, which is the whole point
+# of having two per template.
+function(add_real_target_object NAME TEMPLATE EXPECTED_VALUE)
   set(configured_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.mlir")
   set(lowered_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.lowered.mlir")
   set(llvm_dialect_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.llvmdialect.mlir")
   set(ll_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.ll")
   set(obj "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.o")
 
-  configure_file(check.mlir.in ${configured_src} @ONLY)
+  configure_file(${TEMPLATE} ${configured_src} @ONLY)
 
   add_custom_command(
     OUTPUT ${lowered_src}
@@ -85,10 +88,17 @@ function(add_real_target_object NAME EXPECTED_VALUE)
   set(CIM_REAL_TARGET_OBJ_${NAME} ${obj} PARENT_SCOPE)
 endfunction()
 
-add_real_target_object(correct 7)
-add_real_target_object(wrong 999)
+# cim.mvm: identity weight, out[0] == act[0] == 7 by construction.
+add_real_target_object(correct check.mlir.in 7)
+add_real_target_object(wrong check.mlir.in 999)
+# cim.requantize: a raw dot product (40000) far outside an 8-bit signed
+# clamp, so reaching the expected value needs a real, working
+# cimrt_requantize call, not just a value passed through unchanged -- see
+# check-requantize.mlir.in's own header.
+add_real_target_object(requantize-correct check-requantize.mlir.in 127)
+add_real_target_object(requantize-wrong check-requantize.mlir.in 999)
 
-foreach(variant correct wrong)
+foreach(variant correct wrong requantize-correct requantize-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
     ${CIM_REAL_TARGET_OBJ_${variant}})
@@ -102,15 +112,20 @@ endforeach()
 
 add_test(NAME real-target-e2e-correct-value-passes
          COMMAND real-target-e2e-correct)
+add_test(NAME real-target-e2e-requantize-correct-value-passes
+         COMMAND real-target-e2e-requantize-correct)
 
-# The whole point of this variant: cf.assert firing inside the compiled
-# binary is a real SIGABRT, not just a nonzero exit -- and CTest's WILL_FAIL
-# property explicitly does NOT invert a signal-terminated ("system-level")
-# failure (`cmake --help-property WILL_FAIL`), so it cannot express "this
-# test passes when the binary crashes". `sh -c '! ...'` inverts the shell's
-# own exit status instead: a crash (nonzero/signal) makes `!`'s result 0,
-# a genuine PASS from ctest's point of view, and if the binary ever exits 0
-# (meaning the wrong-value check silently stopped checking anything) `!`
-# makes the wrapper fail, a genuine, ordinary CTest FAILED.
+# The whole point of these two variants: cf.assert firing inside the
+# compiled binary is a real SIGABRT, not just a nonzero exit -- and CTest's
+# WILL_FAIL property explicitly does NOT invert a signal-terminated
+# ("system-level") failure (`cmake --help-property WILL_FAIL`), so it
+# cannot express "this test passes when the binary crashes". `sh -c
+# '! ...'` inverts the shell's own exit status instead: a crash
+# (nonzero/signal) makes `!`'s result 0, a genuine PASS from ctest's point
+# of view, and if the binary ever exits 0 (meaning the wrong-value check
+# silently stopped checking anything) `!` makes the wrapper fail, a
+# genuine, ordinary CTest FAILED.
 add_test(NAME real-target-e2e-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-wrong>")
+add_test(NAME real-target-e2e-requantize-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-requantize-wrong>")

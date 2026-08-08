@@ -35,23 +35,29 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** All eight lowering passes are real, though the last one
-(`cim-lower-to-target`) covers a deliberately scoped slice — see below. Two real
-composition breaks between them have been closed: `cim-legalize-precision` now retypes
-the downstream `cim.copy`/`memref.copy` chain where it owns the type, and falls back to
-a width-preserving requantize (the value is still genuinely clamped) where it doesn't —
-see `lib/Transforms/CIMLegalizePrecision.cpp`'s file header. `cim-lower-to-target` now
+**Partly implemented, and it composes end to end.** All eight lowering passes are real,
+though the last one (`cim-lower-to-target`) covers a deliberately scoped slice — see
+below. Three real composition breaks between them have been closed: `cim-legalize-precision`
+retypes the downstream `cim.copy`/`memref.copy` chain where it owns the type, and falls
+back to a width-preserving requantize (the value is still genuinely clamped) where it
+doesn't — see `lib/Transforms/CIMLegalizePrecision.cpp`'s file header. `cim-lower-to-target`
 folds an identity `memref.subview` of a device-space value through to its source handle,
 exactly the shape `cim-partition` emits slicing a staged activation for a single K-tile,
-and still refuses a genuine (non-identity) slice rather than mislowering it. One boundary
-remains and is **not** a composition bug: `cim-legalize-precision` always inserts a real
-`cim.requantize`, and `cim-lower-to-target` refuses `cim.requantize` outright as a matter
-of its documented v0.1 scope (real requantize lowering is M4). So those two passes cannot
-both sit in a chain that also reaches `cim-lower-to-target` until that lands —
-`test/Transforms/cim-pipeline-full.mlir` and `test/mlir/pipeline_e2e_test.cpp`'s
-`e2e_full_pipeline_through_precision_legalization_composes` exercise the two chains that
-actually do compose today: passes 1–6 plus `cim-cost-report`, and passes 1–5 plus
-`cim-cost-report` and `cim-lower-to-target` (skipping precision legalization).
+and still refuses a genuine (non-identity) slice rather than mislowering it. And
+`cim-lower-to-target` now lowers `cim.requantize` itself, against a new `cimrt_requantize`
+ABI call that does the round-half-away-from-zero and signed-clamp arithmetic device-side —
+so `cim-legalize-precision` (which always inserts a real `cim.requantize`) and
+`cim-lower-to-target` (which used to refuse it outright) can finally sit in the same
+chain. `test/Transforms/cim-pipeline-full.mlir` proves it three ways: the two narrower
+chains as their own regression coverage (passes 1–6 plus `cim-cost-report`; passes 1–5
+plus `cim-cost-report` and `cim-lower-to-target`, skipping precision legalization), and a
+third chaining literally all eight passes, spec order, on one module, down to real
+`cimrt_mvm`/`cimrt_requantize` calls with no `cim` ops left.
+`test/mlir/pipeline_e2e_test.cpp`'s `e2e_full_pipeline_through_precision_legalization_composes`
+checks the same composed chain numerically through the interpreter, and
+`test/real-target/`'s `requantize-correct`/`requantize-wrong` pair checks it one level
+further down: a real compiled binary whose `cimrt_requantize` call clamps a genuine
+out-of-range value and genuinely traps when the expected result is wrong.
 `cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
@@ -119,11 +125,14 @@ through that readout path, rather than silently degrading. The interpreter execu
 both a fractional scale/nonzero zero_point and the clamp itself in both directions
 (`test/mlir/legalize_precision_e2e_test.cpp`), since unlike `cim.barrier` this op genuinely
 changes values and there is no "does not change the answer" invariant to fall back on.
-Not yet wired into the live pipeline: `cim-partition` emits its own `cim.copy` back to a
+Composes with `cim-partition`'s output: `cim-partition` emits its own `cim.copy` back to a
 host buffer typed to match the original i32 accumulator, with no knowledge that this pass
-might requantize that value down to i8 first, so it is tested on hand-written IR shaped the
-way `cim-partition`'s output locally is (`test/Transforms/cim-legalize-precision.mlir`) —
-the same kind of documented v0.1 integration gap `cim-insert-transfers` has too.
+might requantize that value down to i8 first, so this pass retypes that downstream chain
+where it owns every value in it, and falls back to a width-preserving (still genuinely
+clamped) requantize where it doesn't — see `lib/Transforms/CIMLegalizePrecision.cpp`'s
+file header, and `test/Transforms/cim-legalize-precision.mlir`'s
+`narrows_through_a_locally_owned_copy_chain`/`falls_back_when_the_sink_is_not_owned` cases
+for both directions.
 
 `cim-insert-transfers` (Pass 5) inserts a `cim.copy` wherever a `cim.mvm`'s activation
 operand is not already `#cim.space<near>` (spec Sec. 3.4) and rewires the `mvm` to read the
@@ -132,9 +141,10 @@ loop-invariant with respect to it — inserted once before the loop rather than 
 iteration, and shared by every `mvm` inside that loop reading the exact same invariant
 source rather than duplicated per site. On today's real pipeline this pass has nothing to
 do: `cim-partition` already stages every activation into near space itself before this pass
-would ever see it, so — like `cim-legalize-precision` above — it is tested on hand-written
-IR that manufactures the space mismatch `cim-partition`'s current output never produces
-(`test/Transforms/cim-insert-transfers.mlir`). `cim.copy` is a faithful byte-for-byte move,
+would ever see it — genuinely nothing left to fix here, unlike `cim-legalize-precision`'s
+own gap above — so it is tested on hand-written IR that manufactures the space mismatch
+`cim-partition`'s current output never produces (`test/Transforms/cim-insert-transfers.mlir`).
+`cim.copy` is a faithful byte-for-byte move,
 not a value-changing operation, so the numerical side of verification is an invariance
 check like `cim-schedule`'s: `test/mlir/insert_transfers_e2e_test.cpp` confirms running a
 module with and without the pass computes identical numbers, while
@@ -145,25 +155,30 @@ redundant copies inside the loop, which the numerical suite alone would silently
 `cim-lower-to-target` (Pass 7) is the pass that turns compiled IR into something that can
 actually run on (real or simulated) hardware rather than only inside this project's own
 interpreter: it converts `cim.device_open`/`cim.tile_alloc`/`cim.program`/`cim.mvm`/
-`cim.copy`/`cim.barrier` into `func.call`s against `cimrt.h`'s real C ABI, with every
-`cimrt_status` checked via `cf.assert` rather than ignored, so the result can go through
-MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and come out
-as a real binary. v0.1's scope is deliberately straight-line, single-tile code: `cim.
-reduce_partial`, `cim.requantize`, and any `cim` op nested inside a loop are refused with a
-diagnostic rather than mislowered, matching the same "refuse rather than guess" discipline
-as `cim-partition`'s own scope limits below. Verified two ways: `test/Transforms/
-cim-lower-to-target.mlir`'s structural FileCheck suite covers every op, every `cim.copy`
-space combination, and every refusal; beyond that, this pass's output for a representative
-case was taken all the way through the real conversion pipeline, `mlir-translate`, `clang`,
-and linked against `runtime/libcimrt.a`, then actually **run** as a native binary — it
-computed the correct `cim.mvm` result against the real (simulated) hardware backend, not
-the interpreter — first verified once by hand, now reproducible on demand as
-`test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs
-`mlir-opt`/`mlir-translate`/`clang` and a linker the main suite has no business depending
-on to configure): two binaries built from the same source differing only in a constant a
-`cf.assert` checks a real `cim.mvm` result against, run via `ctest -R real-target` —
-the correct one must exit 0 and the wrong one must genuinely crash, so a broken assertion
-that "always passes" would be caught, not just a broken one that never fires.
+`cim.copy`/`cim.barrier`/`cim.requantize` into `func.call`s against `cimrt.h`'s real C ABI
+(`cim.requantize` against a new `cimrt_requantize` entry point that does the
+round-half-away-from-zero and signed-clamp arithmetic device-side, not a second copy of
+that arithmetic in generated IR), with every `cimrt_status` checked via `cf.assert` rather
+than ignored, so the result can go through MLIR's standard `--convert-to-llvm` pipeline,
+`mlir-translate`, and a linker, and come out as a real binary. v0.1's scope is deliberately
+straight-line, single-tile code: `cim.reduce_partial` and any `cim` op nested inside a loop
+are refused with a diagnostic rather than mislowered, matching the same "refuse rather than
+guess" discipline as `cim-partition`'s own scope limits below. Verified three ways:
+`test/Transforms/cim-lower-to-target.mlir`'s structural FileCheck suite covers every op,
+every `cim.copy` space combination, and every refusal; `test/mlir/pipeline_e2e_test.cpp`
+checks the composed chain's requantize clamp numerically through the interpreter; and
+beyond that, both a `cim.mvm` and a `cim.requantize` case were taken all the way through
+the real conversion pipeline, `mlir-translate`, `clang`, and linked against
+`runtime/libcimrt.a`, then actually **run** as native binaries — computing the correct
+result against the real (simulated) hardware backend, not the interpreter, with the
+`cim.requantize` case specifically clamping a genuine out-of-range value (an 8-bit signed
+clamp can only hold `[-128, 127]`). Reproducible on demand as `test/real-target/` (`cmake
+-DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs `mlir-opt`/`mlir-translate`/
+`clang` and a linker the main suite has no business depending on to configure): four
+binaries built from two sources (mvm, requantize) each differing only in a constant a
+`cf.assert` checks a real result against, run via `ctest -R real-target` — the correct ones
+must exit 0 and the wrong ones must genuinely crash, so a broken assertion that "always
+passes" would be caught, not just a broken one that never fires.
 
 `cim-partition`'s own scope limits (matrix-vector, output-major weights,
 exact tile multiples) are each refused with a warning rather than silently mislowered — see

@@ -20,10 +20,28 @@
 //    buffer this pass allocates for one iteration would either leak on
 //    every subsequent iteration or need a hoisting analysis of its own;
 //    neither is designed yet.
-// 2. cim.reduce_partial and cim.requantize are refused outright, not
-//    mislowered. Multi-tile K-reduction and requantization both need their
-//    own buffer-lifetime story this pass does not have; see the M4 roadmap
-//    entry for where that work is tracked.
+// 2. cim.reduce_partial is refused outright, not mislowered: multi-tile
+//    K-reduction needs its own buffer-lifetime story this pass does not
+//    have (multiple partial-sum buffers alive at once, reduced into one).
+//    See the M4 roadmap entry for where that work is tracked.
+//
+//    cim.requantize IS lowered (lowerRequantize, below), against a new
+//    cimrt_requantize ABI call that does the round-half-away-from-zero and
+//    signed-clamp arithmetic device-side -- this pass has never computed a
+//    value itself anywhere else (it stages memory and dispatches calls;
+//    cimrt does the real work), and reproducing that arithmetic a second
+//    time in generated IR would risk it silently drifting from
+//    Interpreter.cpp's own copy. cim-legalize-precision makes a
+//    requantize's input its terminal accumulator's SOLE consumer, so
+//    there is no multi-buffer lifetime puzzle here the way there is for
+//    reduce_partial -- one producer, one consumer, exactly like an mvm's
+//    staged activation. The one wrinkle: cimrt_requantize needs the
+//    input's element width independently of the (always-safe, own) result
+//    type, and a device-space input operand that was already lowered by an
+//    earlier op in this same pass is just a bare !llvm.ptr with no width
+//    of its own -- see deviceValueElemBits below, the second (and only
+//    other) piece of real bookkeeping this pass keeps, for exactly the
+//    same reason tileDevices exists.
 // 3. Memory model: a #cim.space<near|insitu> memref is NOT a real memref
 //    after this pass runs -- cimrt's buffers are opaque handles (you
 //    cannot get a raw pointer into device memory the way memref-to-llvm
@@ -46,10 +64,13 @@
 //    its own file header). Only a genuinely host-side operand gets staged
 //    into a fresh scratch buffer, written, and freed once its one
 //    consuming call returns, exactly like the interpreter's own
-//    runProgram/runMvm. The one thing operand-type inspection cannot
-//    recover is which DEVICE a bare i32 tile id belongs to (an integer
-//    carries no such link), so that is the one piece of real bookkeeping
-//    this pass still keeps: tileDevices, below.
+//    runProgram/runMvm. Operand-type inspection cannot recover two
+//    things: which DEVICE a bare i32 tile id belongs to (an integer
+//    carries no such link -- tileDevices, below), and what element WIDTH
+//    an already-lowered !llvm.ptr device value used to have (a pointer
+//    carries no width -- deviceValueElemBits, below, needed only by
+//    lowerRequantize). Those two maps are the only real bookkeeping this
+//    pass keeps.
 // 4. Freeing: this pass frees only the SCRATCH buffers it allocates
 //    itself purely to stage one call (weight/activation staging in
 //    lowerProgram/lowerMvm). A device-space value that OUTLIVES its
@@ -184,6 +205,7 @@ public:
     i32Ty = IntegerType::get(ctx, 32);
     i64Ty = IntegerType::get(ctx, 64);
     i1Ty = IntegerType::get(ctx, 1);
+    f32Ty = Float32Type::get(ctx);
   }
 
   LogicalResult run(func::FuncOp func) {
@@ -232,13 +254,24 @@ private:
   const ::cim::TargetSpec &spec;
   unsigned &stringGlobalCounter;
 
-  Type ptrTy, i32Ty, i64Ty, i1Ty;
+  Type ptrTy, i32Ty, i64Ty, i1Ty, f32Ty;
 
   /// The i32 tile-id constant this pass materialized for a cim.tile_alloc
   /// (and reused verbatim for the cim.program that programs it) -> the
   /// !llvm.ptr device it was allocated on. The one piece of bookkeeping an
   /// operand's own type cannot recover -- see file header point 3.
   llvm::DenseMap<Value, Value> tileDevices;
+  /// A device-space !llvm.ptr this pass handed back as the replacement for
+  /// some memref-typed value -> that memref's own element bit width.
+  /// Needed only by lowerRequantize, which -- unlike every other lowering
+  /// here -- needs an INPUT operand's element width even when that operand
+  /// is already ptrTy (an earlier mvm/copy this same pass lowered staged
+  /// it): a bare pointer carries no width of its own, the same kind of gap
+  /// tileDevices exists to close for tile ids. Populated everywhere a
+  /// device-space handle is created and kept alive as a value's
+  /// replacement (lowerMvm, lowerCopy, lowerRequantize's own device-space
+  /// branch) -- see file header point 3.
+  llvm::DenseMap<Value, unsigned> deviceValueElemBits;
   /// Every device this pass has opened in this function, in program order.
   /// cim.copy carries no device operand of its own in the dialect (its ODS
   /// arguments are just `$source`), so a call that needs one to route
@@ -382,7 +415,7 @@ private:
   /// guess here.
   LogicalResult checkAllowedConsumers(Value deviceValue) {
     for (Operation *user : deviceValue.getUsers()) {
-      if (isa<ProgramOp, MvmOp, CopyOp, memref::DeallocOp>(user))
+      if (isa<ProgramOp, MvmOp, CopyOp, RequantizeOp, memref::DeallocOp>(user))
         continue;
       if (auto view = dyn_cast<memref::SubViewOp>(user)) {
         if (isIdentitySubview(view))
@@ -398,9 +431,9 @@ private:
       return user->emitError(
           "cim-lower-to-target: this op consumes a #cim.space<near|insitu> "
           "value with no lowering defined for that use in this v0.1 slice "
-          "(only cim.program, cim.mvm, cim.copy, memref.dealloc and an "
-          "identity memref.subview consuming a device-space value are "
-          "supported)");
+          "(only cim.program, cim.mvm, cim.copy, cim.requantize, "
+          "memref.dealloc and an identity memref.subview consuming a "
+          "device-space value are supported)");
     }
     return success();
   }
@@ -429,9 +462,7 @@ private:
           "cim-lower-to-target: cim.reduce_partial is not lowered yet -- "
           "v0.1 scope is single-tile only (see this file's header comment)");
     if (auto o = dyn_cast<RequantizeOp>(op))
-      return o.emitError(
-          "cim-lower-to-target: cim.requantize is not lowered yet (see "
-          "this file's header comment)");
+      return lowerRequantize(o);
     if (auto o = dyn_cast<memref::DeallocOp>(op))
       return lowerDealloc(o);
     if (auto o = dyn_cast<memref::SubViewOp>(op))
@@ -653,9 +684,132 @@ private:
       if (failed(checkAllowedConsumers(original)))
         return failure();
       original.replaceAllUsesWith(outBuf);
+      deviceValueElemBits[outBuf] = resultType.getElementTypeBitWidth();
     } else {
       // A host-declared result: this pass must leave real, readable bytes
       // behind for whatever consumes it (a print, a dealloc, ...).
+      auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
+      Value realPtr = hostPointer(b, loc, realAlloc.getResult());
+      readBuffer(b, loc, outBuf, realPtr, *resultBytes);
+      freeBuffer(b, loc, outBuf);
+      original.replaceAllUsesWith(realAlloc.getResult());
+    }
+    op.erase();
+    return success();
+  }
+
+  /// Lowers cim.requantize against the new cimrt_requantize ABI call (see
+  /// this file's header point 2 and runtime/include/cimrt.h). Mirrors
+  /// lowerMvm's shape closely: stage the input, allocate an output buffer,
+  /// call, check the status, branch on the result's declared space.
+  LogicalResult lowerRequantize(RequantizeOp op) {
+    // Raw operand access, not op.getInput() -- see lowerTileAlloc's
+    // comment; the input is exactly the operand most likely to already be
+    // ptrTy on real pipeline output (the mvm/reduce_partial this pass
+    // already lowered feeding it).
+    Value inputOperand = op->getOperand(0);
+    auto resultType = dyn_cast<MemRefType>(op.getResult().getType());
+    if (!resultType)
+      return op.emitError(
+          "cim-lower-to-target: cim.requantize's result must be a ranked "
+          "memref");
+    FailureOr<int64_t> resultBytes = byteSizeOf(resultType);
+    if (failed(resultBytes))
+      return op.emitError(
+          "cim-lower-to-target: cim.requantize's result must have a "
+          "static shape and a whole-byte element type");
+    const int64_t count = resultType.getNumElements();
+    const unsigned outBits = resultType.getElementTypeBitWidth();
+
+    // The input's element width, independently of the result's: self-
+    // describing when the operand is still a real memref, recovered from
+    // deviceValueElemBits (file header point 3) when it is already ptrTy.
+    unsigned inBits;
+    if (inputOperand.getType() == ptrTy) {
+      auto it = deviceValueElemBits.find(inputOperand);
+      if (it == deviceValueElemBits.end())
+        return op.emitError(
+            "cim-lower-to-target: internal error: could not recover "
+            "cim.requantize's input element width");
+      inBits = it->second;
+    } else {
+      auto inputType = cast<MemRefType>(inputOperand.getType());
+      if (failed(byteSizeOf(inputType)))
+        return op.emitError(
+            "cim-lower-to-target: cim.requantize's input must have a "
+            "static shape and a whole-byte element type");
+      inBits = inputType.getElementTypeBitWidth();
+    }
+
+    // cim.requantize carries no device operand of its own in the dialect,
+    // same as cim.copy -- "any device opened so far", see lowerCopy's
+    // comment.
+    if (openDevices.empty())
+      return op.emitError(
+          "cim-lower-to-target: cim.requantize needs a device to stage "
+          "through, but no cim.device_open has been lowered yet in this "
+          "function");
+    Value dev = openDevices.front();
+
+    // Every real cim-legalize-precision output keeps the input's own
+    // memory space on the result -- both its narrowing and width-
+    // preserving shapes do (see CIMLegalizePrecision.cpp's file header) --
+    // so the buffers this call stages through live in whichever space the
+    // RESULT declares; a host-declared result stages/reads back exactly
+    // like cim.mvm's does.
+    auto resultSpace = dyn_cast_or_null<SpaceAttr>(resultType.getMemorySpace());
+    const bool resultIsDevice = resultSpace && resultSpace.getKind() != SpaceKind::host;
+    const CimrtSpace stageSpace =
+        resultIsDevice
+            ? (resultSpace.getKind() == SpaceKind::insitu ? CimrtSpace::kInsitu
+                                                            : CimrtSpace::kNear)
+            : CimrtSpace::kNear;
+
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    bool inputScratch = false;
+    Value inputBuf =
+        stageForRead(b, loc, dev, inputOperand, stageSpace, inputScratch);
+    Value outBuf = allocBuffer(b, loc, dev, *resultBytes, stageSpace);
+
+    Value countVal = constI64(b, loc, count);
+    Value inBitsVal = constI32(b, loc, static_cast<int32_t>(inBits));
+    Value outBitsVal = constI32(b, loc, static_cast<int32_t>(outBits));
+    Value scaleVal =
+        b.create<arith::ConstantOp>(loc, b.getFloatAttr(f32Ty, op.getScale()));
+    // Signed reinterpretation, same as RequantizeOp::verify()'s own read of
+    // effective_bits: the ODS accessor for an I32Attr is unsigned, so a
+    // negative zero_point in the IR would otherwise read as a very large
+    // positive one.
+    Value zeroPointVal =
+        constI32(b, loc, static_cast<int32_t>(op.getZeroPoint()));
+    Value effectiveBitsVal =
+        constI32(b, loc, static_cast<int32_t>(op.getEffectiveBits()));
+
+    auto fn = getOrInsertFunc(
+        "cimrt_requantize",
+        b.getFunctionType(
+            {ptrTy, ptrTy, ptrTy, i64Ty, i32Ty, i32Ty, f32Ty, i32Ty, i32Ty},
+            {i32Ty}));
+    Value status =
+        b.create<func::CallOp>(
+             loc, fn,
+             ValueRange{dev, inputBuf, outBuf, countVal, inBitsVal, outBitsVal,
+                        scaleVal, zeroPointVal, effectiveBitsVal})
+            .getResult(0);
+    checkOk(b, loc, status, "cimrt_requantize failed");
+    if (inputScratch)
+      freeBuffer(b, loc, inputBuf);
+
+    Value original = op.getResult();
+    if (resultIsDevice) {
+      // Check BEFORE rewriting so an unsupported consumer is reported
+      // clearly rather than left as ill-typed IR (file header point 3).
+      if (failed(checkAllowedConsumers(original)))
+        return failure();
+      original.replaceAllUsesWith(outBuf);
+      deviceValueElemBits[outBuf] = outBits;
+    } else {
       auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
       Value realPtr = hostPointer(b, loc, realAlloc.getResult());
       readBuffer(b, loc, outBuf, realPtr, *resultBytes);
@@ -730,6 +884,7 @@ private:
       if (failed(checkAllowedConsumers(original)))
         return failure();
       original.replaceAllUsesWith(buf);
+      deviceValueElemBits[buf] = destType.getElementTypeBitWidth();
       op.erase();
       return success();
     }
@@ -756,6 +911,7 @@ private:
     if (failed(checkAllowedConsumers(original)))
       return failure();
     original.replaceAllUsesWith(dstBuf);
+    deviceValueElemBits[dstBuf] = destType.getElementTypeBitWidth();
     op.erase();
     return success();
   }

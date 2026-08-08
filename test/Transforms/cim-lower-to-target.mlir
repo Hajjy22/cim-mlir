@@ -255,14 +255,74 @@ func.func @reduce_partial_is_refused(%p0: memref<4xi32>, %p1: memref<4xi32>) {
 
 // -----
 
-// cim.requantize is refused outright, same reasoning.
-func.func @requantize_is_refused(%in: memref<4xi32>) {
-  // expected-error @+1 {{cim.requantize is not lowered yet}}
+// cim.requantize, host in and out: staged into a scratch near-space buffer
+// (freed once its one use is done, same as cim.mvm's activation staging),
+// requantized via cimrt_requantize, then read back into a real host
+// memref for whatever consumes it -- the exact cim.mvm host-result shape,
+// see @dealloc_on_device_space_result_becomes_cimrt_free's host case above
+// for the same pattern.
+// CHECK-LABEL: func.func @requantize_host_narrows
+func.func @requantize_host_narrows(%in: memref<4xi32>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
   %q = cim.requantize %in {scale = 1.0 : f32, zero_point = 0 : i32, effective_bits = 8 : i32}
        : memref<4xi32> -> memref<4xi8>
   memref.dealloc %q : memref<4xi8>
   return
 }
+// CHECK: call @cimrt_open
+// CHECK: call @cimrt_write(%[[INBUF:[0-9]+]],
+// CHECK: cf.assert
+// The exact operand order cimrt_requantize documents in cimrt.h: dev, in,
+// out, count, in_bits, out_bits, scale, zero_point, effective_bits -- only
+// the buffer identities (in, out) are pinned by name here, not the
+// scalar constants, which the unit-level cimrt_requantize tests
+// (test/unit/cimrt_test.cpp) and the numerical e2e test already cover.
+// CHECK: call @cimrt_requantize(%{{.*}}, %[[INBUF]], %[[OUTBUF:[0-9]+]]
+// CHECK: cf.assert
+// The input scratch buffer is freed once its one use is done, exactly
+// like cim.mvm's staged activation.
+// CHECK: call @cimrt_free(%[[INBUF]])
+// CHECK: %[[REALALLOC:.*]] = memref.alloc() : memref<4xi8>
+// CHECK: call @cimrt_read(%[[OUTBUF]]
+// CHECK: cf.assert
+// CHECK: call @cimrt_free(%[[OUTBUF]])
+// CHECK: memref.dealloc %[[REALALLOC]]
+// CHECK-NOT: cim.requantize
+
+// -----
+
+// cim.requantize, device in and out (near -> near, the shape
+// cim-legalize-precision's width-preserving fallback and its narrowing
+// path both produce on real cim-partition output): no read-back, stays an
+// opaque handle. The input is already ptrTy (staged by the preceding
+// cim.copy this pass already lowered) -- deviceValueElemBits is what
+// recovers its element width with no extra staging, so there is only ONE
+// cimrt_alloc for the input (the copy's own), not a second one here.
+// CHECK-LABEL: func.func @requantize_device_narrows_and_stays_a_handle
+func.func @requantize_device_narrows_and_stays_a_handle(%act: memref<4xi32>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %near = cim.copy %act : memref<4xi32> to memref<4xi32, #cim.space<near>>
+  %q = cim.requantize %near {scale = 1.0 : f32, zero_point = 0 : i32, effective_bits = 8 : i32}
+       : memref<4xi32, #cim.space<near>> -> memref<4xi8, #cim.space<near>>
+  memref.dealloc %q : memref<4xi8, #cim.space<near>>
+  return
+}
+// CHECK: call @cimrt_open
+// CHECK: call @cimrt_write(%[[COPYBUF:[0-9]+]],
+// CHECK: cf.assert
+// Reusing the SAME %[[COPYBUF]] as requantize's own input operand (not a
+// freshly allocated one) is the proof that deviceValueElemBits recovered
+// its width with no extra staging -- if a second buffer had been
+// allocated and written instead, this capture would simply fail to match.
+// CHECK: call @cimrt_requantize(%{{.*}}, %[[COPYBUF]], %[[OUTBUF2:[0-9]+]]
+// CHECK: cf.assert
+// The copy's own buffer has no explicit memref.dealloc in the source, so
+// it leaks (file header point 4) -- only the requantize's OWN result,
+// which the source's memref.dealloc explicitly targets, is freed.
+// CHECK-NOT: call @cimrt_free(%[[COPYBUF]])
+// CHECK: call @cimrt_free(%[[OUTBUF2]])
+// CHECK-NOT: cim.requantize
+// CHECK-NOT: cim.copy
 
 // -----
 

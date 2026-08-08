@@ -133,6 +133,31 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
                         const cimrt_buffer *act, cimrt_buffer *out,
                         bool accumulate);
 
+/* Requantize (spec Sec. 5.3): models a digital requantizer or an analog
+ * ADC readout. Reads `count` elements of `in_bits`-wide signed integers
+ * from `input`, computes `quantized = zero_point + round(value / scale)`
+ * (round-half-away-from-zero), clamps to the SIGNED range `effective_bits`
+ * can hold, and writes `count` elements of `out_bits`-wide signed integers
+ * to `output`.
+ *
+ * `in_bits`/`out_bits` are explicit, not inferred, for the same reason
+ * every other call here takes an explicit byte count: cimrt_buffer carries
+ * no dtype of its own. `in_bits` and `out_bits` may differ (narrowing,
+ * e.g. i32->i8, is the common case; widening is also valid) and each must
+ * be a positive multiple of 8 -- this ABI is exactly as byte-addressed as
+ * everywhere else in this project. `effective_bits` must be positive and
+ * not exceed `out_bits`.
+ *
+ * Not yet counted by cimrt_profile_stop: the target schema's `costs:`
+ * section has no requantize/readout entry (spec target-format.md), so this
+ * call currently contributes nothing to programs_issued/mvms_issued/
+ * energy -- a known simplification (spec M4), not a silent omission. */
+cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
+                               cimrt_buffer *output, size_t count,
+                               uint32_t in_bits, uint32_t out_bits,
+                               float scale, int32_t zero_point,
+                               uint32_t effective_bits);
+
 /* --- sync --- */
 cimrt_status cimrt_barrier(cimrt_device *dev);
 

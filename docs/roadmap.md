@@ -68,28 +68,34 @@ compiled IR, if it is ever wanted, is separate work from what landed here.
 
 **Composition hardening.** Individually-real passes are not the same claim
 as a pipeline that composes, and for a while this project made the former
-claim while only the latter was true up to Pass 5. Two real composition
+claim while only the latter was true up to Pass 5. Three real composition
 breaks got fixed (see the Pass 6 and Pass 7 entries above for the actual
 fixes): `cim-legalize-precision` retyping a downstream `cim.copy`/
 `memref.copy` chain where it safely can and falling back to a
 width-preserving requantize where it can't (rather than tripping the
-dialect verifier), and `cim-lower-to-target` folding an identity
+dialect verifier); `cim-lower-to-target` folding an identity
 `memref.subview` of a device-space value through to its source handle
 (rather than refusing the exact shape `cim-partition` emits for a
-single-K-tile activation). A third boundary was found along the way and is
-NOT a composition bug: `cim-legalize-precision` always inserts a real
-`cim.requantize`, and `cim-lower-to-target` refuses `cim.requantize`
-outright as a matter of its documented v0.1 scope (M4). So the two passes
-genuinely cannot both sit in a chain that also reaches
-`cim-lower-to-target` until requantize lowering is implemented --
-`test/Transforms/cim-pipeline-full.mlir` proves the two chains that
-actually do compose today (through `cim-legalize-precision` and
-`cim-cost-report`, or through `cim-cost-report` and `cim-lower-to-target`
-skipping `cim-legalize-precision`) rather than asserting a single 8-pass
-chain that cannot exist yet. `test/mlir/pipeline_e2e_test.cpp`'s
-`e2e_full_pipeline_through_precision_legalization_composes` is the same
-claim checked numerically: the composed chain's requantize clamp is
-checked against an independently computed reference, not just its shape.
+single-K-tile activation); and `cim-lower-to-target` lowering
+`cim.requantize` itself against a new `cimrt_requantize` ABI call, so
+`cim-legalize-precision` (which always inserts a real `cim.requantize`)
+and `cim-lower-to-target` (which used to refuse it outright) can finally
+sit in the same chain. `test/Transforms/cim-pipeline-full.mlir` proves all
+three RUN lines: the two narrower chains kept as their own regression
+coverage (through `cim-legalize-precision` and `cim-cost-report`, and
+through `cim-cost-report` and `cim-lower-to-target` skipping precision
+legalization), and a third (`FULL`) chaining literally all eight passes,
+spec order, on one module, down to real `cimrt_mvm`/`cimrt_requantize`
+calls with no cim ops left. `test/mlir/pipeline_e2e_test.cpp`'s
+`e2e_full_pipeline_through_precision_legalization_composes` checks the
+same composed chain's requantize clamp numerically against an
+independently computed reference, through the interpreter (which stops at
+the point `cim-lower-to-target` would take over); `test/real-target/`'s
+`requantize-correct`/`requantize-wrong` pair is the same claim checked one
+level further down -- a real compiled binary's `cimrt_requantize` call
+clamping a genuine out-of-range value (40000, an 8-bit signed clamp can
+only hold `[-128, 127]`) and genuinely trapping when the expected value is
+wrong.
 
 ## M0 — Environment and orientation
 - [x] Repository scaffold matching this layout.
@@ -264,9 +270,15 @@ checked against an independently computed reference, not just its shape.
   `cim-placement`'s own loop hoisting produces -- is refused with a
   diagnostic, since a buffer this pass allocated would either leak every
   iteration or need a hoisting analysis of its own, neither designed
-  here), and `cim.reduce_partial`/`cim.requantize` are refused outright
-  rather than mislowered (multi-tile K-reduction and requantization both
-  need their own buffer-lifetime story this pass does not have).
+  here), and `cim.reduce_partial` is refused outright rather than
+  mislowered (multi-tile K-reduction needs its own buffer-lifetime story
+  this pass does not have -- multiple partial-sum buffers alive at once,
+  reduced into one). `cim.requantize`, originally refused for the same
+  stated reason, is now lowered (see the composition-hardening entry
+  above): it turned out to have no such buffer-lifetime problem in the
+  straight-line, single-tile slice, since `cim-legalize-precision` makes
+  it a terminal accumulator's SOLE consumer -- one producer, one consumer,
+  exactly like `cim.mvm`'s own staged activation.
 
   Memory model: a `#cim.space<near|insitu>` memref is not a real memref
   after this pass runs -- cimrt's buffers are opaque handles, incompatible
@@ -313,6 +325,41 @@ checked against an independently computed reference, not just its shape.
   `non_identity_subview_is_refused` cover both directions, and
   `test/Transforms/cim-pipeline-full.mlir` exercises the fold against real
   `cim-partition` output.
+
+  `cim.requantize` lowering (originally refused outright, see the v0.1
+  scope paragraph above). Against a new `cimrt_requantize` ABI call
+  (`runtime/include/cimrt.h`, `runtime/src/simulator/simulator.cpp`) that
+  does the round-half-away-from-zero and signed-clamp arithmetic
+  device-side, rather than reproducing that arithmetic a second time in
+  generated IR -- this pass has never computed a value itself anywhere
+  else, it stages memory and dispatches calls, and a second independent
+  copy of that formula would risk silently drifting from
+  `Interpreter.cpp`'s own. `lowerRequantize` mirrors `lowerMvm`'s shape
+  closely (`stageForRead` for the input, `allocBuffer` for the output,
+  call, `checkOk`, branch on the result's declared space). The one new
+  piece of bookkeeping: `cimrt_requantize` needs the input's element width
+  independently of the (always-safe, own) result type, and an
+  already-lowered device-space input operand is a bare `!llvm.ptr` with no
+  width of its own -- `deviceValueElemBits` (a `Value -> unsigned` map,
+  populated everywhere `lowerMvm`/`lowerCopy`/`lowerRequantize` hand back a
+  device-space handle) recovers it, the same kind of gap `tileDevices`
+  already existed to close for tile ids. Verified three ways:
+  `test/Transforms/cim-lower-to-target.mlir`'s
+  `requantize_host_narrows`/`requantize_device_narrows_and_stays_a_handle`
+  structurally; `test/Transforms/cim-pipeline-full.mlir`'s `FULL` RUN line
+  against real, fully-composed `cim-partition` output (see the
+  composition-hardening entry above); and `test/real-target/`'s
+  `requantize-correct`/`requantize-wrong` pair, a real compiled binary
+  whose `cimrt_requantize` call clamps a genuine out-of-range value
+  (40000, an 8-bit signed clamp can only hold `[-128, 127]`) and genuinely
+  traps when the expected result is wrong -- the strongest evidence this
+  project has that the composed chain is a working artifact, not just
+  well-shaped IR. `cimrt_requantize` itself is checked directly in
+  `test/unit/cimrt_test.cpp` against an independently-written reference,
+  covering narrowing, widening, rounding ties, and the clamp firing in
+  both directions; **not yet counted by `cimrt_profile_stop`** -- the
+  target schema's `costs:` section has no requantize/readout entry, a
+  known simplification (spec M4), not a silent omission.
 
   A real bug this design surfaced during its own gate run, worth keeping
   in mind for any future pass that touches already-rewritten operands: the
@@ -443,10 +490,18 @@ module stays correct and is simply not offloaded:
   working lowering to prove retargetability.
 - `cim-legalize-precision` with real `effective_bits` modeling.
 - `cim-lower-to-target` beyond its v0.1 straight-line, single-tile slice:
-  lowering `cim.reduce_partial` and `cim.requantize`, and lowering a cim op
-  inside an `scf.for` (needs a real buffer-lifetime story across loop
-  iterations, not just within one straight-line block) -- see the Pass 7
-  entry above for exactly what is and is not covered today.
+  lowering `cim.reduce_partial` (multiple partial-sum buffers alive at
+  once, reduced into one -- its own real buffer-lifetime story), and
+  lowering a cim op inside an `scf.for` (needs a real buffer-lifetime
+  story across loop iterations, not just within one straight-line block)
+  -- see the Pass 7 entry above for exactly what is and is not covered
+  today. `cim.requantize` lowering is done (composition-hardening entry
+  above).
+- `cimrt_requantize` accounted in the cost model: the target schema's
+  `costs:` section needs a requantize/readout entry before
+  `cimrt_profile_stop`/`cim-cost-report` can count it (currently zero-cost,
+  a known simplification, not a silent omission -- see the Pass 7 entry
+  above).
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

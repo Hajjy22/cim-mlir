@@ -17,6 +17,8 @@
 #include "cost_model.h"
 #include "../erbium/erbium_backend.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -280,6 +282,75 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
   }
 
   dev->cost.recordMvm();
+  return CIMRT_OK;
+}
+
+/// Whole bytes for `bits`, or 0 if `bits` is not a positive multiple of 8 --
+/// this ABI is exactly as byte-addressed as cimrt_alloc/write/read
+/// (and Interpreter.cpp's elementByteWidth, which this mirrors).
+static uint32_t bitsToBytes(uint32_t bits) {
+  return (bits > 0 && bits % 8 == 0) ? bits / 8 : 0;
+}
+
+/// Sign-extend the `bytes`-byte little-endian integer starting at `p` to
+/// int64_t. Mirrors Interpreter.cpp's runRequantize sign-extension exactly
+/// (same reasoning: a bare cast would read the high bit as magnitude, not
+/// sign, for anything narrower than int64_t).
+static int64_t signExtend(const uint8_t *p, uint32_t bytes) {
+  uint64_t raw = 0;
+  std::memcpy(&raw, p, bytes);
+  const uint32_t bits = bytes * 8;
+  if (bits >= 64)
+    return static_cast<int64_t>(raw);
+  const uint64_t signBit = static_cast<uint64_t>(1) << (bits - 1);
+  return static_cast<int64_t>((raw ^ signBit) - signBit);
+}
+
+cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
+                               cimrt_buffer *output, size_t count,
+                               uint32_t in_bits, uint32_t out_bits,
+                               float scale, int32_t zero_point,
+                               uint32_t effective_bits) {
+  if (!dev || !input || !output)
+    return CIMRT_ERR_INVALID_ARG;
+  const uint32_t inBytes = bitsToBytes(in_bits);
+  const uint32_t outBytes = bitsToBytes(out_bits);
+  if (inBytes == 0 || outBytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (effective_bits == 0 || effective_bits > out_bits)
+    return CIMRT_ERR_INVALID_ARG;
+  if (!(scale > 0.0f))
+    return CIMRT_ERR_INVALID_ARG;
+  if (input->data.size() != count * inBytes ||
+      output->data.size() != count * outBytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  // The SIGNED range effective_bits can hold, regardless of whether
+  // out_bits is nominally wider -- the readout path this op stands for
+  // (an analog ADC's real resolution, or a digital requantizer's narrower
+  // accumulator) is what actually limits precision, not the container.
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effective_bits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effective_bits - 1)) - 1;
+
+  for (size_t i = 0; i < count; ++i) {
+    const int64_t value = signExtend(input->data.data() + i * inBytes, inBytes);
+    // round-half-away-from-zero, the one mode that treats positive and
+    // negative accumulator values symmetrically -- matches
+    // Interpreter.cpp's runRequantize exactly, since this is the same
+    // arithmetic contract computed a second, independent way (device-side
+    // here, host-side there) and both must agree bit for bit.
+    const double scaled = static_cast<double>(value) / static_cast<double>(scale);
+    int64_t quantized = static_cast<int64_t>(zero_point) +
+                        static_cast<int64_t>(std::llround(scaled));
+    quantized = std::clamp(quantized, clampMin, clampMax);
+
+    const uint64_t bits = static_cast<uint64_t>(quantized);
+    std::memcpy(output->data.data() + i * outBytes, &bits, outBytes);
+  }
+
+  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
+  // on this function for why (no requantize/readout entry in the target
+  // schema's costs: section; real M4 work, not a silent omission).
   return CIMRT_OK;
 }
 
