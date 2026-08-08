@@ -3,6 +3,10 @@
 add_executable(cim-mlir-tests
   ${CMAKE_CURRENT_SOURCE_DIR}/../unit/test_main.cpp
   pipeline_e2e_test.cpp
+  cost_report_e2e_test.cpp
+  schedule_e2e_test.cpp
+  legalize_precision_e2e_test.cpp
+  insert_transfers_e2e_test.cpp
 )
 
 target_include_directories(cim-mlir-tests PRIVATE

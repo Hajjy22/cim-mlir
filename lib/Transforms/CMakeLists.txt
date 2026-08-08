@@ -7,6 +7,8 @@ add_mlir_dialect_library(MLIRCIMTransforms
   CIMLegalizePrecision.cpp
   CIMLowerToTarget.cpp
   CIMCostReport.cpp
+  CostReportUtils.cpp
+  LoopAnalysis.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/cim/Transforms
@@ -24,6 +26,8 @@ add_mlir_dialect_library(MLIRCIMTransforms
   MLIRFuncDialect
   MLIRArithDialect
   MLIRSCFDialect
+  MLIRLLVMDialect
+  MLIRControlFlowDialect
 )
 
 # The passes delegate their actual algorithms to the MLIR-free core.

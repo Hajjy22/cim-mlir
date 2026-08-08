@@ -17,10 +17,15 @@
 #include "cost_model.h"
 #include "../erbium/erbium_backend.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace cim;
@@ -30,15 +35,28 @@ struct cimrt_device {
   TargetSpec spec;
   CostAccumulator cost{spec};
   std::unordered_map<cimrt_tile_id, std::vector<uint8_t>> tileWeights;
-  bool profiling = false;
+  // Snapshot of `cost`'s counters taken by cimrt_profile_start, so stop can
+  // report the delta for one window rather than the cumulative total since
+  // cimrt_open. Un-set (nullopt-by-flag) until start is actually called.
+  CostAccumulator::Snapshot profileBaseline{};
+  bool profilingActive = false;
+
+  // Every cimrt_buffer allocated from this device, so cimrt_close can
+  // orphan them instead of leaving a dangling back-pointer for the next
+  // cimrt_write/cimrt_read/cimrt_copy to dereference. A raw non-owning set:
+  // the buffers own their own lifetime via cimrt_free, this only needs to
+  // find and null them out.
+  std::unordered_set<cimrt_buffer *> liveBuffers;
 };
 
 struct cimrt_buffer {
   std::vector<uint8_t> data;
   cimrt_space space;
-  // Back-pointer to the owning device. Without it cimrt_copy has no device
-  // handle, so CostAccumulator::recordTransfer was unreachable by
-  // construction and bytes_transferred was permanently zero.
+  // Back-pointer to the owning device, for cost accounting. Nulled by
+  // cimrt_close when the device goes away first -- see the lifetime note on
+  // cimrt_close in cimrt.h. Every write site that reads `dev` must treat
+  // null as "orphaned", never assume it stays valid for the buffer's whole
+  // lifetime.
   cimrt_device *dev = nullptr;
 };
 
@@ -57,15 +75,26 @@ static std::string resolveTargetPath(const std::string &name) {
 cimrt_status cimrt_open(const char *target_name, cimrt_device **out) {
   if (!target_name || !out)
     return CIMRT_ERR_INVALID_ARG;
+  *out = nullptr;
 
   // A "-hw" suffix asks for real hardware, which is a different backend --
   // not this functional simulator. Reporting NO_DEVICE here is what makes
   // "no hardware attached" distinguishable from "simulator unavailable".
   const std::string name = target_name;
   if (name.size() >= 3 && name.compare(name.size() - 3, 3, "-hw") == 0)
-    return cim::erbium::open();
+    return cim::erbium::open(out);
 
-  auto *dev = new cimrt_device();
+  // A well-formed but adversarially large target spec (an absurd tile
+  // count/geometry) could in principle exhaust memory during parsing or
+  // construction; report it the same way an oversized cimrt_alloc is
+  // reported rather than letting an allocator exception cross the
+  // extern "C" boundary, which is undefined behaviour.
+  cimrt_device *dev = nullptr;
+  try {
+    dev = new cimrt_device();
+  } catch (const std::bad_alloc &) {
+    return CIMRT_ERR_OOM;
+  }
   dev->name = name;
 
   if (!parseTargetSpecFromFile(resolveTargetPath(name), dev->spec)) {
@@ -77,7 +106,17 @@ cimrt_status cimrt_open(const char *target_name, cimrt_device **out) {
   return CIMRT_OK;
 }
 
-void cimrt_close(cimrt_device *dev) { delete dev; }
+void cimrt_close(cimrt_device *dev) {
+  if (!dev)
+    return;
+  // Orphan every buffer still allocated from this device -- see the
+  // lifetime note on cimrt_close in cimrt.h. `liveBuffers` is exactly the
+  // set of buffers whose `dev` still points here, so this cannot miss one
+  // or double-orphan one already freed (cimrt_free deregisters first).
+  for (cimrt_buffer *buf : dev->liveBuffers)
+    buf->dev = nullptr;
+  delete dev;
+}
 
 cimrt_status cimrt_query(cimrt_device *dev, cimrt_device_info *out) {
   if (!dev || !out)
@@ -95,10 +134,25 @@ cimrt_status cimrt_alloc(cimrt_device *dev, size_t bytes, cimrt_space space,
                           cimrt_buffer **out) {
   if (!dev || !out)
     return CIMRT_ERR_INVALID_ARG;
-  auto *buf = new cimrt_buffer();
-  buf->data.resize(bytes, 0);
+  *out = nullptr;
+
+  cimrt_buffer *buf = nullptr;
+  try {
+    buf = new cimrt_buffer();
+    buf->data.resize(bytes, 0);
+  } catch (const std::bad_alloc &) {
+    delete buf;
+    return CIMRT_ERR_OOM;
+  } catch (const std::length_error &) {
+    // vector::resize throws this for a size past its max_size(), which is
+    // an unsatisfiable request rather than a transient allocator failure,
+    // but it is the same answer from the caller's side: cannot have it.
+    delete buf;
+    return CIMRT_ERR_OOM;
+  }
   buf->space = space;
   buf->dev = dev;
+  dev->liveBuffers.insert(buf);
   *out = buf;
   return CIMRT_OK;
 }
@@ -108,9 +162,36 @@ cimrt_status cimrt_copy(cimrt_buffer *dst, const cimrt_buffer *src) {
     return CIMRT_ERR_INVALID_ARG;
   if (dst->data.size() != src->data.size())
     return CIMRT_ERR_SHAPE_MISMATCH;
+  // An orphaned destination (its device already closed) cannot have this
+  // transfer costed, and costing it against nothing would make the cost
+  // model silently wrong rather than loudly unavailable -- see the
+  // cimrt_close lifetime note in cimrt.h.
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG;
   dst->data = src->data;
-  if (dst->dev)
-    dst->dev->cost.recordTransfer(dst->data.size());
+  dst->dev->cost.recordTransfer(dst->data.size());
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_copy_range(cimrt_buffer *dst, size_t dst_offset,
+                              const cimrt_buffer *src, size_t src_offset,
+                              size_t bytes) {
+  if (!dst || !src)
+    return CIMRT_ERR_INVALID_ARG;
+  if (dst == src)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: dst and src must differ.
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
+  // Checked against overflow rather than just `offset + bytes > size`,
+  // which wraps for adversarial offsets -- same guard cimrt_write/
+  // cimrt_read already use.
+  if (dst_offset > dst->data.size() || bytes > dst->data.size() - dst_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  if (src_offset > src->data.size() || bytes > src->data.size() - src_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  std::memcpy(dst->data.data() + dst_offset, src->data.data() + src_offset,
+              bytes);
+  dst->dev->cost.recordTransfer(bytes);
   return CIMRT_OK;
 }
 
@@ -118,13 +199,14 @@ cimrt_status cimrt_write(cimrt_buffer *dst, size_t dst_offset, const void *src,
                           size_t bytes) {
   if (!dst || !src)
     return CIMRT_ERR_INVALID_ARG;
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
   // Checked against overflow rather than just `offset + bytes > size`,
   // which wraps for adversarial offsets.
   if (dst_offset > dst->data.size() || bytes > dst->data.size() - dst_offset)
     return CIMRT_ERR_INVALID_ARG;
   std::memcpy(dst->data.data() + dst_offset, src, bytes);
-  if (dst->dev)
-    dst->dev->cost.recordTransfer(bytes);
+  dst->dev->cost.recordTransfer(bytes);
   return CIMRT_OK;
 }
 
@@ -132,22 +214,36 @@ cimrt_status cimrt_read(const cimrt_buffer *src, size_t src_offset, void *dst,
                          size_t bytes) {
   if (!src || !dst)
     return CIMRT_ERR_INVALID_ARG;
+  if (!src->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
   if (src_offset > src->data.size() || bytes > src->data.size() - src_offset)
     return CIMRT_ERR_INVALID_ARG;
   std::memcpy(dst, src->data.data() + src_offset, bytes);
-  if (src->dev)
-    src->dev->cost.recordTransfer(bytes);
+  src->dev->cost.recordTransfer(bytes);
   return CIMRT_OK;
 }
 
-void cimrt_free(cimrt_buffer *buf) { delete buf; }
+void cimrt_free(cimrt_buffer *buf) {
+  if (!buf)
+    return;
+  // Deregister before deleting: a buffer freed while its device is still
+  // open must not leave a dangling entry in dev->liveBuffers for the next
+  // cimrt_close to walk and write through -- the mirror image of the
+  // use-after-free this registry exists to prevent.
+  if (buf->dev)
+    buf->dev->liveBuffers.erase(buf);
+  delete buf;
+}
 
 cimrt_status cimrt_program(cimrt_device *dev, cimrt_tile_id tile,
                             const cimrt_buffer *weights) {
   if (!dev || !weights)
     return CIMRT_ERR_INVALID_ARG;
+  // A tile id the target does not have is a malformed call, not "busy":
+  // TILE_BUSY says "this tile exists and is not ready", which sends a
+  // caller looking for a scheduling problem that is not there.
   if (tile >= dev->spec.tiles.count)
-    return CIMRT_ERR_TILE_BUSY;
+    return CIMRT_ERR_INVALID_ARG;
   size_t expected =
       static_cast<size_t>(dev->spec.tiles.rows) * dev->spec.tiles.cols;
   if (weights->data.size() != expected)
@@ -167,6 +263,12 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
                         const cimrt_buffer *act, cimrt_buffer *out,
                         bool accumulate) {
   if (!dev || !act || !out)
+    return CIMRT_ERR_INVALID_ARG;
+  // Same distinction as cimrt_program: a tile id the target does not have
+  // is malformed, not "busy". Must be checked before the tileWeights
+  // lookup below, which cannot otherwise tell "out of range" apart from
+  // "in range but never programmed".
+  if (tile >= dev->spec.tiles.count)
     return CIMRT_ERR_INVALID_ARG;
 
   auto it = dev->tileWeights.find(tile);
@@ -205,6 +307,111 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
   return CIMRT_OK;
 }
 
+/// Whole bytes for `bits`, or 0 if `bits` is not a positive multiple of 8 --
+/// this ABI is exactly as byte-addressed as cimrt_alloc/write/read
+/// (and Interpreter.cpp's elementByteWidth, which this mirrors).
+static uint32_t bitsToBytes(uint32_t bits) {
+  return (bits > 0 && bits % 8 == 0) ? bits / 8 : 0;
+}
+
+/// Sign-extend the `bytes`-byte little-endian integer starting at `p` to
+/// int64_t. Mirrors Interpreter.cpp's runRequantize sign-extension exactly
+/// (same reasoning: a bare cast would read the high bit as magnitude, not
+/// sign, for anything narrower than int64_t).
+static int64_t signExtend(const uint8_t *p, uint32_t bytes) {
+  uint64_t raw = 0;
+  std::memcpy(&raw, p, bytes);
+  const uint32_t bits = bytes * 8;
+  if (bits >= 64)
+    return static_cast<int64_t>(raw);
+  const uint64_t signBit = static_cast<uint64_t>(1) << (bits - 1);
+  return static_cast<int64_t>((raw ^ signBit) - signBit);
+}
+
+cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
+                               cimrt_buffer *output, size_t count,
+                               uint32_t in_bits, uint32_t out_bits,
+                               float scale, int32_t zero_point,
+                               uint32_t effective_bits) {
+  if (!dev || !input || !output)
+    return CIMRT_ERR_INVALID_ARG;
+  const uint32_t inBytes = bitsToBytes(in_bits);
+  const uint32_t outBytes = bitsToBytes(out_bits);
+  if (inBytes == 0 || outBytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (effective_bits == 0 || effective_bits > out_bits)
+    return CIMRT_ERR_INVALID_ARG;
+  if (!(scale > 0.0f))
+    return CIMRT_ERR_INVALID_ARG;
+  if (input->data.size() != count * inBytes ||
+      output->data.size() != count * outBytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  // The SIGNED range effective_bits can hold, regardless of whether
+  // out_bits is nominally wider -- the readout path this op stands for
+  // (an analog ADC's real resolution, or a digital requantizer's narrower
+  // accumulator) is what actually limits precision, not the container.
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effective_bits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effective_bits - 1)) - 1;
+
+  for (size_t i = 0; i < count; ++i) {
+    const int64_t value = signExtend(input->data.data() + i * inBytes, inBytes);
+    // round-half-away-from-zero, the one mode that treats positive and
+    // negative accumulator values symmetrically -- matches
+    // Interpreter.cpp's runRequantize exactly, since this is the same
+    // arithmetic contract computed a second, independent way (device-side
+    // here, host-side there) and both must agree bit for bit.
+    const double scaled = static_cast<double>(value) / static_cast<double>(scale);
+    int64_t quantized = static_cast<int64_t>(zero_point) +
+                        static_cast<int64_t>(std::llround(scaled));
+    quantized = std::clamp(quantized, clampMin, clampMax);
+
+    const uint64_t bits = static_cast<uint64_t>(quantized);
+    std::memcpy(output->data.data() + i * outBytes, &bits, outBytes);
+  }
+
+  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
+  // on this function for why (no requantize/readout entry in the target
+  // schema's costs: section; real M4 work, not a silent omission).
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
+                              const cimrt_buffer *a, const cimrt_buffer *b,
+                              size_t count, uint32_t bits) {
+  if (!dev || !out || !a || !b)
+    return CIMRT_ERR_INVALID_ARG;
+  if (out == a || out == b)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: out must not alias a or b.
+  const uint32_t bytes = bitsToBytes(bits);
+  if (bytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (a->data.size() != count * bytes || b->data.size() != count * bytes ||
+      out->data.size() != count * bytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t lhs = 0, rhs = 0;
+    std::memcpy(&lhs, a->data.data() + i * bytes, bytes);
+    std::memcpy(&rhs, b->data.data() + i * bytes, bytes);
+    // Wrapping addition, matching Interpreter.cpp's runReducePartial: a
+    // fixed-width accumulator wraps, it does not saturate. Widened to
+    // uint64_t so the add itself never overflows a C++ type before the
+    // result is truncated back to `bytes` -- correct for bytes up to 8;
+    // this ABI's own byte-addressed contract (bitsToBytes) never produces
+    // more than that from a 32-bit `bits` parameter in practice, but the
+    // truncating memcpy below is what actually enforces the wrap either
+    // way, not this widening.
+    const uint64_t sum = lhs + rhs;
+    std::memcpy(out->data.data() + i * bytes, &sum, bytes);
+  }
+
+  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
+  // on this function for why (no reduce/accumulate entry in the target
+  // schema's costs: section; real M4 work, not a silent omission).
+  return CIMRT_OK;
+}
+
 cimrt_status cimrt_barrier(cimrt_device *dev) {
   if (!dev)
     return CIMRT_ERR_INVALID_ARG;
@@ -215,19 +422,27 @@ cimrt_status cimrt_barrier(cimrt_device *dev) {
 cimrt_status cimrt_profile_start(cimrt_device *dev) {
   if (!dev)
     return CIMRT_ERR_INVALID_ARG;
-  dev->profiling = true;
+  dev->profileBaseline = dev->cost.snapshot();
+  dev->profilingActive = true;
   return CIMRT_OK;
 }
 
 cimrt_status cimrt_profile_stop(cimrt_device *dev, cimrt_profile *out) {
   if (!dev || !out)
     return CIMRT_ERR_INVALID_ARG;
-  out->programs_issued = dev->cost.getProgramsIssued();
-  out->mvms_issued = dev->cost.getMvmsIssued();
-  out->bytes_transferred = dev->cost.getBytesTransferred();
-  out->estimated_energy_pj = dev->cost.getEstimatedEnergyPj();
-  out->estimated_latency_ns = dev->cost.getEstimatedLatencyNs();
-  dev->profiling = false;
+  // A stop with no matching start reports zero, not the cumulative total
+  // since cimrt_open (see the contract comment on cimrt_profile_start/stop
+  // in cimrt.h): baseline == current counters gives a zero delta below,
+  // which is exactly that "no window was opened" answer.
+  const CostAccumulator::Snapshot baseline =
+      dev->profilingActive ? dev->profileBaseline : dev->cost.snapshot();
+  const CostAccumulator::Snapshot now = dev->cost.snapshot();
+  out->programs_issued = now.programsIssued - baseline.programsIssued;
+  out->mvms_issued = now.mvmsIssued - baseline.mvmsIssued;
+  out->bytes_transferred = now.bytesTransferred - baseline.bytesTransferred;
+  out->estimated_energy_pj = now.energyPj - baseline.energyPj;
+  out->estimated_latency_ns = now.latencyNs - baseline.latencyNs;
+  dev->profilingActive = false;
   return CIMRT_OK;
 }
 

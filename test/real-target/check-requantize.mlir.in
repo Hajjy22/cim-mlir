@@ -1,0 +1,42 @@
+// Sibling of check.mlir.in, configured the same way (see that file's own
+// header and test/real-target/CMakeLists.txt) into
+// requantize-correct.mlir (EXPECTED_VALUE=127) and requantize-wrong.mlir
+// (EXPECTED_VALUE=999).
+//
+// check.mlir.in proves a compiled cim.mvm computes the right answer;
+// this file proves the same for cim.requantize's cimrt_requantize call --
+// the strongest possible evidence that the whole
+// cim-legalize-precision -> cim-lower-to-target composition this session
+// closed produces a genuinely working artifact, not just well-shaped IR.
+// Weights and activation are chosen so the raw mvm dot product (40000)
+// is far outside what an 8-bit signed clamp can hold, so a real compiled
+// binary's requantize call has to actually clamp, not just pass a value
+// through unchanged, to reach EXPECTED_VALUE=127.
+func.func @run_check() {
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+  %t = cim.tile_alloc %dev {id = 0 : i64}
+       : (!cim.device<"@CIM_REAL_TARGET_YAML@">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %act = memref.get_global @act : memref<4xi8>
+  %out = cim.mvm %r, %act : (!cim.resident<4x4xi8>, memref<4xi8>) -> memref<4xi32>
+  %q = cim.requantize %out {scale = 1.0 : f32, zero_point = 0 : i32, effective_bits = 8 : i32}
+       : memref<4xi32> -> memref<4xi32>
+  %c0 = arith.constant 0 : index
+  %got = memref.load %q[%c0] : memref<4xi32>
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: cimrt_requantize result did not match the expected value"
+  memref.dealloc %q : memref<4xi32>
+  return
+}
+// Row 0 is all 100s; dotted with an all-100s activation, out[0] = 100*100*4
+// = 40000 -- 40000, and effective_bits=8's signed clamp range is
+// [-128, 127], so out[0] can only reach EXPECTED_VALUE=127 if
+// cimrt_requantize's clamp genuinely ran.
+memref.global "private" constant @w : memref<4x4xi8> = dense<[[100, 100, 100, 100],
+                                                               [0, 0, 0, 0],
+                                                               [0, 0, 0, 0],
+                                                               [0, 0, 0, 0]]>
+memref.global "private" constant @act : memref<4xi8> = dense<[100, 100, 100, 100]>

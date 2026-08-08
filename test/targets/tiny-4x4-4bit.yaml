@@ -1,0 +1,44 @@
+# test/targets/tiny-4x4-4bit.yaml
+#
+# Identical to tiny-4x4.yaml except precision.output_effective_bits: 4 --
+# exists only to exercise cim-legalize-precision's sub-8-bit warning path
+# (test/Transforms/cim-legalize-precision.mlir), which tiny-4x4.yaml's own
+# lossless 8-bit setting cannot reach.
+
+name: tiny-4x4-4bit
+description: Tiny synthetic target for tests (2 tiles of 4x4, 4-bit readout)
+version: 0.1
+
+class: analog_cim
+
+provenance: estimated  # synthetic; not measured, not modelling any real part
+
+tiles:
+  count: 2
+  rows: 4
+  cols: 4
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: true
+  persistence: nonvolatile
+
+costs:
+  program:
+    latency_ns: 1000
+    energy_pj: 10000
+  mvm:
+    latency_ns: 10
+    energy_pj: 100
+  transfer:
+    bandwidth_gbps: 1.0
+    energy_pj_per_byte: 1.0
+  standby_leakage_uw_per_tile: 0.0
+
+precision:
+  output_effective_bits: 4
+
+capabilities:
+  double_buffer_program: false
+  partial_sum_in_place: true
+  autonomous_control: false

@@ -315,3 +315,166 @@ CIM_TEST(spill_rows_actually_spill) {
     CIM_EXPECT(r.programs > r.distinctWeights);
   }
 }
+
+// The evidence behind decision 4 in lib/Transforms/CIMPlacement.cpp's file
+// header, pinned here so a future reader cannot dispute it without a
+// failing test.
+//
+// The optimal N-inference schedule for a spill workload is NOT expressible
+// as a single loop body, and the reason is specifically that its
+// per-iteration cim.program COUNT varies. A fixed loop body executes a
+// fixed set of ops on every iteration and therefore emits a constant
+// number of programs per iteration; the optimum emits 8 on some iterations
+// and 9 on others. No choice of tile ids -- including ids computed from
+// the induction variable -- can change that, because the count, not the
+// assignment, is what differs.
+//
+// This matters because it is the argument against a much more invasive
+// change (making cim.tile_alloc's id dynamic so the assignment could
+// rotate). That change would ripple through the dialect, the lowering, the
+// interpreter and every test spelling `{id = N}`, and would buy exactly
+// zero programs. This test is why that is a fact rather than an opinion.
+CIM_TEST(the_n_inference_optimum_is_not_a_constant_per_iteration_count) {
+  constexpr uint32_t kBlocks = 16;
+  constexpr uint32_t kTiles = 8;
+  constexpr uint32_t kIterations = 30;
+
+  PlacementProblem problem;
+  problem.numTiles = kTiles;
+  problem.name = "cyclic-sweep";
+  for (uint32_t rep = 0; rep < kIterations; ++rep)
+    for (uint32_t b = 0; b < kBlocks; ++b)
+      problem.useSequence.push_back(b);
+
+  const PlacementResult result =
+      runValidated(problem, EvictionPolicy::Belady);
+
+  // Programs per iteration, sliced the same way computeCostReport's own
+  // windowing does.
+  std::vector<uint64_t> perIteration(kIterations, 0);
+  for (const PlacementAction &action : result.actions)
+    if (action.kind != ActionKind::Reuse)
+      ++perIteration[action.step / kBlocks];
+
+  // Iteration 0 is the cold-start install: every block is a miss.
+  CIM_EXPECT_EQ(perIteration[0], uint64_t(kBlocks));
+
+  // The load-bearing assertion: past the install, the count is NOT
+  // constant. If this ever becomes constant, a single loop body could
+  // reach the optimum and decision 4's reasoning needs revisiting.
+  bool sawEight = false, sawNine = false;
+  for (uint32_t i = 1; i < kIterations; ++i) {
+    if (perIteration[i] == 8) sawEight = true;
+    if (perIteration[i] == 9) sawNine = true;
+    // Nothing outside {8, 9} should appear in steady state -- the lower
+    // bound is blocks - (tiles - 1) = 9 for a body where each weight is
+    // used once, and 8 occurs only where a previous iteration's residency
+    // carries one extra block across the boundary.
+    CIM_EXPECT(perIteration[i] == 8 || perIteration[i] == 9);
+  }
+  CIM_EXPECT(sawEight);
+  CIM_EXPECT(sawNine);
+}
+
+// computeSteadyStatePlacement / validateSteadyStatePlacement -- the
+// deliberate version of decision 4's own hoisting, closing the "reached
+// by accident" gap test/Transforms/cim-placement-spill-loop.mlir guards
+// structurally. See include/cim/Placement/Placement.h's own comment on
+// SteadyStateResult for the full design; these are the hand-computed
+// cases, exhaustive/property coverage lives in
+// steady_state_property_test.cpp.
+
+CIM_TEST(steady_state_fits_entirely_pins_everything_and_streams_nothing) {
+  SteadyStateProblem problem;
+  problem.numTiles = 8;
+  problem.bodySequence = {0, 1, 2, 3}; // 4 distinct weights, 8 tiles: fits.
+  const SteadyStateResult result = computeSteadyStatePlacement(problem);
+
+  CIM_EXPECT(result.feasible);
+  CIM_EXPECT_EQ(result.pinnedTileCount, uint32_t(4));
+  CIM_EXPECT_EQ(result.programsPerIteration, uint64_t(0));
+  CIM_EXPECT_EQ(result.body.size(), size_t(4));
+  // Each weight appears exactly once, so every occurrence is that weight's
+  // first (and only) one: a real ProgramIntoFree, not a Reuse -- otherwise
+  // nothing would ever actually install the weight into its pinned tile.
+  for (const PlacementAction &a : result.body)
+    CIM_EXPECT(a.kind == ActionKind::ProgramIntoFree);
+
+  std::string error;
+  CIM_EXPECT(validateSteadyStatePlacement(problem, result, &error));
+}
+
+CIM_TEST(steady_state_matches_the_real_spill_loop_shape) {
+  // The exact shape test/Transforms/cim-placement-spill-loop.mlir checks
+  // on real IR: 16 weight blocks over 8 tiles, one block used once per
+  // iteration -- the mm-spill-2x shape at test scale. Expected counts
+  // (tiles - 1 pinned, blocks - (tiles - 1) streamed) come from that
+  // file's own header, not re-derived here.
+  {
+    SteadyStateProblem problem;
+    problem.numTiles = 8;
+    for (uint32_t b = 0; b < 16; ++b)
+      problem.bodySequence.push_back(b);
+    const SteadyStateResult result = computeSteadyStatePlacement(problem);
+    CIM_EXPECT_EQ(result.pinnedTileCount, uint32_t(7));
+    CIM_EXPECT_EQ(result.programsPerIteration, uint64_t(9));
+    std::string error;
+    CIM_EXPECT(validateSteadyStatePlacement(problem, result, &error));
+  }
+  // mm-spill-8x at test scale: 64 blocks over 8 tiles.
+  {
+    SteadyStateProblem problem;
+    problem.numTiles = 8;
+    for (uint32_t b = 0; b < 64; ++b)
+      problem.bodySequence.push_back(b);
+    const SteadyStateResult result = computeSteadyStatePlacement(problem);
+    CIM_EXPECT_EQ(result.pinnedTileCount, uint32_t(7));
+    CIM_EXPECT_EQ(result.programsPerIteration, uint64_t(57));
+    std::string error;
+    CIM_EXPECT(validateSteadyStatePlacement(problem, result, &error));
+  }
+}
+
+CIM_TEST(steady_state_handles_a_weight_repeated_within_one_body) {
+  // Two matmuls in one loop body sharing a weight block: weight 0 is
+  // used twice, 1 and 2 once each, over 2 tiles. Occurrence count picks
+  // weight 0 to pin (used twice, more than any other), streaming 1 and 2
+  // through the remaining tile -- 2 programs per iteration, not 3, which
+  // is what today's accidental, per-block Belady solve reaches only when
+  // its own tile-0-first eviction quirk happens to agree (see decision 4
+  // in lib/Transforms/CIMPlacement.cpp for the case where it does not).
+  SteadyStateProblem problem;
+  problem.numTiles = 2;
+  problem.bodySequence = {0, 1, 2, 0};
+  const SteadyStateResult result = computeSteadyStatePlacement(problem);
+
+  CIM_EXPECT_EQ(result.pinnedTileCount, uint32_t(1));
+  CIM_EXPECT_EQ(result.programsPerIteration, uint64_t(2));
+  std::string error;
+  CIM_EXPECT(validateSteadyStatePlacement(problem, result, &error));
+}
+
+CIM_TEST(steady_state_handles_a_single_tile_device) {
+  // Nothing can be pinned with only one tile and more than one distinct
+  // weight -- everything streams, matching what an ordinary Belady solve
+  // with numTiles=1 would do anyway.
+  SteadyStateProblem problem;
+  problem.numTiles = 1;
+  problem.bodySequence = {0, 1, 2, 3, 4};
+  const SteadyStateResult result = computeSteadyStatePlacement(problem);
+
+  CIM_EXPECT_EQ(result.pinnedTileCount, uint32_t(0));
+  CIM_EXPECT_EQ(result.programsPerIteration, uint64_t(5));
+  std::string error;
+  CIM_EXPECT(validateSteadyStatePlacement(problem, result, &error));
+}
+
+CIM_TEST(steady_state_is_infeasible_for_an_empty_body_or_no_tiles) {
+  SteadyStateProblem empty;
+  empty.numTiles = 8;
+  CIM_EXPECT(!computeSteadyStatePlacement(empty).feasible);
+
+  SteadyStateProblem noTiles;
+  noTiles.bodySequence = {0, 1, 2};
+  CIM_EXPECT(!computeSteadyStatePlacement(noTiles).feasible);
+}

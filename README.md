@@ -19,7 +19,9 @@ It is not a general ML compiler (it plugs in below IREE/TVM/XLA as a backend), n
 and not analog-first — the first working targets are digital/near-memory, because that is
 what ships today. See [`docs/abstraction.md`](docs/abstraction.md) for the hardware
 abstraction model, which is the actual intellectual contribution of this project — read it
-before the code.
+before the code. [`docs/website/index.html`](docs/website/index.html) is the same material
+laid out as a single reference page (diagrams, the pipeline, the full dialect) — open it
+directly in a browser.
 
 ## Status
 
@@ -35,7 +37,34 @@ None of it needs an LLVM toolchain.
 round-trips all nine ops, and its verifiers reject malformed IR (10 FileCheck tests,
 including negative cases for shape mismatch, accumulator saturation, and same-space copies).
 
-**Partly implemented.** Three of the eight lowering passes are real: `cim-detect` finds
+**Partly implemented, and it composes end to end.** All eight lowering passes are real,
+though the last one (`cim-lower-to-target`) covers a deliberately scoped slice — see
+below. Three real composition breaks between them have been closed: `cim-legalize-precision`
+retypes the downstream `cim.copy`/`memref.copy` chain where it owns the type, and falls
+back to a width-preserving requantize (the value is still genuinely clamped) where it
+doesn't — see `lib/Transforms/CIMLegalizePrecision.cpp`'s file header. `cim-lower-to-target`
+folds an identity `memref.subview` of a device-space value through to its source handle,
+exactly the shape `cim-partition` emits slicing a staged activation for a single K-tile,
+and now MATERIALIZES a genuine (non-identity) rank-1 slice into a fresh buffer via a new
+`cimrt_copy_range` ABI call instead of refusing it — exactly the shape `cim-partition`
+emits slicing a staged activation once a matmul spans more than one K-tile, and the fix
+that finally lets a real multi-K-tile matmul reach `cimrt_mvm` through this pass at all
+(a higher-rank or non-unit-stride slice is still refused; see below). And
+`cim-lower-to-target` now lowers `cim.requantize` itself, against a new `cimrt_requantize`
+ABI call that does the round-half-away-from-zero and signed-clamp arithmetic device-side —
+so `cim-legalize-precision` (which always inserts a real `cim.requantize`) and
+`cim-lower-to-target` (which used to refuse it outright) can finally sit in the same
+chain. `test/Transforms/cim-pipeline-full.mlir` proves it three ways: the two narrower
+chains as their own regression coverage (passes 1–6 plus `cim-cost-report`; passes 1–5
+plus `cim-cost-report` and `cim-lower-to-target`, skipping precision legalization), and a
+third chaining literally all eight passes, spec order, on one module, down to real
+`cimrt_mvm`/`cimrt_requantize` calls with no `cim` ops left.
+`test/mlir/pipeline_e2e_test.cpp`'s `e2e_full_pipeline_through_precision_legalization_composes`
+checks the same composed chain numerically through the interpreter, and
+`test/real-target/`'s `requantize-correct`/`requantize-wrong` pair checks it one level
+further down: a real compiled binary whose `cimrt_requantize` call clamps a genuine
+out-of-range value and genuinely traps when the expected result is wrong.
+`cim-detect` finds
 INT8 matmuls with a constant weight operand, `cim-partition` lowers them into per-tile
 `cim.program`/`cim.mvm` with partial-sum reduction and explicit memory-space transfers,
 and `cim-placement` — the pass the project exists for — rewrites that IR from a Belady
@@ -60,14 +89,185 @@ too: a `cim.program` is hoisted above the loop when its tile is provably untouch
 anything else for the whole iteration and the loop's trip count is a compile-time
 constant known positive. That reproduces the headline claim — a model that fits entirely
 reprograms once, no matter how many inferences the loop runs — on compiled IR, checked by
-executing the loop through a real interpreter, not just by inspecting its shape. It does
-**not** replicate a full N-inference Belady solve, which is what the spill-workload
-figures below still come from (`docs/roadmap.md`'s M3 section draws the exact line).
+executing the loop through a real interpreter, not just by inspecting its shape.
 
-The remaining five passes are registered but their bodies are `TODO` stubs, so nothing
-compiles a real model end to end yet. `cim-partition`'s scope limits (matrix-vector,
-output-major weights, exact tile multiples) are each refused with a warning rather than
-silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+Under spill it does not exactly match a full N-inference Belady solve, and the distance is
+now measured rather than left vague: on the `mm-spill-2x` shape (16 weight blocks, 8 tiles)
+the pass emits `7 + 9*T` programs — 9007 at 1000 inferences against the optimum's 8538, a
+**5.5%** gap, not the 16000 that "does not replicate a full solve" could easily be read as.
+`cim-placement` now runs that flattened solve itself on the real IR and `cim-cost-report`
+publishes both numbers and the gap, so it stays measured. The residual is not a missing
+optimization — `7 + 9*T` is the proven optimum for any single loop body, and the flattened
+solve beats it only by varying its per-iteration program count, which a fixed loop body
+cannot do. Reaching that per-body optimum is deliberate, not a side effect: a pin-and-stream
+schedule (`cim::computeSteadyStatePlacement`) pins the `tiles-1` most-used weights and
+streams the rest through the remaining tile — provably exact when every weight in a body is
+used once, and a validated heuristic (never worse than doing nothing) otherwise — and
+`cim-placement` takes it whenever it beats the ordinary per-block solve, including the case
+the ordinary solve could miss: a weight used more than once within one loop body.
+`docs/roadmap.md`'s M3 section has the measurement and the proof sketch.
+
+`cim-cost-report` (Pass 8) also rewrites nothing but walks the final, already-placed IR
+and emits the project's publishable numbers as JSON — the same `CostReport`/`toJson`
+format `cim-bench` already prints, not a second cost model that could drift from it.
+Every `cim.program`/`cim.mvm` is weighted by the product of its enclosing loops'
+compile-time-constant trip counts before being counted, because a `cim.program` hoisted
+above an `scf.for` executes once regardless of where it sits textually while one left
+inside executes trip-count times — a plain walk-and-count would misreport exactly the IR
+`cim-placement`'s loop hoisting now produces. Checked against `cim-run --profile`'s real
+`cimrt` counters for straight-line, spill and loop-hoisted modules alike
+(`test/mlir/cost_report_e2e_test.cpp`): predicted and executed `programs`/`mvms` must
+agree exactly.
+
+`cim-schedule` (Pass 4) keeps source order — v0.1 never reorders or overlaps anything,
+that is v0.2's double-buffering work — and inserts `cim.barrier` conservatively: a device's
+outstanding `cim.program`/`cim.mvm` work is tracked as an open, un-synchronized run until
+something actually depends on its result (a direct operand, or a use nested inside an
+`scf.for` body — the loop op itself never lists a value only its body references, which is
+exactly the case that needs a barrier *before* the loop, not just inside it), at which
+point a barrier is inserted immediately before the dependent op. `cim.barrier` is a no-op
+in the functional simulator, so a numerical differential cannot tell a correctly-placed
+barrier from a missing one — that is what the structural tests
+(`test/Transforms/cim-schedule.mlir`) are for, and a mutation test confirms they actually
+catch a broken scheduler that a numerical-only check would silently let through
+(`test/mlir/schedule_e2e_test.cpp` covers the "does not change the answer" half instead).
+
+`cim-legalize-precision` (Pass 6) inserts `cim.requantize` after every "terminal"
+accumulator — a `cim.reduce_partial` result, or a `cim.mvm` result no `cim.reduce_partial`
+consumes (the single-K-tile case) — using `scale=1.0`/`zero_point=0` always, since v0.1 has
+no per-layer calibration step anywhere in the pipeline to derive anything else from; what
+this legalizes is the op shape spec Sec. 6 calls for, and the clamp that
+`output_effective_bits` genuinely does encode. On a target declaring fewer than 8 effective
+bits it emits a warning naming exactly how many of the 256 i8 encodings are unreachable
+through that readout path, rather than silently degrading. The interpreter executes
+`cim.requantize` for real — round-half-away-from-zero, then clamp to the signed range
+`effective_bits` can hold — checked against an independent reference implementation over
+both a fractional scale/nonzero zero_point and the clamp itself in both directions
+(`test/mlir/legalize_precision_e2e_test.cpp`), since unlike `cim.barrier` this op genuinely
+changes values and there is no "does not change the answer" invariant to fall back on.
+Composes with `cim-partition`'s output: `cim-partition` emits its own `cim.copy` back to a
+host buffer typed to match the original i32 accumulator, with no knowledge that this pass
+might requantize that value down to i8 first, so this pass retypes that downstream chain
+where it owns every value in it, and falls back to a width-preserving (still genuinely
+clamped) requantize where it doesn't — see `lib/Transforms/CIMLegalizePrecision.cpp`'s
+file header, and `test/Transforms/cim-legalize-precision.mlir`'s
+`narrows_through_a_locally_owned_copy_chain`/`falls_back_when_the_sink_is_not_owned` cases
+for both directions.
+
+`cim-insert-transfers` (Pass 5) inserts a `cim.copy` wherever a `cim.mvm`'s activation
+operand is not already `#cim.space<near>` (spec Sec. 3.4) and rewires the `mvm` to read the
+copy's result, then hoists that copy above an enclosing `scf.for` when the source is
+loop-invariant with respect to it — inserted once before the loop rather than once per
+iteration, and shared by every `mvm` inside that loop reading the exact same invariant
+source rather than duplicated per site. On today's real pipeline this pass has nothing to
+do: `cim-partition` already stages every activation into near space itself before this pass
+would ever see it — genuinely nothing left to fix here, unlike `cim-legalize-precision`'s
+own gap above — so it is tested on hand-written IR that manufactures the space mismatch
+`cim-partition`'s current output never produces (`test/Transforms/cim-insert-transfers.mlir`).
+`cim.copy` is a faithful byte-for-byte move,
+not a value-changing operation, so the numerical side of verification is an invariance
+check like `cim-schedule`'s: `test/mlir/insert_transfers_e2e_test.cpp` confirms running a
+module with and without the pass computes identical numbers, while
+`test/Transforms/cim-insert-transfers.mlir`'s structural checks are what actually catch a
+broken hoist — a mutation reverting the loop-invariance check produces correct numbers with
+redundant copies inside the loop, which the numerical suite alone would silently accept.
+
+`cim-lower-to-target` (Pass 7) is the pass that turns compiled IR into something that can
+actually run on (real or simulated) hardware rather than only inside this project's own
+interpreter: it converts `cim.device_open`/`cim.tile_alloc`/`cim.program`/`cim.mvm`/
+`cim.copy`/`cim.barrier`/`cim.requantize`/`cim.reduce_partial` into `func.call`s against
+`cimrt.h`'s real C ABI (`cim.requantize` against `cimrt_requantize`, which does the
+round-half-away-from-zero and signed-clamp arithmetic device-side; `cim.reduce_partial`
+against a new `cimrt_reduce_add`, which sums two device buffers elementwise with the same
+wrapping — not saturating — addition `Interpreter.cpp`'s own `runReducePartial` uses, an
+N-operand reduce becoming N-1 chained calls; a genuine, non-identity slice of a
+device-space buffer against a new `cimrt_copy_range`, a byte-range generalization of
+`cimrt_copy` the same way `cimrt_write`/`cimrt_read`'s own offset parameters generalize a
+whole-buffer transfer — none of these three ops reproduce their arithmetic a second time
+in generated IR, matching the discipline this pass follows everywhere), with every
+`cimrt_status` checked via `cf.assert` rather than ignored, so the result can go through
+MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and come out
+as a real binary. v0.1's scope now covers straight-line code PLUS one level of `scf.for`
+nesting — exactly the shape `cim-placement`'s own loop hoisting produces once a matmul's
+activation has more than one row (`cim-partition` implements the matrix-*vector* contract
+only, so a multi-row loop is always the caller's, never something it introduces itself).
+Every buffer this pass allocates while lowering a recognized loop's body — the activation
+stage's device buffer, `cim.mvm`'s result, a readback's host buffer — is created ONCE,
+immediately before the loop, and REUSED every iteration rather than realloc'd at the
+op's own (in-loop) position, which would otherwise leak one buffer's worth of memory on
+every iteration but the last; a buffer's matching free (a `cimrt_free`, or a real
+`memref.dealloc`) is, symmetrically, deferred to just after the loop whenever that
+specific buffer's own allocation was itself hoisted, since freeing the one shared, reused
+handle on whichever iteration the original free sat on would be a use-after-free for
+every later iteration. A cim op nested any deeper than that one level (a second `scf.for`,
+an `scf.if`, or a loop with loop-carried `iter_args`) is still refused with a diagnostic
+rather than mislowered, matching the same "refuse rather than guess" discipline as
+`cim-partition`'s own scope limits below (a higher-rank or non-unit-stride slice is
+refused the same way, for the same reason — `cimrt_copy_range` moves one contiguous byte
+range, not a real sub-buffer/gather concept). Closing both `cim.reduce_partial` and the
+non-identity slice in the same session is what finally lets a REAL multi-K-tile matmul
+reach `cimrt_mvm` through this pass end to end — `cim-partition` slices one shared staged
+activation buffer per K-tile, and both pieces were needed together before that could reach
+a real binary at all.
+
+Verified three ways: `test/Transforms/cim-lower-to-target.mlir`'s structural FileCheck
+suite covers every op, every `cim.copy` space combination, `cim.reduce_partial`'s N-1 call
+chaining and intermediate-buffer freeing, the subview materialization's byte range, the
+loop case's buffer hoisting and deferred frees (both a device handle's `cimrt_free` and a
+host buffer's `memref.dealloc` moved to just after the loop), and every refusal (including
+the loop-specific ones — loop-carried values, nesting two levels deep);
+`test/Transforms/cim-pipeline-multi-k-tile.mlir` runs cim-detect, cim-partition, and
+cim-lower-to-target (and, in one variant, all eight passes) on a real two-K-tile
+`linalg.matmul_transpose_b` and checks it reaches `cimrt_copy_range`/`cimrt_mvm`/
+`cimrt_reduce_add` with no `cim` ops left; and beyond that, a `cim.mvm`, a `cim.requantize`,
+a `cim.reduce_partial`, a genuine `cim-detect`/`cim-partition`/`cim-lower-to-target`-compiled
+multi-K-tile matmul, and — the newest, the loop case — a genuine multi-row matmul run
+through `cim-detect`/`cim-partition`/`cim-placement`/`cim-lower-to-target` were each taken
+all the way through the real conversion pipeline (the loop case needs `--lower-affine` and
+`--convert-scf-to-cf` too, ahead of `--convert-cf-to-llvm` specifically — a dynamic
+per-iteration `memref.subview` offset becomes an `affine.apply` no other pass here
+converts, and `cf.assert`'s own multi-block lowering must not run before `scf.for`'s
+single block has itself become real control flow), `mlir-translate`, `clang`, and linked
+against `runtime/libcimrt.a`, then actually **run** as native binaries — computing the
+correct result against the real (simulated) hardware backend, not the interpreter, with
+the `cim.requantize` case clamping a genuine out-of-range value (an 8-bit signed clamp can
+only hold `[-128, 127]`), the `cim.reduce_partial` case summing two partials (10 and 15) to
+a value (25) neither one is alone, the multi-K-tile case's all-ones 4x8 weight against
+activation `[1..8]` needing both K-tiles' contributions combined to reach 36 (10 or 26
+would mean one was silently dropped), and the loop case's three rows (identity weight,
+each row's first activation element distinct — 1, 5, 9) combining into one checksum (951)
+that only comes out right if all three iterations independently computed and *kept* their
+own correct value rather than clobbering or reusing a stale one — so a broken slice, a
+broken `cimrt_reduce_add`, or a broken buffer-hoist would be caught, not just well-shaped
+IR. Reproducible on demand as `test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`,
+default OFF since it needs `mlir-opt`/`mlir-translate`/`clang` and a linker the main suite
+has no business depending on to configure): ten binaries built from five sources (mvm,
+requantize, reduce_partial, multi-k-tile, loop) each differing only in a constant a
+`cf.assert` checks a real result against, run via `ctest -R real-target` — the correct
+ones must exit 0 and the wrong ones must genuinely crash, so a broken assertion that
+"always passes" would be caught, not just a broken one that never fires.
+
+`cim-partition`'s remaining scope limits (matrix-vector, output-major weights) are each
+refused with a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+A third limit, N and K needing to be exact multiples of the tile geometry, is closed:
+a ragged edge is zero-padded up to the next tile multiple (`memref.alloc` + `linalg.fill`
++ a `memref.copy` of the real data into the top-left corner) before tiling proceeds
+exactly as in the exact-multiple case, and the write-back crops each block back down to
+its real output rows so a padding row's all-zero result never reaches `%out`
+(`test/Transforms/cim-partition.mlir`'s `ragged_n_is_zero_padded`/`ragged_k_is_zero_padded`
+check the IR shape; `test/mlir/pipeline_e2e_test.cpp`'s `e2e_ragged_*` cases check the
+padding is numerically inert against the plain, unpadded reference). The interpreter
+gained `linalg.fill` execution to make that checkable — `cim-partition`'s zero-padding is
+its only source in this pipeline.
+
+`cimrt` (the C ABI everything above eventually calls through) went through a hardening
+pass: a use-after-free when a buffer outlived its device, an allocation failure that
+threw a C++ exception across the `extern "C"` boundary instead of returning
+`CIMRT_ERR_OOM`, misleading status codes, and a profiling window that never actually
+windowed anything are all fixed, each with a regression test that failed against the
+unfixed code first (`test/unit/cimrt_test.cpp`). The interpreter also gained a guard
+against sub-byte element types (`i1`/`i4`), which used to silently compute zero-byte
+allocations via `bitWidth / 8` truncating to zero.
 
 ## Quickstart
 
@@ -134,10 +334,12 @@ cmake -S . -B build-cov  -G Ninja -DCIM_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=De
 ```
 
 Coverage is gated at 85% line / 78% branch over `lib/Placement`, `lib/Target`,
-`lib/Interpreter` and `runtime/src` (currently 90.6% / 85.3%). `lib/Dialect` is
-mostly TableGen output and `lib/Transforms` is still five-eighths empty stubs,
-so both are reported and not gated — a threshold there would measure how many
-stubs exist rather than how well anything is tested.
+`lib/Interpreter` and `runtime/src` (currently 90.3% / 83.3%). `lib/Dialect` is
+mostly TableGen output, and `lib/Transforms` is exercised primarily through the
+FileCheck/lit suite rather than line-by-line unit tests (a pass is a rewrite
+over IR shapes, not a library of branches a unit test calls directly) — both
+are reported and not gated, since a line-coverage threshold would measure the
+wrong thing for either.
 
 ## Repository layout
 

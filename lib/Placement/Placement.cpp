@@ -3,7 +3,9 @@
 #include "cim/Placement/Placement.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cim {
 
@@ -266,6 +268,248 @@ bool validatePlacement(const PlacementProblem &problem,
     return fail("reported eviction count does not match the replayed schedule");
 
   return true;
+}
+
+SteadyStateResult computeSteadyStatePlacement(const SteadyStateProblem &problem) {
+  SteadyStateResult result;
+  if (problem.bodySequence.empty() || problem.numTiles == 0)
+    return result;
+  result.feasible = true;
+
+  // Occurrence count per distinct weight, plus first-use order kept
+  // separately: an unordered_map's own iteration order is not
+  // deterministic, and two weights used equally often must not have
+  // their pin/stream assignment depend on hash-table layout.
+  std::unordered_map<WeightId, uint64_t> occurrences;
+  std::vector<WeightId> firstUseOrder;
+  for (WeightId w : problem.bodySequence) {
+    auto [it, inserted] = occurrences.try_emplace(w, uint64_t{0});
+    ++it->second;
+    if (inserted)
+      firstUseOrder.push_back(w);
+  }
+  const size_t distinctWeights = firstUseOrder.size();
+
+  if (distinctWeights <= problem.numTiles) {
+    // Fits entirely: every distinct weight is pinned, nothing streams --
+    // the mm-fit case. This re-derives, deliberately, exactly what the
+    // pass's own accidental hoisting already reached correctly for this
+    // case; the point of this function is the SPILL case below, not a
+    // new claim here.
+    //
+    // Each pinned weight's OWN FIRST occurrence in the body is a real
+    // ProgramIntoFree, not a Reuse: the caller's rewrite needs an actual
+    // surviving cim.program to hoist for each pinned weight (there is
+    // nothing to "reuse" from if every occurrence were labeled Reuse --
+    // the op that would have produced the resident value would never
+    // exist). Only a weight repeated later in the SAME body reuses that
+    // one real install; programsPerIteration stays 0 regardless, since a
+    // pinned tile's install is hoisted and never recurs per iteration
+    // (see the comment on SteadyStateResult::programsPerIteration).
+    std::unordered_map<WeightId, TileId> pinnedTile;
+    for (size_t i = 0; i < firstUseOrder.size(); ++i)
+      pinnedTile[firstUseOrder[i]] = static_cast<TileId>(i);
+    result.pinnedTileCount = static_cast<uint32_t>(distinctWeights);
+    result.programsPerIteration = 0;
+    result.body.reserve(problem.bodySequence.size());
+    std::unordered_set<WeightId> installed;
+    for (WeightId w : problem.bodySequence) {
+      PlacementAction a;
+      a.step = result.body.size();
+      a.weight = w;
+      a.tile = pinnedTile.at(w);
+      a.kind = installed.insert(w).second ? ActionKind::ProgramIntoFree
+                                          : ActionKind::Reuse;
+      result.body.push_back(a);
+    }
+    return result;
+  }
+
+  // Spill: pin the (numTiles - 1) weights used most often -- ties broken
+  // by first-use order, so the choice is deterministic -- and stream
+  // everything else through the one tile deliberately left unpinned.
+  std::vector<WeightId> byOccurrence = firstUseOrder;
+  std::stable_sort(byOccurrence.begin(), byOccurrence.end(),
+                    [&](WeightId a, WeightId b) {
+                      return occurrences.at(a) > occurrences.at(b);
+                    });
+  const uint32_t pinnedCount = problem.numTiles - 1;
+  std::unordered_map<WeightId, TileId> pinnedTile;
+  for (uint32_t i = 0; i < pinnedCount; ++i)
+    pinnedTile[byOccurrence[i]] = static_cast<TileId>(i);
+  const TileId streamTile = static_cast<TileId>(pinnedCount);
+  result.pinnedTileCount = pinnedCount;
+
+  // The streamed subsequence: bodySequence with every pinned occurrence
+  // removed, relative order kept. Solved via the ordinary engine with
+  // numTiles=1 rather than a second, hand-written scheme -- with a
+  // single tile there is never a choice of victim (selectVictim always
+  // has exactly one candidate), so which EvictionPolicy is named here is
+  // immaterial; Belady is used only because it is the one every other
+  // caller already trusts.
+  std::vector<WeightId> streamed;
+  streamed.reserve(problem.bodySequence.size());
+  for (WeightId w : problem.bodySequence)
+    if (!pinnedTile.count(w))
+      streamed.push_back(w);
+
+  std::vector<PlacementAction> streamActions;
+  if (!streamed.empty()) {
+    PlacementProblem single;
+    single.numTiles = 1;
+    single.useSequence = streamed;
+    const PlacementResult solved = computePlacement(single, EvictionPolicy::Belady);
+    streamActions = solved.actions;
+  }
+
+  result.body.reserve(problem.bodySequence.size());
+  size_t streamIndex = 0;
+  // As in the fits-entirely branch above: a pinned weight's own first
+  // occurrence in the body is the real, surviving ProgramIntoFree the
+  // caller hoists; only a LATER repeat of that same weight within this
+  // body reuses it. programsPerIteration counts only the streamed
+  // tile's own programs -- a pinned tile's install, whatever its kind
+  // label, is hoisted and never recurs per iteration.
+  std::unordered_set<WeightId> installedPinned;
+  for (WeightId w : problem.bodySequence) {
+    PlacementAction a;
+    a.step = result.body.size();
+    a.weight = w;
+    auto pinnedIt = pinnedTile.find(w);
+    if (pinnedIt != pinnedTile.end()) {
+      a.tile = pinnedIt->second;
+      a.kind = installedPinned.insert(w).second ? ActionKind::ProgramIntoFree
+                                                : ActionKind::Reuse;
+    } else {
+      const PlacementAction &src = streamActions[streamIndex++];
+      a.tile = streamTile;
+      a.kind = src.kind;
+      // The Free/Eviction distinction is bookkeeping this function's own
+      // caller never acts on differently (see the header comment on
+      // SteadyStateResult::body) -- carried through anyway so a
+      // validator working only from `body` has enough information to
+      // check it, without needing to re-derive it.
+      if (src.kind == ActionKind::ProgramWithEviction)
+        a.evicted = src.evicted;
+      if (src.kind != ActionKind::Reuse)
+        ++result.programsPerIteration;
+    }
+    result.body.push_back(a);
+  }
+
+  return result;
+}
+
+bool validateSteadyStatePlacement(const SteadyStateProblem &problem,
+                                   const SteadyStateResult &result,
+                                   std::string *error) {
+  auto fail = [&](const std::string &msg) {
+    if (error)
+      *error = msg;
+    return false;
+  };
+
+  if (!result.feasible)
+    return fail("steady-state result is not feasible");
+  if (result.body.size() != problem.bodySequence.size())
+    return fail("steady-state body length does not match the use sequence");
+  for (size_t i = 0; i < result.body.size(); ++i)
+    if (result.body[i].weight != problem.bodySequence[i])
+      return fail("steady-state body step " + std::to_string(i) +
+                  " names a different weight than the use sequence");
+
+  // The stream tile's "continuation" actions: what a SECOND (and every
+  // later) repetition's stream-tile steps look like, now that the tile
+  // is no longer empty. Recomputed here rather than stored on
+  // SteadyStateResult -- the real IR rewrite in
+  // lib/Transforms/CIMPlacement.cpp never needs it, since it treats
+  // ProgramIntoFree and ProgramWithEviction identically; only this proof
+  // does, to satisfy validatePlacement's own bookkeeping.
+  std::vector<WeightId> streamed;
+  for (const PlacementAction &a : result.body)
+    if (a.tile >= result.pinnedTileCount)
+      streamed.push_back(a.weight);
+
+  std::vector<PlacementAction> continuation;
+  if (!streamed.empty()) {
+    PlacementProblem doubled;
+    doubled.numTiles = 1;
+    doubled.useSequence = streamed;
+    doubled.useSequence.insert(doubled.useSequence.end(), streamed.begin(),
+                               streamed.end());
+    const PlacementResult solved =
+        computePlacement(doubled, EvictionPolicy::Belady);
+    continuation.assign(solved.actions.begin() +
+                            static_cast<std::ptrdiff_t>(streamed.size()),
+                        solved.actions.end());
+    // The internal solve above used a single tile numbered 0 (it knows
+    // nothing about the real target's tile count); remap every action to
+    // the ACTUAL physical stream tile before this is used in a real,
+    // full-width replay below -- `computeSteadyStatePlacement` performs
+    // the identical remap for `result.body` itself, for the same reason.
+    for (PlacementAction &a : continuation)
+      a.tile = result.pinnedTileCount;
+  }
+
+  PlacementProblem flat;
+  flat.numTiles = problem.numTiles;
+  flat.name = problem.name;
+  PlacementResult flatResult;
+  flatResult.policy = EvictionPolicy::Belady;
+
+  auto append = [&](WeightId w, const PlacementAction &action) {
+    PlacementAction a = action;
+    a.step = flat.useSequence.size();
+    a.weight = w;
+    flat.useSequence.push_back(w);
+    flatResult.actions.push_back(a);
+    if (a.kind == ActionKind::Reuse) {
+      ++flatResult.reuses;
+    } else {
+      ++flatResult.programs;
+      if (a.kind == ActionKind::ProgramWithEviction)
+        ++flatResult.evictions;
+    }
+  };
+
+  // No separate bootstrap pass is needed: computeSteadyStatePlacement
+  // already guarantees that a pinned weight's FIRST occurrence in `body`
+  // is a real ActionKind::ProgramIntoFree (not a Reuse) at whatever step
+  // it naturally falls, and every later occurrence of that same weight is
+  // Reuse -- so replaying `body` verbatim once already installs every
+  // pinned tile in place, in the correct order, against an initially
+  // empty device. That is exactly repetition 0 below.
+  //
+  // Three repetitions of `body`: repetition 0 uses `body`'s own actions
+  // unchanged, which both installs every pinned tile (its first
+  // ProgramIntoFree) and streams the first pass through the stream tile
+  // (also starting empty). Repetitions 1 and 2 force EVERY pinned-tile
+  // step to Reuse regardless of what `body` itself recorded there --  by
+  // then the tile is permanently occupied by that same weight forever, so
+  // replaying body's own first-occurrence ProgramIntoFree again would
+  // fail validatePlacement's own free-tile check -- and use
+  // `continuation`'s recomputed labels for the stream tile, since it is
+  // no longer empty either by the second pass.
+  for (int rep = 0; rep < 3; ++rep) {
+    size_t streamIndex = 0;
+    for (const PlacementAction &a : result.body) {
+      if (a.tile < result.pinnedTileCount) {
+        if (rep == 0) {
+          append(a.weight, a);
+        } else {
+          PlacementAction reuse = a;
+          reuse.kind = ActionKind::Reuse;
+          append(a.weight, reuse);
+        }
+      } else {
+        const PlacementAction &src = (rep == 0) ? a : continuation[streamIndex];
+        append(a.weight, src);
+        ++streamIndex;
+      }
+    }
+  }
+
+  return validatePlacement(flat, flatResult, error);
 }
 
 } // namespace cim

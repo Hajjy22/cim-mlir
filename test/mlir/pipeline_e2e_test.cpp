@@ -37,6 +37,9 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -173,8 +176,25 @@ struct RunResult {
 /// detect+partition+placement. Running the *same* source both ways is what
 /// makes the invariance test below possible: placement is an optimization,
 /// so any difference in the numbers is a bug in placement by definition.
+///
+/// `withPrecisionPipeline` extends the chain with cim-schedule,
+/// cim-insert-transfers and cim-legalize-precision -- passes 4 through 6 --
+/// on top of whatever detect/partition/placement already ran. This is the
+/// composition-hardening regression test (Part 4 of the plan that closed
+/// blockers in cim-legalize-precision and cim-lower-to-target): before that
+/// work, running cim-legalize-precision on real cim-partition output failed
+/// with "copy must not change element type" (see
+/// lib/Transforms/CIMLegalizePrecision.cpp's file header) -- this is that
+/// same composition, but checked against the interpreter's actual numbers
+/// rather than only structurally (test/Transforms/cim-pipeline-full.mlir is
+/// the structural half). cim-schedule and cim-insert-transfers are true
+/// no-ops on real cim-partition output (see their own file headers) and are
+/// included anyway because a regression test for "the chain composes"
+/// should run the actual chain, not a shortcut that happens to reach the
+/// same place.
 RunResult compileSource(const std::string &source, bool withPlacement,
-                        std::string *error) {
+                        std::string *error,
+                        bool withPrecisionPipeline = false) {
   RunResult result;
 
   DialectRegistry registry;
@@ -207,6 +227,17 @@ RunResult compileSource(const std::string &source, bool withPlacement,
       return result;
     }
     pm.addPass(std::move(placement));
+  }
+
+  if (withPrecisionPipeline) {
+    pm.addPass(cim::createCIMSchedulePass());
+    pm.addPass(cim::createCIMInsertTransfersPass());
+    auto legalize = cim::createCIMLegalizePrecisionPass();
+    if (failed(legalize->initializeOptions("target-yaml=" + tinyTarget()))) {
+      *error = "failed to set cim-legalize-precision options";
+      return result;
+    }
+    pm.addPass(std::move(legalize));
   }
 
   if (failed(pm.run(*module))) {
@@ -334,6 +365,58 @@ void checkCase(const char *label, const std::vector<int8_t> &w,
   }
 }
 
+/// Independent reference for cim.requantize's arithmetic -- the same
+/// formula legalize_precision_e2e_test.cpp checks the interpreter against
+/// directly, recomputed here from first principles (not called from that
+/// file) so a bug shared between the two would not be invisible to both.
+/// round-half-away-from-zero, then clamp to the signed range effectiveBits
+/// can hold (Interpreter.cpp's runRequantize's own contract).
+int32_t expectedRequantize(int32_t value, uint32_t effectiveBits) {
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
+  int64_t quantized = std::llround(static_cast<double>(value)); // scale=1.0
+  quantized = std::clamp(quantized, clampMin, clampMax);
+  return static_cast<int32_t>(quantized);
+}
+
+/// Run one case through the FULL composed pipeline (detect, partition,
+/// placement, schedule, insert-transfers, legalize-precision) and compare
+/// against the matmul reference put through expectedRequantize element-wise
+/// -- tiny-4x4.yaml declares output_effective_bits: 8, matching the target
+/// this pipeline runs against.
+void checkPrecisionCase(const char *label, const std::vector<int8_t> &w,
+                        const std::vector<int8_t> &act, int n, int k) {
+  std::string error;
+  const RunResult result = compileSource(buildModule(w, act, n, k),
+                                         /*withPlacement=*/true, &error,
+                                         /*withPrecisionPipeline=*/true);
+  if (!error.empty()) {
+    CIM_FAIL(std::string(label) + ": " + error);
+    return;
+  }
+  if (result.prints.empty()) {
+    CIM_FAIL(std::string(label) + ": interpreter printed nothing");
+    return;
+  }
+  const std::vector<int32_t> &got = result.prints.front();
+  const std::vector<int32_t> raw = reference(w, act, n, k);
+  if (got.size() != raw.size()) {
+    CIM_FAIL(std::string(label) + ": expected " + std::to_string(raw.size()) +
+             " outputs, got " + std::to_string(got.size()));
+    return;
+  }
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const int32_t want = expectedRequantize(raw[i], /*effectiveBits=*/8);
+    if (got[i] != want) {
+      CIM_FAIL(std::string(label) + ": output[" + std::to_string(i) +
+               "] = " + std::to_string(got[i]) + ", requantized reference says " +
+               std::to_string(want) + " (raw matmul value was " +
+               std::to_string(raw[i]) + ")");
+      return;
+    }
+  }
+}
+
 std::vector<int8_t> sequential(int count, int start, int step) {
   std::vector<int8_t> v;
   v.reserve(count);
@@ -383,6 +466,25 @@ CIM_TEST(e2e_zero_weights_produce_zero) {
   checkCase("zeros", w, act, 4, 4);
 }
 
+CIM_TEST(e2e_full_pipeline_through_precision_legalization_composes) {
+  // Part 4's numerical regression test for Parts 2 and 3 of the
+  // composition-hardening work: detect, partition, placement, schedule,
+  // insert-transfers and legalize-precision chained together and actually
+  // EXECUTED, not just structurally checked (that is
+  // test/Transforms/cim-pipeline-full.mlir's job). Weights and activation
+  // are chosen so the raw dot product overflows an 8-bit clamp for two of
+  // the four outputs (40000 and -40000, both far outside [-128, 127]) and
+  // stays within it for the other two -- proving cim.requantize's clamp is
+  // doing real work inside a real composed pipeline, not just passing
+  // values through unchanged.
+  const std::vector<int8_t> w = {100, 100, 100, 100,
+                                  -100, -100, -100, -100,
+                                  1, 0, 0, 0,
+                                  0, 0, 0, 1};
+  const std::vector<int8_t> act = {100, 100, 100, 100};
+  checkPrecisionCase("precision pipeline", w, act, 4, 4);
+}
+
 //===----------------------------------------------------------------------===//
 // Multiple blocks: this is where tiling can go wrong
 //===----------------------------------------------------------------------===//
@@ -429,6 +531,48 @@ CIM_TEST(e2e_many_blocks_stress_reuse_in_both_dimensions) {
   const std::vector<int8_t> w = sequential(16 * 8, -64, 1);
   const std::vector<int8_t> act = sequential(8, -4, 1);
   checkCase("stress reuse", w, act, 16, 8);
+}
+
+//===----------------------------------------------------------------------===//
+// Ragged shapes: N and/or K not exact multiples of the tile geometry.
+// cim-partition zero-pads up to the next tile multiple (test/Transforms/
+// cim-partition.mlir's ragged_*_is_zero_padded cases check the IR shape);
+// these cases check that the padding is numerically inert and the
+// write-back crop lands on exactly the real rows, using the plain
+// (unpadded) reference as ground truth -- it has no idea padding
+// happened, so any leak of a padding row/column into a real output
+// changes the comparison.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(e2e_ragged_n_is_zero_padded_and_cropped) {
+  // N = 6 over 4-row tiles: paddedN = 8, so the second block's tile
+  // computes a full 4-row result but only 2 of those rows (6 - 4) are
+  // real output. Deliberately nonzero, non-symmetric weights so that a
+  // write-back that copied all 4 rows instead of cropping to 2 -- either
+  // overrunning %out or overwriting real memory just past it -- would be
+  // caught, not masked by a padding row that happens to be zero anyway.
+  const std::vector<int8_t> w = sequential(6 * 4, -12, 1);
+  const std::vector<int8_t> act = {3, -5, 7, -11};
+  checkCase("ragged N", w, act, 6, 4);
+}
+
+CIM_TEST(e2e_ragged_k_is_zero_padded) {
+  // K = 6 over 4-column tiles: paddedK = 8, so both the weight matrix's
+  // extra columns and the staged activation are zero-padded before the
+  // two K-blocks' partial sums are reduced. Getting the pad value wrong
+  // (anything but zero) would corrupt every output, not just an edge one.
+  const std::vector<int8_t> w = sequential(4 * 6, -10, 1);
+  const std::vector<int8_t> act = sequential(6, -3, 2);
+  checkCase("ragged K", w, act, 4, 6);
+}
+
+CIM_TEST(e2e_ragged_in_both_dimensions) {
+  // N = 5, K = 7: both dimensions ragged at once, padding up to 8x8 (a
+  // 2x2 grid of tile blocks) -- weight padding, activation padding, and
+  // the cropped write-back all exercised together in the same matmul.
+  const std::vector<int8_t> w = sequential(5 * 7, -17, 1);
+  const std::vector<int8_t> act = sequential(7, 4, -3);
+  checkCase("ragged N and K", w, act, 5, 7);
 }
 
 //===----------------------------------------------------------------------===//
@@ -605,6 +749,128 @@ void checkLoopValues(const char *label, const RunResult &result,
   if (result.prints[0] != want)
     CIM_FAIL(std::string(label) +
              ": loop output disagrees with the per-iteration reference");
+}
+
+/// Six matmuls per iteration against four weight globals A, B, C, D, used
+/// in the order A, B, C, A, A, D -- A three times, the others once each.
+/// This is the numerical-invariance counterpart to
+/// test/Transforms/cim-placement-deliberate-hoist.mlir's hand-written IR:
+/// the same intra-body repetition shape where the ordinary per-block
+/// Belady solve's own tile-0-first eviction tie-break hoists nothing (see
+/// decision 4 in lib/Transforms/CIMPlacement.cpp's file header), and
+/// decision 5's deliberate steady-state schedule is what actually reaches
+/// the achievable bound -- but built through the real
+/// cim-detect/cim-partition pipeline rather than hand-rolled cim ops. Each
+/// matmul is its own isolated n x k block (cim-partition sees no tiling to
+/// do), fed through six separate per-position activation/output buffers so
+/// each of the six calls can be checked against its own reference
+/// independently, the same way buildTwoMatmulModule's two calls are.
+std::string buildLoopRepeatedWeightModule(
+    const std::array<std::vector<int8_t>, 4> &weights,
+    const std::array<std::vector<std::vector<int8_t>>, 6> &acts, int n,
+    int k) {
+  static const char *const kWeightNames[4] = {"wa", "wb", "wc", "wd"};
+  static const int kOrder[6] = {0, 1, 2, 0, 0, 3};
+  const int iters = static_cast<int>(acts[0].size());
+
+  std::ostringstream os;
+  for (int w = 0; w < 4; ++w) {
+    os << "memref.global \"private\" constant @" << kWeightNames[w]
+       << " : memref<" << n << "x" << k << "xi8> = dense<[";
+    for (int i = 0; i < n; ++i) {
+      os << (i ? ", [" : "[");
+      for (int j = 0; j < k; ++j)
+        os << (j ? ", " : "") << static_cast<int>(weights[static_cast<size_t>(w)][static_cast<size_t>(i * k + j)]);
+      os << "]";
+    }
+    os << "]>\n";
+  }
+  for (int p = 0; p < 6; ++p) {
+    os << "memref.global \"private\" constant @acts" << p << " : memref<"
+       << iters << "x" << k << "xi8> = dense<[";
+    for (int r = 0; r < iters; ++r)
+      os << (r ? ", [" : "[")
+         << denseList(acts[static_cast<size_t>(p)][static_cast<size_t>(r)])
+         << "]";
+    os << "]>\n";
+  }
+
+  os << "func.func private @cim_print_i32(memref<*xi32>)\n";
+  os << "func.func @main() {\n";
+  for (int w = 0; w < 4; ++w)
+    os << "  %" << kWeightNames[w] << " = memref.get_global @"
+       << kWeightNames[w] << " : memref<" << n << "x" << k << "xi8>\n";
+  for (int p = 0; p < 6; ++p) {
+    os << "  %acts" << p << " = memref.get_global @acts" << p << " : memref<"
+       << iters << "x" << k << "xi8>\n";
+    os << "  %out" << p << " = memref.alloc() : memref<" << iters << "x" << n
+       << "xi32>\n";
+  }
+  os << "  %c0 = arith.constant 0 : index\n";
+  os << "  %c1 = arith.constant 1 : index\n";
+  os << "  %cN = arith.constant " << iters << " : index\n";
+  os << "  scf.for %i = %c0 to %cN step %c1 {\n";
+  for (int p = 0; p < 6; ++p) {
+    const char *wn = kWeightNames[kOrder[p]];
+    os << "    %actRow" << p << " = memref.subview %acts" << p
+       << "[%i, 0] [1, " << k << "] [1, 1] : memref<" << iters << "x" << k
+       << "xi8> to memref<1x" << k << "xi8, strided<[" << k
+       << ", 1], offset: ?>>\n";
+    os << "    %actLocal" << p << " = memref.alloc() : memref<1x" << k
+       << "xi8>\n";
+    os << "    memref.copy %actRow" << p << ", %actLocal" << p
+       << " : memref<1x" << k << "xi8, strided<[" << k
+       << ", 1], offset: ?>> to memref<1x" << k << "xi8>\n";
+    os << "    %outRow" << p << " = memref.subview %out" << p << "[%i, 0] [1, "
+       << n << "] [1, 1] : memref<" << iters << "x" << n
+       << "xi32> to memref<1x" << n << "xi32, strided<[" << n
+       << ", 1], offset: ?>>\n";
+    os << "    linalg.matmul_transpose_b ins(%actLocal" << p << ", %" << wn
+       << " : memref<1x" << k << "xi8>, memref<" << n << "x" << k
+       << "xi8>) outs(%outRow" << p << " : memref<1x" << n
+       << "xi32, strided<[" << n << ", 1], offset: ?>>)\n";
+    os << "    memref.dealloc %actLocal" << p << " : memref<1x" << k
+       << "xi8>\n";
+  }
+  os << "  }\n";
+  for (int p = 0; p < 6; ++p) {
+    os << "  %cast" << p << " = memref.cast %out" << p << " : memref<"
+       << iters << "x" << n << "xi32> to memref<*xi32>\n";
+    os << "  func.call @cim_print_i32(%cast" << p
+       << ") : (memref<*xi32>) -> ()\n";
+  }
+  for (int p = 0; p < 6; ++p)
+    os << "  memref.dealloc %out" << p << " : memref<" << iters << "x" << n
+       << "xi32>\n";
+  os << "  return\n}\n";
+  return os.str();
+}
+
+/// buildLoopRepeatedWeightModule prints its six per-position buffers, in
+/// position order, once each, after the loop.
+void checkRepeatedWeightLoopValues(
+    const char *label, const RunResult &result,
+    const std::array<std::vector<int8_t>, 4> &weights,
+    const std::array<std::vector<std::vector<int8_t>>, 6> &acts, int n,
+    int k) {
+  static const int kOrder[6] = {0, 1, 2, 0, 0, 3};
+  if (result.prints.size() != 6) {
+    CIM_FAIL(std::string(label) + ": expected 6 printed buffers (one per "
+             "matmul position), got " +
+             std::to_string(result.prints.size()));
+    return;
+  }
+  for (int p = 0; p < 6; ++p) {
+    std::vector<int32_t> want;
+    for (const std::vector<int8_t> &act : acts[static_cast<size_t>(p)]) {
+      const std::vector<int32_t> row =
+          reference(weights[static_cast<size_t>(kOrder[p])], act, n, k);
+      want.insert(want.end(), row.begin(), row.end());
+    }
+    if (result.prints[static_cast<size_t>(p)] != want)
+      CIM_FAIL(std::string(label) + ": position " + std::to_string(p) +
+               " disagrees with its own per-iteration reference");
+  }
 }
 
 } // namespace
@@ -907,4 +1173,40 @@ CIM_TEST(placement_leaves_a_zero_trip_count_loop_alone) {
   if (!placed.prints.empty())
     for (int32_t value : placed.prints.front())
       CIM_EXPECT_EQ(value, 0);
+}
+
+CIM_TEST(placement_never_changes_values_with_a_weight_repeated_in_one_body) {
+  // The numerical-invariance counterpart to
+  // test/Transforms/cim-placement-deliberate-hoist.mlir: the same
+  // [A, B, C, A, A, D] use sequence per iteration (A used three times, B/C/D
+  // once each), built through the real cim-detect/cim-partition pipeline
+  // rather than hand-written cim ops. runBothWays already requires the
+  // plain and placed prints to agree byte-for-byte; this additionally pins
+  // both of them to an independent C++ reference, so a bug that moved both
+  // pipelines to the same WRONG answer would still be caught.
+  std::array<std::vector<int8_t>, 4> weights = {
+      sequential(4 * 4, -8, 1), sequential(4 * 4, 1, 1),
+      sequential(4 * 4, -16, 2), sequential(4 * 4, 3, -1)};
+  const int iters = 3;
+  std::array<std::vector<std::vector<int8_t>>, 6> acts;
+  for (int p = 0; p < 6; ++p)
+    for (int i = 0; i < iters; ++i)
+      acts[static_cast<size_t>(p)].push_back(sequential(4, p - 3 * i, 1));
+
+  const auto [plain, placed] = runBothWays(
+      "repeated-weight-loop", buildLoopRepeatedWeightModule(weights, acts, 4, 4));
+  if (plain.programs == 0)
+    return;
+
+  // 6 cim.program ops textually per iteration either way -- the loop body
+  // does not multiply them in the IR, and which of them survive placement
+  // (and whether it is the ordinary per-block solve or decision 5's
+  // deliberate steady-state schedule that placeBlock's own cost comparison
+  // picks) is test/Transforms/cim-placement-deliberate-hoist.mlir's job,
+  // not this test's. This test's only claim is that whatever placement
+  // does to program count, the six computed matmul results never move.
+  checkRepeatedWeightLoopValues("repeated-weight-loop", plain, weights, acts,
+                                4, 4);
+  checkRepeatedWeightLoopValues("repeated-weight-loop (placed)", placed,
+                                weights, acts, 4, 4);
 }

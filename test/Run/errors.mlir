@@ -11,6 +11,8 @@
 // RUN: not cim-run --target-yaml=%S/no-such-target.yaml --entry=opens_a_device %s 2>&1 \
 // RUN:   | FileCheck --check-prefix=BAD-TARGET %s
 // RUN: not cim-run %s 2>&1 | FileCheck --check-prefix=NO-TARGET %s
+// RUN: not cim-run --target-yaml=%S/../targets/tiny-4x4.yaml --entry=sub_byte_alloc %s 2>&1 \
+// RUN:   | FileCheck --check-prefix=SUB-BYTE %s
 
 // The interpreter's refusals are load-bearing. Its whole justification is
 // that it never produces a plausible number it cannot stand behind, so every
@@ -69,6 +71,16 @@ func.func @opens_a_device() {
   return
 }
 
+// i4 is an accepted weight_dtype in the target schema (test/python/schema.py
+// generates it), so a sub-byte element type reaching the interpreter is
+// in-domain, not hypothetical. bitWidth / 8 truncates to 0 for i4 -- a
+// zero-byte allocation with no diagnostic -- unless runAlloc refuses it
+// first.
+func.func @sub_byte_alloc() {
+  %m = memref.alloc() : memref<4xi4>
+  return
+}
+
 // NO-ENTRY: no such entry function: nope
 // ARGS: zero-argument entry functions
 // EXTERNAL: entry function has no body
@@ -76,3 +88,4 @@ func.func @opens_a_device() {
 // ITER-ARGS: loop-carried values
 // BAD-TARGET: cimrt_open
 // NO-TARGET: --target-yaml is required
+// SUB-BYTE: narrower than a byte

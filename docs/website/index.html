@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  cim-mlir architecture reference.
+
+  A committed file, not a generated build artifact: open it directly in a
+  browser (file://, or after cloning the repo) -- there is no build step
+  and no external asset. Kept beside docs/roadmap.md, docs/abstraction.md,
+  docs/target-format.md and docs/dialect.md as a fourth, reader-facing
+  entry point into the same material; those files stay the source of
+  record when they disagree with anything stated here.
+
+  Update in place as features land, the same way docs/roadmap.md is kept
+  current -- this is not a snapshot to regenerate, it is maintained.
+-->
+<title>cim-mlir — architecture reference</title>
+
+<style>
+  /* ---------- tokens: complete light palette on bare :root ---------- */
+  :root {
+    --paper:      #fbfbfc;
+    --panel:      #f2f3f6;
+    --ink:        #14181f;
+    --muted:      #5c6572;
+    --rule:       #dde1e7;
+    --rule-soft:  #e9ecf0;
+    --accent:     #2f4b7c;
+    --accent-dim: #64789f;
+    --limit:      #8a5d12;
+    --limit-bg:   #f7f0e2;
+    --ok:         #2c5f4a;
+    --code-bg:    #eef0f4;
+
+    --sans: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --serif: "Iowan Old Style", Charter, Georgia, "Times New Roman", serif;
+  }
+  /* system-dark (nothing stamped) — tokens only, and an explicit light choice still wins */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #101319;
+      --panel:      #171b23;
+      --ink:        #e4e7ec;
+      --muted:      #99a2b0;
+      --rule:       #2a303a;
+      --rule-soft:  #212630;
+      --accent:     #8fb0e0;
+      --accent-dim: #6b86b0;
+      --limit:      #d9a63f;
+      --limit-bg:   #241d0e;
+      --ok:         #7fc0a4;
+      --code-bg:    #1a1f28;
+    }
+  }
+  /* explicit dark choice wins over a light OS */
+  :root[data-theme="dark"] {
+    --paper:      #101319;
+    --panel:      #171b23;
+    --ink:        #e4e7ec;
+    --muted:      #99a2b0;
+    --rule:       #2a303a;
+    --rule-soft:  #212630;
+    --accent:     #8fb0e0;
+    --accent-dim: #6b86b0;
+    --limit:      #d9a63f;
+    --limit-bg:   #241d0e;
+    --ok:         #7fc0a4;
+    --code-bg:    #1a1f28;
+  }
+
+  /* ---------- base ---------- */
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 24px 120px;
+  }
+  main { min-width: 0; max-width: 68ch; }
+
+  /* ---------- masthead ---------- */
+  header.masthead {
+    padding: 72px 0 34px;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 8px;
+    max-width: 68ch;
+  }
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--sans);
+    font-size: clamp(28px, 4.2vw, 40px);
+    font-weight: 600;
+    letter-spacing: -.02em;
+    line-height: 1.12;
+    margin: 0 0 16px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 19px;
+    color: var(--muted);
+    margin: 0;
+    text-wrap: pretty;
+  }
+
+  /* ---------- sections ---------- */
+  section { padding-top: 52px; scroll-margin-top: 20px; }
+  h2 {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 22px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+  }
+  h3 {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    margin: 34px 0 10px;
+    color: var(--ink);
+  }
+  p { margin: 0 0 18px; text-wrap: pretty; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, .toc a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  strong { font-weight: 600; }
+
+  code {
+    font-family: var(--sans);
+    font-size: .86em;
+    background: var(--code-bg);
+    padding: .1em .34em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.6;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--accent-dim);
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 0 0 18px;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  ul, ol { margin: 0 0 18px; padding-left: 22px; }
+  li { margin-bottom: 8px; }
+
+  /* ---------- tables ---------- */
+  .scroller { overflow-x: auto; margin: 0 0 22px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 460px;
+    font-size: 14.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    font-family: var(--sans);
+    font-size: 11px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-align: left;
+    font-weight: 600;
+    padding: 0 14px 8px 0;
+    border-bottom: 1px solid var(--ink);
+    vertical-align: bottom;
+  }
+  td {
+    padding: 10px 14px 10px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  td:last-child, th:last-child { padding-right: 0; }
+
+  /* ---------- pass list (a real sequence, so it is numbered) ---------- */
+  .passes { list-style: none; padding: 0; margin: 0; counter-reset: pass; }
+  .passes li {
+    display: grid;
+    grid-template-columns: 30px 1fr;
+    gap: 0 14px;
+    padding: 15px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    margin: 0;
+  }
+  .passes li::before {
+    counter-increment: pass;
+    content: counter(pass);
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--muted);
+    padding-top: 3px;
+    font-variant-numeric: tabular-nums;
+  }
+  .pname { font-family: var(--sans); font-size: 14px; font-weight: 600; }
+  .pbody { font-size: 15.5px; margin: 5px 0 0; color: var(--ink); }
+  .prefuse {
+    font-size: 14px;
+    margin: 7px 0 0;
+    color: var(--limit);
+    font-family: var(--sans);
+    line-height: 1.5;
+  }
+  .prefuse b { font-weight: 600; letter-spacing: .05em; text-transform: uppercase; font-size: 10.5px; }
+
+  /* ---------- op reference ---------- */
+  .op { padding: 16px 0; border-bottom: 1px solid var(--rule-soft); }
+  .op h4 {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    color: var(--ink);
+  }
+  .op p { font-size: 15.5px; margin: 0 0 10px; }
+  .op pre { margin-bottom: 0; font-size: 12.5px; }
+
+  /* ---------- callout: limits ---------- */
+  .limit {
+    background: var(--limit-bg);
+    border-left: 2px solid var(--limit);
+    padding: 14px 16px;
+    margin: 0 0 22px;
+    font-size: 15.5px;
+  }
+  .limit p:last-child { margin-bottom: 0; }
+  .limit .tag {
+    font-family: var(--sans);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--limit);
+    display: block;
+    margin-bottom: 7px;
+    font-weight: 600;
+  }
+
+  /* ---------- status pills ---------- */
+  .pill {
+    font-family: var(--sans);
+    font-size: 10.5px;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .pill.works { color: var(--ok); }
+  .pill.partial { color: var(--limit); }
+  .pill.none { color: var(--muted); }
+
+  /* ---------- figures ---------- */
+  /* diagrams are allowed past the text measure — they read better wide */
+  figure { margin: 26px 0 24px; }
+  figure .scroller { margin-bottom: 0; }
+  @media (min-width: 780px) {
+    figure { width: calc(100% + 72px); margin-right: -72px; }
+  }
+  svg { display: block; }
+  svg text { font-family: var(--sans); fill: var(--ink); }
+  svg .lbl { font-size: 11px; }
+  svg .lbl-sm { font-size: 9.5px; fill: var(--muted); }
+  svg .lbl-mono { font-size: 10.5px; fill: var(--accent); }
+  svg .box { fill: var(--panel); stroke: var(--accent-dim); stroke-width: 1; }
+  svg .box-solid { fill: var(--accent); stroke: none; }
+  svg .box-limit { fill: var(--limit-bg); stroke: var(--limit); stroke-width: 1; }
+  svg .ln { stroke: var(--accent-dim); stroke-width: 1; fill: none; }
+  svg .ln-soft { stroke: var(--rule); stroke-width: 1; fill: none; }
+  figcaption {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 12px;
+    line-height: 1.55;
+    max-width: 62ch;
+  }
+
+  /* ---------- table of contents rail ---------- */
+  .toc { display: none; }
+  @media (min-width: 1080px) {
+    .wrap { grid-template-columns: 178px 1fr; column-gap: 56px; }
+    header.masthead { grid-column: 1 / -1; }
+    .toc {
+      display: block;
+      position: sticky;
+      top: 28px;
+      align-self: start;
+      padding-top: 66px;
+    }
+    .toc ol { list-style: none; margin: 0; padding: 0; counter-reset: toc; }
+    .toc li { margin: 0 0 9px; }
+    .toc a {
+      font-family: var(--sans);
+      font-size: 11.5px;
+      color: var(--muted);
+      text-decoration: none;
+      display: block;
+      line-height: 1.4;
+    }
+    .toc a:hover { color: var(--accent); }
+  }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--sans);
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.7;
+    max-width: 68ch;
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">cim-mlir · architecture reference · v0.1</p>
+    <h1>A compiler for compute-in-memory hardware</h1>
+    <p class="standfirst">An MLIR dialect, eight passes, and a runtime ABI for hardware that computes inside the memory array — where writing weights costs orders of magnitude more than using them.</p>
+  </header>
+
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#problem">The problem</a></li>
+      <li><a href="#axes">Five axes</a></li>
+      <li><a href="#tile">The tile</a></li>
+      <li><a href="#asymmetry">The asymmetry</a></li>
+      <li><a href="#spaces">Memory spaces</a></li>
+      <li><a href="#pipeline">The pipeline</a></li>
+      <li><a href="#dialect">Dialect reference</a></li>
+      <li><a href="#runtime">Runtime boundary</a></li>
+      <li><a href="#status">What works</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <section id="problem">
+      <h2>The problem</h2>
+      <p>Compute-in-memory hardware exists and some of it ships. What does not exist is a way to take a normal neural network — a PyTorch model, an ONNX file — and run it on that hardware without hand-writing assembly or using a vendor's closed, single-chip compiler.</p>
+      <p>Every vendor rebuilds this layer privately. Academic work solved it for exactly one chip. The result is that this hardware has no software gravity, and hardware without software gravity does not get adopted. This project is an attempt at the missing layer: one abstraction that several different CIM/PIM parts can be described in, and a compiler that targets the abstraction rather than any single chip.</p>
+    </section>
+
+    <section id="axes">
+      <h2>Five axes of variation</h2>
+      <p>Real CIM/PIM hardware varies along five axes. A useful abstraction has to parameterize all five and assume none of them.</p>
+      <div class="scroller">
+        <table>
+          <thead>
+            <tr><th style="width:22%">Axis</th><th style="width:40%">Range in real hardware</th><th>Why the compiler cares</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Compute locality</strong></td><td>In the bitcell array → at the sense amps → beside the bank → on the DIMM</td><td>Sets what one operation costs and what data has to move</td></tr>
+            <tr><td><strong>Weight residency</strong></td><td>Weight-stationary and persistent → reloaded per layer</td><td>The dominant scheduling constraint. Reprogramming cost varies by ~1000×</td></tr>
+            <tr><td><strong>Persistence</strong></td><td>Volatile SRAM → non-volatile MRAM / RRAM / flash</td><td>Non-volatility means weights survive power-off — an execution model normal compilers have no equivalent for</td></tr>
+            <tr><td><strong>Precision</strong></td><td>Analog 3–8 bit effective → digital INT8 / FP8 / BF16</td><td>Decides whether quantization passes are needed and whether accuracy must be modeled</td></tr>
+            <tr><td><strong>Control model</strong></td><td>Host-driven offload → autonomous in-memory cores</td><td>Decides whether the compiler emits a kernel or a whole program</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tile">
+      <h2>The unifying abstraction: the tile</h2>
+      <p>All of it is modeled as an array of <strong>tiles</strong>. A tile is a fixed-capacity 2D compute-and-storage unit that can hold a weight sub-matrix and perform a matrix-vector multiply against it.</p>
+      <p>This is deliberately the lowest common denominator. A UPMEM DPU is a tile. A 256×256 digital SRAM macro is a tile. An analog crossbar is a tile. A near-memory RISC-V cluster is a tile. Everything above this line in the compiler is written against that one shape.</p>
+
+      <figure>
+        <div class="scroller">
+          <svg viewBox="0 0 620 240" width="620" height="240" role="img" aria-label="A device containing eight tiles, with one tile enlarged to show a weight sub-matrix and a matrix-vector multiply">
+            <rect x="10" y="30" width="248" height="150" class="box"/>
+            <text x="10" y="22" class="lbl-sm">device — targets/erbium-8t.yaml</text>
+            <g>
+              <rect x="28" y="50" width="48" height="48" class="box"/>
+              <rect x="86" y="50" width="48" height="48" class="box"/>
+              <rect x="144" y="50" width="48" height="48" class="box"/>
+              <rect x="202" y="50" width="38" height="48" class="box"/>
+              <rect x="28" y="112" width="48" height="48" class="box"/>
+              <rect x="86" y="112" width="48" height="48" class="box"/>
+              <rect x="144" y="112" width="48" height="48" class="box"/>
+              <rect x="202" y="112" width="38" height="48" class="box"/>
+            </g>
+            <text x="46" y="196" class="lbl-sm">tiles.count: 8</text>
+
+            <path d="M76 98 L332 62" class="ln-soft"/>
+            <path d="M76 112 L332 196" class="ln-soft"/>
+
+            <rect x="332" y="52" width="150" height="150" class="box"/>
+            <text x="332" y="44" class="lbl-sm">one tile</text>
+            <g class="ln-soft">
+              <path d="M332 89 H482 M332 126 H482 M332 163 H482"/>
+              <path d="M369 52 V202 M406 52 V202 M443 52 V202"/>
+            </g>
+            <text x="342" y="222" class="lbl-mono">256 × 256 · i8</text>
+
+            <path d="M500 127 H556" class="ln"/>
+            <path d="M549 122 L557 127 L549 132 Z" fill="var(--accent-dim)"/>
+            <text x="500" y="118" class="lbl-mono">cim.mvm</text>
+            <text x="500" y="146" class="lbl-sm">i32 out</text>
+          </svg>
+        </div>
+        <figcaption>A tile carries rows and columns (its weight capacity), the weight and activation dtypes, whether it is persistent, and separate cost figures for programming versus computing. Those fields come from a target description file, not from the compiler.</figcaption>
+      </figure>
+    </section>
+
+    <section id="asymmetry">
+      <h2>The asymmetry the compiler exploits</h2>
+      <p>On a GPU, loading weights and computing with them cost roughly comparable amounts. On CIM hardware they differ by orders of magnitude, and on non-volatile CIM the asymmetry is extreme: writes to MRAM or RRAM are slow and energy-hungry, but once written the weights sit there at essentially zero standby leakage indefinitely.</p>
+      <p>So the central optimization problem is not scheduling the math. It is:</p>
+      <p><strong>Given N physical tiles and a model with M weight sub-matrices where M &gt; N, decide which weights live where and when, so that total reprogramming cost is minimized.</strong></p>
+      <p>That is a placement and eviction problem, and no mainstream ML compiler solves it, because no mainstream hardware has this cost structure. It is the thesis of the project — the pass that implements it is the one worth having.</p>
+      <p>The useful part: because a model graph is static, the whole use sequence is known at compile time. That makes <strong>Belady's furthest-in-future policy</strong> — provably optimal, and impossible for any runtime cache to implement because it requires knowing the future — actually available here.</p>
+
+      <figure>
+        <div class="scroller">
+          <svg viewBox="0 0 620 210" width="620" height="210" role="img" aria-label="Six weight blocks competing for three tiles over time, with one reuse and one eviction">
+            <text x="10" y="20" class="lbl-sm">6 weight sub-matrices · 3 tiles · use order left to right</text>
+
+            <g class="lbl-sm">
+              <text x="10" y="62">tile 0</text>
+              <text x="10" y="106">tile 1</text>
+              <text x="10" y="150">tile 2</text>
+            </g>
+            <g class="ln-soft">
+              <path d="M56 70 H592 M56 114 H592 M56 158 H592"/>
+            </g>
+
+            <rect x="60" y="44" width="70" height="26" class="box-solid"/>
+            <text x="72" y="62" class="lbl" fill="var(--paper)">W0</text>
+            <rect x="60" y="88" width="70" height="26" class="box-solid"/>
+            <text x="72" y="106" class="lbl" fill="var(--paper)">W1</text>
+            <rect x="60" y="132" width="70" height="26" class="box-solid"/>
+            <text x="72" y="150" class="lbl" fill="var(--paper)">W2</text>
+
+            <rect x="140" y="44" width="70" height="26" class="box"/>
+            <text x="152" y="62" class="lbl">W0</text>
+            <text x="140" y="36" class="lbl-sm">reuse — free</text>
+
+            <rect x="220" y="88" width="70" height="26" class="box-limit"/>
+            <text x="232" y="106" class="lbl" fill="var(--limit)">W3</text>
+            <text x="220" y="80" class="lbl-sm">W1 evicted</text>
+
+            <rect x="300" y="132" width="70" height="26" class="box-limit"/>
+            <text x="312" y="150" class="lbl" fill="var(--limit)">W4</text>
+
+            <rect x="380" y="44" width="70" height="26" class="box"/>
+            <text x="392" y="62" class="lbl">W0</text>
+
+            <rect x="460" y="88" width="70" height="26" class="box"/>
+            <text x="472" y="106" class="lbl">W3</text>
+
+            <text x="60" y="188" class="lbl-sm">filled = a cim.program, the expensive op</text>
+            <text x="380" y="188" class="lbl-sm">outline = already resident, cost nothing</text>
+          </svg>
+        </div>
+        <figcaption>Belady keeps whichever resident weight is needed soonest and evicts the one whose next use is furthest away. Every outlined block is a reprogram that did not happen. The scheduling engine is kept free of any MLIR dependency and is checked against exhaustive search, so optimality is proven rather than asserted.</figcaption>
+      </figure>
+    </section>
+
+    <section id="spaces">
+      <h2>Memory spaces</h2>
+      <p>Three address spaces are modeled as memory-space attributes on <code>memref</code>. Transfers between them are always explicit <code>cim.copy</code> ops — never implicit.</p>
+
+      <figure>
+        <div class="scroller">
+          <svg viewBox="0 0 620 190" width="620" height="190" role="img" aria-label="Three memory spaces, host, near and insitu, connected by explicit copy operations">
+            <rect x="14" y="46" width="160" height="72" class="box"/>
+            <text x="30" y="78" class="lbl">#cim.space&lt;host&gt;</text>
+            <text x="30" y="98" class="lbl-sm">normal host DRAM</text>
+
+            <rect x="230" y="46" width="160" height="72" class="box"/>
+            <text x="246" y="78" class="lbl">#cim.space&lt;near&gt;</text>
+            <text x="246" y="98" class="lbl-sm">scratchpad by the unit</text>
+
+            <rect x="446" y="46" width="160" height="72" class="box"/>
+            <text x="462" y="78" class="lbl">#cim.space&lt;insitu&gt;</text>
+            <text x="462" y="98" class="lbl-sm">the weight array itself</text>
+
+            <path d="M178 82 H222" class="ln"/>
+            <path d="M215 77 L223 82 L215 87 Z" fill="var(--accent-dim)"/>
+            <text x="176" y="70" class="lbl-mono">cim.copy</text>
+
+            <path d="M394 82 H438" class="ln"/>
+            <path d="M431 77 L439 82 L431 87 Z" fill="var(--accent-dim)"/>
+            <text x="386" y="70" class="lbl-mono">cim.copy</text>
+
+            <text x="14" y="152" class="lbl-sm">Every byte that crosses a boundary is one op in the IR —</text>
+            <text x="14" y="168" class="lbl-sm">which is exactly why the cost report can be honest about it.</text>
+          </svg>
+        </div>
+        <figcaption>This is the design decision that makes cost modeling truthful rather than approximate. Nothing moves invisibly, so nothing goes uncounted.</figcaption>
+      </figure>
+    </section>
+
+    <section id="pipeline">
+      <h2>The pipeline</h2>
+      <p>Eight passes, run in order. They compose as one chain: a real matmul goes in at the top and real runtime calls come out at the bottom.</p>
+
+      <figure>
+        <div class="scroller">
+          <svg viewBox="0 0 1190 118" width="1190" height="118" role="img" aria-label="The eight compiler passes in order, from cim-detect through cim-cost-report">
+            <g>
+              <rect x="10" y="34" width="122" height="44" class="box"/>
+              <text x="22" y="52" class="lbl-sm">1</text><text x="22" y="68" class="lbl">detect</text>
+              <rect x="156" y="34" width="122" height="44" class="box"/>
+              <text x="168" y="52" class="lbl-sm">2</text><text x="168" y="68" class="lbl">partition</text>
+              <rect x="302" y="34" width="122" height="44" class="box-solid"/>
+              <text x="314" y="52" class="lbl-sm" fill="var(--paper)">3</text><text x="314" y="68" class="lbl" fill="var(--paper)">placement</text>
+              <rect x="448" y="34" width="122" height="44" class="box"/>
+              <text x="460" y="52" class="lbl-sm">4</text><text x="460" y="68" class="lbl">schedule</text>
+              <rect x="594" y="34" width="122" height="44" class="box"/>
+              <text x="606" y="52" class="lbl-sm">5</text><text x="606" y="68" class="lbl">transfers</text>
+              <rect x="740" y="34" width="122" height="44" class="box"/>
+              <text x="752" y="52" class="lbl-sm">6</text><text x="752" y="68" class="lbl">precision</text>
+              <rect x="886" y="34" width="122" height="44" class="box"/>
+              <text x="898" y="52" class="lbl-sm">7</text><text x="898" y="68" class="lbl">lower</text>
+              <rect x="1032" y="34" width="122" height="44" class="box"/>
+              <text x="1044" y="52" class="lbl-sm">8</text><text x="1044" y="68" class="lbl">cost report</text>
+            </g>
+            <g class="ln">
+              <path d="M132 56 H150"/><path d="M278 56 H296"/><path d="M424 56 H442"/>
+              <path d="M570 56 H588"/><path d="M716 56 H734"/><path d="M862 56 H880"/>
+              <path d="M1008 56 H1026"/>
+            </g>
+            <g fill="var(--accent-dim)">
+              <path d="M144 51 L152 56 L144 61 Z"/><path d="M290 51 L298 56 L290 61 Z"/>
+              <path d="M436 51 L444 56 L436 61 Z"/><path d="M582 51 L590 56 L582 61 Z"/>
+              <path d="M728 51 L736 56 L728 61 Z"/><path d="M874 51 L882 56 L874 61 Z"/>
+              <path d="M1020 51 L1028 56 L1020 61 Z"/>
+            </g>
+            <text x="10" y="24" class="lbl-sm">linalg.matmul in</text>
+            <text x="1032" y="24" class="lbl-sm">JSON out</text>
+            <text x="10" y="102" class="lbl-sm">cim ops appear here →</text>
+            <text x="886" y="102" class="lbl-sm">← and are gone by here</text>
+          </svg>
+        </div>
+        <figcaption>Pass 3 is the one the project exists for. Everything on either side of it is plumbing that makes it possible to run on real IR.</figcaption>
+      </figure>
+
+      <ol class="passes">
+        <li>
+          <div>
+            <div class="pname">cim-detect</div>
+            <p class="pbody">Finds <code>linalg.matmul</code>-shaped ops with a constant INT8 weight operand and annotates them as candidates. Detection and conversion are separate passes so each is testable alone — this one only marks, it never rewrites.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-partition</div>
+            <p class="pbody">Cuts a logical weight matrix into tile-sized sub-matrices and emits the cim ops that operate on them. A ragged edge is zero-padded up to the next tile multiple and cropped back on write-out, rather than special-cased.</p>
+            <p class="prefuse"><b>Refuses</b> a plain <code>linalg.matmul</code> (needs output-major weights) and a matmul with more than one output row. Both leave the original op intact with a warning, so the module stays correct and is simply not offloaded.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-placement</div>
+            <p class="pbody">The flagship. Recovers the execution order of weight sub-matrices from the IR, solves it with Belady, and rewrites: redundant programs are erased and their consumers rewired to the weights already resident in the tile. It also hoists a program out of a loop when that tile is provably untouched for a whole iteration, and separately solves the whole flattened multi-iteration sequence so it can report how far its own output sits from the unrestricted optimum — see the note in the status section for that number and why it stops where it does.</p>
+            <p class="prefuse"><b>Note</b> weight identity is <em>not</em> SSA identity — two matmuls reading one weight global produce different SSA values for the same physical weights, so identity is the root allocation, byte offset and shape. Keying on the value would find no reuse while appearing to work.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-schedule</div>
+            <p class="pbody">Decides where a <code>cim.barrier</code> has to sit. Work accumulates un-synchronized until something actually depends on it; the barrier goes immediately before that dependent op, and a block always flushes before its own terminator.</p>
+            <p class="prefuse"><b>Scope</b> v0.1 never reorders or overlaps anything. Double-buffering program against mvm is later work, gated on the target declaring it can.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-insert-transfers</div>
+            <p class="pbody">Inserts a <code>cim.copy</code> wherever an op needs an operand in a different space than it currently lives in, then hoists redundant copies out of loops when the source is loop-invariant — inserted once before the loop instead of once per iteration.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-legalize-precision</div>
+            <p class="pbody">Inserts a <code>cim.requantize</code> after each partial-sum reduction so an i32 accumulator is narrowed to the target's declared effective bits, retyping the downstream chain where it safely can.</p>
+            <p class="prefuse"><b>Scope</b> scale is always 1.0 and zero-point 0, because v0.1 has no calibration step anywhere to derive anything else from. Inventing calibration data the pass could not validate would be the exact "plausible but wrong" failure this project avoids.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-lower-to-target</div>
+            <p class="pbody">Turns cim ops into real <code>func.call</code>s against the runtime's C ABI, with every status checked by an assertion rather than ignored. The output goes through MLIR's standard LLVM pipeline, a translator and a linker, and comes out as a binary that runs. Handles straight-line code plus one level of loop nesting, hoisting each buffer it allocates out of the loop so it is reused rather than leaked per iteration.</p>
+            <p class="prefuse"><b>Refuses</b> a cim op nested deeper than one loop level, a loop carrying values, and a slice of a device buffer that is not one contiguous byte range.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <div class="pname">cim-cost-report</div>
+            <p class="pbody">Walks the final IR and emits a JSON cost report, weighting each op by the product of its enclosing loops' trip counts — a hoisted program runs once no matter where it sits textually, one left inside a loop runs trip-count times. It reuses the same cost model the benchmark tool uses, rather than a second one that could drift.</p>
+            <p class="prefuse"><b>Refuses</b> to guess: an op under a loop whose trip count is not a compile-time constant is excluded from the totals and flagged in the JSON header, not assumed to fire once.</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section id="dialect">
+      <h2>Dialect reference</h2>
+      <p>Nine ops, three types (<code>!cim.device</code>, <code>!cim.tile</code>, <code>!cim.resident</code>) and one memory-space attribute. Grouped by what they are for.</p>
+
+      <h3>Device and tiles</h3>
+      <div class="op">
+        <h4>cim.device_open</h4>
+        <p>Opens a target by name. Everything else needs one of these.</p>
+        <pre><code>%dev = cim.device_open {target = "erbium-8t"} : !cim.device&lt;"erbium-8t"&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.tile_alloc</h4>
+        <p>Claims one physical tile. The <code>id</code> is what <code>cim-placement</code> writes its answer into.</p>
+        <pre><code>%t = cim.tile_alloc %dev {id = 0 : i64}
+     : (!cim.device&lt;"erbium-8t"&gt;) -&gt; !cim.tile&lt;256x256xi8&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.tile_free</h4>
+        <p>Releases a tile.</p>
+        <pre><code>cim.tile_free %t : !cim.tile&lt;256x256xi8&gt;</code></pre>
+      </div>
+
+      <h3>Compute</h3>
+      <div class="op">
+        <h4>cim.program</h4>
+        <p>Writes weights into a tile. <strong>This is the expensive op</strong> — the entire placement pass exists to emit fewer of these. Its result is a <code>!cim.resident</code>, the proof that particular weights are in that particular tile right now.</p>
+        <pre><code>%r = cim.program %tile, %weights {cost_ns = 12000 : i64, cost_pj = 480000 : i64}
+     : (!cim.tile&lt;256x256xi8&gt;, memref&lt;256x256xi8, #cim.space&lt;host&gt;&gt;)
+       -&gt; !cim.resident&lt;256x256xi8&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.mvm</h4>
+        <p>Matrix-vector multiply against resident weights. Activations must live in near space. The accumulator is wider than the inputs — i8 in, i32 out.</p>
+        <pre><code>%out = cim.mvm %r, %act {accumulate = false}
+       : (!cim.resident&lt;256x256xi8&gt;, memref&lt;256xi8, #cim.space&lt;near&gt;&gt;)
+         -&gt; memref&lt;256xi32, #cim.space&lt;near&gt;&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.reduce_partial</h4>
+        <p>Sums the partial results from a weight matrix that spanned more than one tile in the K dimension. Variadic — an N-operand reduce becomes N−1 runtime calls.</p>
+        <pre><code>%sum = cim.reduce_partial %p0, %p1
+       : (memref&lt;256xi32, #cim.space&lt;near&gt;&gt;, memref&lt;256xi32, #cim.space&lt;near&gt;&gt;)
+         -&gt; memref&lt;256xi32, #cim.space&lt;near&gt;&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.requantize</h4>
+        <p>Narrows a wide accumulator back to the target's effective bits, with rounding half away from zero and a signed clamp. The arithmetic is done by the runtime, not re-emitted as IR, so there is only ever one implementation of the formula.</p>
+        <pre><code>%q = cim.requantize %sum {scale = 0.00392 : f32, zero_point = 0 : i32,
+                          effective_bits = 8 : i32}
+     : memref&lt;256xi32, #cim.space&lt;near&gt;&gt; -&gt; memref&lt;256xi8, #cim.space&lt;near&gt;&gt;</code></pre>
+      </div>
+
+      <h3>Movement and ordering</h3>
+      <div class="op">
+        <h4>cim.copy</h4>
+        <p>Moves a buffer between address spaces. Always explicit — this is what keeps the cost model honest.</p>
+        <pre><code>%d = cim.copy %src : memref&lt;256xi8, #cim.space&lt;host&gt;&gt;
+                  to memref&lt;256xi8, #cim.space&lt;near&gt;&gt;</code></pre>
+      </div>
+      <div class="op">
+        <h4>cim.barrier</h4>
+        <p>Synchronizes all outstanding work on a device.</p>
+        <pre><code>cim.barrier %dev : !cim.device&lt;"erbium-8t"&gt;</code></pre>
+      </div>
+    </section>
+
+    <section id="runtime">
+      <h2>The runtime boundary</h2>
+      <p>Below the dialect sits <code>cimrt</code>, a plain C ABI — open a device, allocate and free buffers, write and read them, program a tile, run an mvm, reduce, requantize, synchronize. The compiler emits calls against this header and nothing below it.</p>
+      <p>Two implementations sit behind that header. A <strong>functional simulator</strong> does real INT8 arithmetic and keeps real profiling counters, so a compiled program produces genuine numbers and genuine op counts. An <strong>Erbium hardware backend</strong> exists as a stub that reports "no device" from every entry point — honestly unimplemented rather than quietly faked.</p>
+      <p>The last pass's output is a real artifact, not a shape. It goes through MLIR's standard conversion pipeline, a translator to LLVM IR, a C compiler and a linker, against the real runtime library — and the resulting binary is executed as part of the test suite, checked against values that only come out right if the hardware path actually worked.</p>
+      <pre><code>cim-opt → mlir-opt --convert-to-llvm → mlir-translate → clang → link libcimrt.a
+                                                                    ↓
+                                                             a binary that runs</code></pre>
+    </section>
+
+    <section id="status">
+      <h2>What works, and what doesn't</h2>
+      <p>Stated the way the repository states it, without rounding up.</p>
+      <div class="scroller">
+        <table>
+          <thead>
+            <tr><th style="width:34%">Area</th><th style="width:16%">State</th><th>Detail</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Placement engine, cost model, target reader</td>
+              <td><span class="pill works">working</span></td>
+              <td>Belady proven optimal against exhaustive search; LRU and FIFO kept as baselines</td>
+            </tr>
+            <tr>
+              <td>The dialect</td>
+              <td><span class="pill works">working</span></td>
+              <td>Nine ops on MLIR 18, with verifiers and round-trip tests</td>
+            </tr>
+            <tr>
+              <td>Functional simulator</td>
+              <td><span class="pill works">working</span></td>
+              <td>Real INT8 matmul, differential-tested against NumPy on swept and random shapes</td>
+            </tr>
+            <tr>
+              <td>All eight passes, composed</td>
+              <td><span class="pill works">working</span></td>
+              <td>A real matmul reaches an executed binary through the whole chain</td>
+            </tr>
+            <tr>
+              <td>Loop support in lowering</td>
+              <td><span class="pill partial">one level</span></td>
+              <td>Buffers hoisted and reused across iterations; deeper nesting and loop-carried values refused</td>
+            </tr>
+            <tr>
+              <td>Weight shapes</td>
+              <td><span class="pill partial">partial</span></td>
+              <td>Matrix-vector with output-major weights. Other shapes warned about and left alone</td>
+            </tr>
+            <tr>
+              <td>Buffer lifetime</td>
+              <td><span class="pill partial">by design</span></td>
+              <td>A device buffer with no explicit deallocation leaks, exactly as hand-written C against the same ABI would. No liveness analysis in v0.1</td>
+            </tr>
+            <tr>
+              <td>Placement under spill</td>
+              <td><span class="pill works">5.5% off optimal</span></td>
+              <td>Provably the best a single loop body can do; the compiler reports its own gap. See the note below</td>
+            </tr>
+            <tr>
+              <td>…reached deliberately</td>
+              <td><span class="pill works">deliberate</span></td>
+              <td>Pin-and-stream schedule, proven optimal when weights repeat at most once per body, validated heuristic otherwise. See the note below</td>
+            </tr>
+            <tr>
+              <td>ONNX front end</td>
+              <td><span class="pill none">not started</span></td>
+              <td>Shapes are hand-written or generated; nothing reads a model file</td>
+            </tr>
+            <tr>
+              <td>Real hardware backend</td>
+              <td><span class="pill none">stub</span></td>
+              <td>Every entry point returns "no device"</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="limit">
+        <span class="tag">Placement across iterations — the number, and why it stops there</span>
+        <p>The benchmark table quotes the <strong>standalone simulator</strong>: 8538 weight-programming ops against 16000 for LRU and FIFO under 2× spill pressure. The compiler does not emit exactly that, and the distance is now measured rather than described.</p>
+        <p>On the same shape — 16 weight blocks over 8 tiles — the compiler emits <strong>7 + 9×T</strong> programs, so 9007 at 1000 inferences against the optimum's 8538. That is a <strong>5.5%</strong> gap, and against LRU's 16000 it is a 43.7% reduction where the table claims 47%. Both numbers and the gap between them are now fields in the compiler's own cost report, so this stays checked rather than asserted.</p>
+        <p>The residual is not a missing optimization. <code>7 + 9×T</code> is <code>tiles−1</code> weights held permanently plus <code>blocks−(tiles−1)</code> reprogrammed each iteration, which is the best <em>any</em> single loop body can do: a weight that nothing in the body programs is never written and so holds a tile forever, and at most <code>tiles−1</code> weights can do that. The unrestricted schedule wins the remaining 5.5% only by <strong>varying how many weights it programs from one iteration to the next</strong> — 8 on some, 9 on others. A loop body executes a fixed set of ops every time round, so it cannot emit a varying number of them.</p>
+        <p>That last point is worth stating because the obvious fix does not work. It looks like the optimal schedule merely rotates which tile holds which weight, which a tile index computed from the loop counter could express. It does not: the count varies, not just the assignment, and no choice of indices changes a fixed body's op count. There is a test pinning that, specifically so the next person does not spend the dialect change to buy nothing.</p>
+      </div>
+
+      <div class="limit">
+        <span class="tag">Now reached deliberately, not by accident</span>
+        <p>Until recently the compiler reached that per-iteration bound <strong>by accident rather than by aiming at it</strong>: an eviction scan that starts at tile 0 and stops at the first weight with no future use happens to leave tile 0 absorbing the whole spill and every other tile written exactly once — precisely the condition that marks a weight as permanently resident. A reasonable-looking cleanup of that scan would have spread evictions instead, silently degrading the workload to what a plain LRU cache does. A structural test guards exactly that regression, because the numerical suites cannot see it — a compiler that holds nothing permanently still computes identical values, just more of them per iteration.</p>
+        <p>The bound is now aimed at directly. A <strong>pin-and-stream</strong> schedule pins the <code>tiles−1</code> most-used weights to permanent tiles by occurrence count (ties broken by first-use order) and streams everything else through the one remaining tile via a single-tile Belady sub-solve — single-tile solves are trivial and deterministic, since there is never a victim to choose between. The compiler computes both this schedule and the ordinary per-block solve for every constant-trip loop and takes whichever is strictly cheaper, so every case where the two already agreed is rewritten byte-for-byte unchanged.</p>
+        <p>When every weight in a loop body is used exactly once — <code>cim-partition</code>'s own shape, and every workload in the benchmark table above — pin-and-stream is <strong>provably optimal</strong>, checked by exhaustive search over every permutation up to 7 distinct weights against every tile count. When a weight repeats within one body the pin choice becomes a heuristic (the true optimum there is a residency fixed-point problem this project does not solve exactly), but it is proven never worse than pinning nothing at all, and its own output always replays as a genuine fixed point — checked exhaustively on small alphabets and on 500 random instances. That repeated-weight case is exactly the one the old accidental mechanism could fail on; there is now a test built specifically to hit it, on both the structural IR shape and the computed numbers.</p>
+      </div>
+
+      <div class="limit">
+        <span class="tag">On the cost numbers</span>
+        <p>The target file's cost figures are <strong>estimates, not measurements</strong>, and the file says so in a provenance field the tools read and print a warning about on every run. Energy figures derived from them inherit that uncertainty. The counts are of weight programming, not end-to-end wall clock.</p>
+      </div>
+    </section>
+
+    <footer>
+      cim-mlir · architecture reference for v0.1 · generated from the repository, and kept beside it as features land.<br>
+      Source of record for anything stated here: the dialect definitions, the pass table, and the roadmap in the repo.
+    </footer>
+
+  </main>
+</div>
+</body>
+</html>

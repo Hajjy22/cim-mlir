@@ -26,4 +26,8 @@ if(CIM_ENABLE_MLIR)
   set_target_properties(check-cim-opt PROPERTIES FOLDER "Tests")
 
   add_lit_testsuites(CIM_OPT ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${CIM_TEST_DEPENDS})
+
+  if(CIM_ENABLE_REAL_TARGET_E2E)
+    add_subdirectory(real-target)
+  endif()
 endif()

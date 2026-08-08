@@ -1,0 +1,48 @@
+// Sibling of check.mlir.in, check-requantize.mlir.in and
+// check-reduce-partial.mlir.in, configured the same way (see check.mlir.in's
+// own header and test/real-target/CMakeLists.txt) into
+// multi-k-tile-correct.mlir (EXPECTED_VALUE=36) and multi-k-tile-wrong.mlir
+// (EXPECTED_VALUE=999).
+//
+// Unlike every other template here, this one starts from a genuine
+// linalg.matmul_transpose_b rather than hand-written cim ops -- the actual
+// compiler front door (cim-detect, cim-partition run ahead of
+// cim-lower-to-target for every variant; see this directory's
+// CMakeLists.txt). It is the strongest available evidence for this
+// session's two composition fixes together: cim-partition's real output
+// for a matmul spanning more than one K-tile needs BOTH cim.reduce_partial
+// lowering AND non-identity memref.subview materialization to reach a
+// real binary at all, and this is that real binary, actually run.
+//
+// A 4x8 all-ones weight on tiny-4x4.yaml's 4x4 tiles: 1 block in N, 2 in
+// K. Every output row sums all 8 activation values (1+2+...+8=36). If
+// cim-lower-to-target's reduce_partial lowering silently dropped the
+// second K-tile's contribution -- a broken cimrt_reduce_add, or an
+// activation slice reading the wrong bytes -- the result would be 10 (the
+// first four activation values only) or 26 (the last four only), not 36.
+func.func @run_check() {
+  // cim-detect requires exactly one constant operand (the weight) --
+  // both a constant weight and a constant activation would leave nothing
+  // for this pass to consider a real inference-shaped matmul, so it
+  // refuses. The activation is staged into a fresh, non-constant buffer
+  // first, matching test/mlir/pipeline_e2e_test.cpp's buildModule -- after
+  // real bufferization an activation would be a plain buffer anyway, not
+  // a global.
+  %actInit = memref.get_global @actInit : memref<1x8xi8>
+  %act = memref.alloc() : memref<1x8xi8>
+  memref.copy %actInit, %act : memref<1x8xi8> to memref<1x8xi8>
+  %w = memref.get_global @w : memref<4x8xi8>
+  %out = memref.alloc() : memref<1x4xi32>
+  linalg.matmul_transpose_b ins(%act, %w : memref<1x8xi8>, memref<4x8xi8>)
+                            outs(%out : memref<1x4xi32>)
+  %c0 = arith.constant 0 : index
+  %got = memref.load %out[%c0, %c0] : memref<1x4xi32>
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: multi-K-tile matmul result did not match the expected value"
+  memref.dealloc %act : memref<1x8xi8>
+  memref.dealloc %out : memref<1x4xi32>
+  return
+}
+memref.global "private" constant @actInit : memref<1x8xi8> = dense<[[1, 2, 3, 4, 5, 6, 7, 8]]>
+memref.global "private" constant @w : memref<4x8xi8> = dense<1>

@@ -1,0 +1,45 @@
+// Configured by CMake into correct.mlir (EXPECTED_VALUE=7, the true first
+// element of an identity-weight mvm against this activation) and wrong.mlir
+// (EXPECTED_VALUE=999, deliberately false) -- see
+// test/real-target/CMakeLists.txt. Not a lit/FileCheck test: this file is
+// compiled all the way to a native binary and RUN, and the check IS the
+// exit status (cf.assert firing is a real SIGABRT), not anything printed.
+//
+// No function arguments or results anywhere in this module on purpose: a
+// zero-arg, zero-result func.func lowers to a plain `void @run_check(void)`
+// after --convert-func-to-llvm, callable directly from the tiny C driver
+// (driver.c) with no memref C-interface wrapping to get right.
+func.func @run_check() {
+  // Runtime/src/simulator/simulator.cpp's cimrt_open resolves a target
+  // name ending in ".yaml" as a literal path, working regardless of ctest's
+  // (unpredictable) working directory -- unlike every other test file in
+  // this project, this one genuinely EXECUTES cimrt_open, so the usual
+  // structural-test convention of an arbitrary short label ("t") does not
+  // apply here.
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+  %t = cim.tile_alloc %dev {id = 0 : i64}
+       : (!cim.device<"@CIM_REAL_TARGET_YAML@">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %act = memref.get_global @act : memref<4xi8>
+  %out = cim.mvm %r, %act : (!cim.resident<4x4xi8>, memref<4xi8>) -> memref<4xi32>
+  %c0 = arith.constant 0 : index
+  %got = memref.load %out[%c0] : memref<4xi32>
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: mvm result did not match the expected value"
+  memref.dealloc %out : memref<4xi32>
+  return
+}
+// Identity weight: mvm's result is exactly the activation, widened to i32
+// (spec Sec. 5's INT8-in/wider-accumulator-out contract) -- so
+// out[0] == act[0] == 7 is true independent of any arithmetic this test
+// itself might get wrong, the same reason e2e_identity_weights_pass_
+// activations_through (test/mlir/pipeline_e2e_test.cpp) uses an identity
+// weight too.
+memref.global "private" constant @w : memref<4x4xi8> = dense<[[1, 0, 0, 0],
+                                                               [0, 1, 0, 0],
+                                                               [0, 0, 1, 0],
+                                                               [0, 0, 0, 1]]>
+memref.global "private" constant @act : memref<4xi8> = dense<[7, -9, 42, -128]>

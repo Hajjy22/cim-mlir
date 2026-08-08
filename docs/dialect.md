@@ -13,5 +13,8 @@ CMake target emits `Dialects/CIMDialect.md` from the `.td` sources).
 - `include/cim/Dialect/CIMOps.td` — all nine ops
 
 Until the ODS-generated docs are wired into the build output, see
-`docs/abstraction.md` for the hardware model these ops encode, and
-`test/Dialect/CIM/*.mlir` for one worked syntax example per op.
+`docs/abstraction.md` for the hardware model these ops encode,
+`test/Dialect/CIM/*.mlir` for one worked syntax example per op, and
+[`docs/website/index.html`](website/index.html) for a hand-written
+op-by-op reference (operands, result, one example each) alongside the
+rest of the architecture — open it directly in a browser.

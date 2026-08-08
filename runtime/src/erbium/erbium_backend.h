@@ -19,8 +19,12 @@ namespace erbium {
 
 /// Open real Erbium hardware. Returns CIMRT_ERR_NO_DEVICE until hardware
 /// bring-up (spec M5); that is a truthful answer, not a placeholder --
-/// there is genuinely no device attached.
-cimrt_status open();
+/// there is genuinely no device attached. Takes the same out-parameter
+/// shape as cimrt_open itself -- the old no-argument signature could not
+/// have set *out even after bring-up landed, so the "-hw" path was
+/// structurally incapable of ever succeeding, independent of hardware
+/// being attached.
+cimrt_status open(cimrt_device **out);
 
 /// TODO(spec M5): real programming and compute against attached hardware.
 cimrt_status program();

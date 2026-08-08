@@ -23,7 +23,23 @@ namespace cim {
 /// Pass 8) when running against the functional simulator.
 class CostAccumulator {
 public:
+  /// A point-in-time copy of the counters, cheap enough to take on every
+  /// cimrt_profile_start without worrying about the cost of profiling
+  /// itself. Backs windowed (start/stop-delta) profiling in cimrt_profile.
+  struct Snapshot {
+    uint64_t programsIssued = 0;
+    uint64_t mvmsIssued = 0;
+    uint64_t bytesTransferred = 0;
+    double energyPj = 0.0;
+    double latencyNs = 0.0;
+  };
+
   explicit CostAccumulator(const TargetSpec &targetSpec) : spec(targetSpec) {}
+
+  Snapshot snapshot() const {
+    return Snapshot{programsIssued, mvmsIssued, bytesTransferred, energyPj,
+                    latencyNs};
+  }
 
   void recordProgram() {
     ++programsIssued;

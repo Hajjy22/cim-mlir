@@ -50,10 +50,26 @@ struct CostReport {
   double steadyStateEnergyPjPerInference = 0.0;
   double steadyStateLatencyNsPerInference = 0.0;
 
+  /// Total analytical wall-clock time (spec Sec. 9.2) one steady-state
+  /// inference takes -- steadyStateLatencyNsPerInference's reprogramming
+  /// time plus that same window's mvm time, which nothing above needed to
+  /// combine before. Exists for amortizedInstallEnergyPjPerInference: a
+  /// volatile array draws standby leakage for however long the array stays
+  /// powered during an inference, whether it is reprogramming or computing,
+  /// not just the reprogramming slice steadyStateLatencyNsPerInference
+  /// tracks on its own.
+  double steadyStateElapsedNsPerInference = 0.0;
+
   /// True when the target keeps weights across power cycles, so
   /// `installEnergyPj` is genuinely a one-time cost rather than a
   /// per-power-on cost.
   bool persistent = false;
+
+  /// Copied from the target file, for `amortizedInstallEnergyPjPerInference`
+  /// below: a volatile array must stay continuously powered to retain its
+  /// programmed weights, which non-volatile storage does not need.
+  double standbyLeakageUwPerTile = 0.0;
+  uint32_t numTiles = 0;
 };
 
 /// `stepsPerInference` is how many entries of the use sequence make up one
@@ -65,10 +81,18 @@ CostReport computeCostReport(const TargetSpec &spec,
                               size_t stepsPerInference);
 
 /// Install energy charged to each inference when the install cost is spread
-/// over `inferences` runs. On a non-volatile target this is the number that
-/// collapses toward zero and makes weight-stationary CIM worth compiling
-/// for; on a volatile target the install cost recurs and this is a floor,
-/// not a limit.
+/// over `inferences` runs, plus -- on a volatile target only -- the standby
+/// leakage cost of keeping the array continuously powered so it retains
+/// those weights for the whole run (`report.standbyLeakageUwPerTile *
+/// report.numTiles`, converted through the run's own per-inference elapsed
+/// time). On a non-volatile target (`report.persistent`) this collapses
+/// toward zero as `inferences` grows -- amortizing install cost over more
+/// runs is what makes weight-stationary CIM worth compiling for. On a
+/// volatile target it does not: the leakage term scales with elapsed time,
+/// not with the install event, so it is a constant per-inference floor no
+/// amount of amortization can shrink -- persistence changes which curve you
+/// are on, not just where a fixed curve sits (`docs/roadmap.md`'s M3
+/// section, `bench/plots/plot_amortization.py`).
 double amortizedInstallEnergyPjPerInference(const CostReport &report,
                                              uint64_t inferences);
 

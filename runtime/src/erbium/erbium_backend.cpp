@@ -22,7 +22,11 @@ namespace {
 cimrt_status notAttached() { return CIMRT_ERR_NO_DEVICE; }
 } // namespace
 
-cimrt_status open() { return notAttached(); }
+cimrt_status open(cimrt_device **out) {
+  if (out)
+    *out = nullptr;
+  return notAttached();
+}
 cimrt_status program() { return notAttached(); }
 cimrt_status mvm() { return notAttached(); }
 

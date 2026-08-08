@@ -7,6 +7,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -15,6 +16,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -77,6 +80,23 @@ bool isDeviceSpace(MemRefType type) {
   return space && space.getKind() != SpaceKind::host;
 }
 
+/// Whole bytes per element, or failure for a bit width that is not a
+/// positive multiple of 8 (i1, i4, ...). Every size/stride/offset
+/// computation in this interpreter is byte-addressed
+/// (`elemBytes * numElements`, `idx * stride * elemBytes`, ...); dividing a
+/// sub-byte bit width by 8 silently truncates to zero, which turns into a
+/// zero-byte allocation, a zero stride, and a zero-byte read/write with no
+/// diagnostic anywhere -- exactly the "silently produce a wrong-but-
+/// plausible number" this interpreter's contract forbids. i4 is an accepted
+/// weight_dtype in the target schema, so this is in-domain, not
+/// hypothetical.
+FailureOr<unsigned> elementByteWidth(Type elementType) {
+  unsigned bits = elementType.getIntOrFloatBitWidth();
+  if (bits == 0 || bits % 8 != 0)
+    return failure();
+  return bits / 8;
+}
+
 //===----------------------------------------------------------------------===//
 // Interpreter
 //===----------------------------------------------------------------------===//
@@ -125,6 +145,7 @@ private:
   LogicalResult runAlloc(Operation *op, MemRefType type);
   LogicalResult runSubView(memref::SubViewOp op);
   LogicalResult runMemRefCopy(memref::CopyOp op);
+  LogicalResult runLinalgFill(linalg::FillOp op);
   LogicalResult runCall(func::CallOp op);
   LogicalResult runDeviceOpen(DeviceOpenOp op);
   LogicalResult runTileAlloc(TileAllocOp op);
@@ -132,6 +153,7 @@ private:
   LogicalResult runMvm(MvmOp op);
   LogicalResult runReducePartial(ReducePartialOp op);
   LogicalResult runCimCopy(CopyOp op);
+  LogicalResult runRequantize(RequantizeOp op);
   LogicalResult runArithConstant(arith::ConstantOp op);
   LogicalResult runScfFor(scf::ForOp op);
 
@@ -186,12 +208,16 @@ Interpreter::viewFromType(MemRefType type, std::shared_ptr<Allocation> base) {
     if (ShapedType::isDynamic(s))
       return failure();
 
+  FailureOr<unsigned> elemBytes = elementByteWidth(type.getElementType());
+  if (failed(elemBytes))
+    return failure();
+
   MemRefValue v;
   v.alloc = std::move(base);
   v.offsetElems = offset;
   v.sizes = llvm::to_vector(type.getShape());
   v.strides = strides;
-  v.elemBytes = type.getElementTypeBitWidth() / 8;
+  v.elemBytes = *elemBytes;
   return v;
 }
 
@@ -293,6 +319,14 @@ FailureOr<cimrt_device *> Interpreter::deviceFor(Operation *op,
     return failure();
   }
   devices[target] = dev;
+  // cimrt's profiling is windowed (spec Sec.8): a stop with no matching
+  // start reports zero, not the cumulative total since open (see cimrt.h).
+  // This interpreter has no separate "begin profiling" op of its own --
+  // --profile means "report everything this run did" -- so open the window
+  // here, at the one point every device's counters are guaranteed to still
+  // be at zero, rather than leaving cimrt_profile_stop (run(), below) to
+  // find no window open and report nothing.
+  cimrt_profile_start(dev);
   return dev;
 }
 
@@ -335,7 +369,12 @@ LogicalResult Interpreter::runGetGlobal(memref::GetGlobalOp op) {
     return op.emitError("only dense integer memref.global initializers are "
                         "supported");
 
-  const unsigned elemBytes = type.getElementTypeBitWidth() / 8;
+  FailureOr<unsigned> elemBytesOr = elementByteWidth(type.getElementType());
+  if (failed(elemBytesOr))
+    return op.emitError(
+        "memref.global element type is narrower than a byte (e.g. i1/i4); "
+        "the interpreter is byte-addressed and cannot represent it");
+  const unsigned elemBytes = *elemBytesOr;
   auto alloc = makeAllocation(type, static_cast<size_t>(type.getNumElements()) *
                                         elemBytes,
                               /*dev=*/nullptr);
@@ -360,7 +399,12 @@ LogicalResult Interpreter::runGetGlobal(memref::GetGlobalOp op) {
 LogicalResult Interpreter::runAlloc(Operation *op, MemRefType type) {
   if (!type.hasStaticShape())
     return op->emitError("dynamic allocations are not supported");
-  const unsigned elemBytes = type.getElementTypeBitWidth() / 8;
+  FailureOr<unsigned> elemBytesOr = elementByteWidth(type.getElementType());
+  if (failed(elemBytesOr))
+    return op->emitError(
+        "allocation element type is narrower than a byte (e.g. i1/i4); the "
+        "interpreter is byte-addressed and cannot represent it");
+  const unsigned elemBytes = *elemBytesOr;
   auto alloc = makeAllocation(
       type, static_cast<size_t>(type.getNumElements()) * elemBytes, nullptr);
   if (!alloc)
@@ -442,6 +486,42 @@ LogicalResult Interpreter::runMemRefCopy(memref::CopyOp op) {
   if (failed(scatter(dstIt->second, bytes)))
     return op.emitError("memref.copy failed to write its target");
   return success();
+}
+
+LogicalResult Interpreter::runLinalgFill(linalg::FillOp op) {
+  // cim-partition's ragged-shape zero-padding is the only source of
+  // linalg.fill in this pipeline (see CIMPartition.cpp): always exactly one
+  // scalar input and one destination buffer, memref (not tensor) semantics,
+  // so there is no result to bind, only the side effect on the destination.
+  if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
+    return op.emitError("the interpreter only models linalg.fill with "
+                        "exactly one scalar input and one destination");
+
+  // The fill value must be something this interpreter has already computed
+  // -- in practice always an arith.constant -- never guessed: a fill this
+  // interpreter cannot evaluate could silently write the wrong pad value
+  // into memory a later cim.mvm reads as real data.
+  FailureOr<int64_t> value = evalIndex(op.getInputs()[0]);
+  if (failed(value))
+    return op.emitError("linalg.fill's scalar operand must be a constant "
+                        "the interpreter can evaluate");
+
+  auto dstIt = memrefs.find(op.getOutputs()[0]);
+  if (dstIt == memrefs.end())
+    return op.emitError("linalg.fill of an unknown buffer");
+  const MemRefValue &dst = dstIt->second;
+
+  // Same little-endian byte layout runAlloc/runProgram already use for
+  // writing a scalar into host memory (see the cursor loop in runAlloc).
+  std::vector<uint8_t> pattern(dst.elemBytes);
+  for (unsigned b = 0; b < dst.elemBytes; ++b)
+    pattern[b] = static_cast<uint8_t>((*value >> (8 * b)) & 0xFF);
+
+  std::vector<uint8_t> bytes(static_cast<size_t>(dst.numElements()) *
+                             dst.elemBytes);
+  for (size_t i = 0; i < bytes.size(); i += dst.elemBytes)
+    std::memcpy(bytes.data() + i, pattern.data(), dst.elemBytes);
+  return scatter(dst, bytes);
 }
 
 LogicalResult Interpreter::runCall(func::CallOp op) {
@@ -584,7 +664,15 @@ LogicalResult Interpreter::runMvm(MvmOp op) {
   }
 
   auto resultType = llvm::cast<MemRefType>(op.getResult().getType());
-  const unsigned elemBytes = resultType.getElementTypeBitWidth() / 8;
+  FailureOr<unsigned> elemBytesOr =
+      elementByteWidth(resultType.getElementType());
+  if (failed(elemBytesOr)) {
+    cimrt_free(actBuf);
+    return op.emitError(
+        "cim.mvm result element type is narrower than a byte (e.g. i1/i4); "
+        "the interpreter is byte-addressed and cannot represent it");
+  }
+  const unsigned elemBytes = *elemBytesOr;
   const size_t resultBytes =
       static_cast<size_t>(resultType.getNumElements()) * elemBytes;
 
@@ -683,7 +771,12 @@ LogicalResult Interpreter::runCimCopy(CopyOp op) {
     return op.emitError("cim.copy on an unknown buffer");
 
   auto destType = llvm::cast<MemRefType>(op.getDest().getType());
-  const unsigned elemBytes = destType.getElementTypeBitWidth() / 8;
+  FailureOr<unsigned> elemBytesOr = elementByteWidth(destType.getElementType());
+  if (failed(elemBytesOr))
+    return op.emitError(
+        "cim.copy destination element type is narrower than a byte (e.g. "
+        "i1/i4); the interpreter is byte-addressed and cannot represent it");
+  const unsigned elemBytes = *elemBytesOr;
   const size_t bytesNeeded =
       static_cast<size_t>(destType.getNumElements()) * elemBytes;
 
@@ -705,6 +798,96 @@ LogicalResult Interpreter::runCimCopy(CopyOp op) {
     return op.emitError("cim.copy source and destination differ in size");
   if (failed(scatter(*view, bytes)))
     return op.emitError("cim.copy failed to write its destination");
+
+  memrefs[op.getResult()] = *view;
+  return success();
+}
+
+LogicalResult Interpreter::runRequantize(RequantizeOp op) {
+  auto srcIt = memrefs.find(op.getInput());
+  if (srcIt == memrefs.end())
+    return op.emitError("cim.requantize on an unknown buffer");
+  const MemRefValue &src = srcIt->second;
+
+  auto inputType = llvm::cast<MemRefType>(op.getInput().getType());
+  auto resultType = llvm::cast<MemRefType>(op.getResult().getType());
+  auto inElem = llvm::dyn_cast<IntegerType>(inputType.getElementType());
+  auto outElem = llvm::dyn_cast<IntegerType>(resultType.getElementType());
+  if (!inElem || !outElem)
+    return op.emitError(
+        "cim.requantize input and result element types must both be "
+        "integers; the interpreter has no other accumulator representation "
+        "to read or produce");
+
+  FailureOr<unsigned> outElemBytesOr = elementByteWidth(outElem);
+  if (failed(outElemBytesOr))
+    return op.emitError(
+        "cim.requantize result element type is narrower than a byte (e.g. "
+        "i1/i4); the interpreter is byte-addressed and cannot represent it");
+  const unsigned outElemBytes = *outElemBytesOr;
+
+  const int64_t count = resultType.getNumElements();
+  if (count != src.numElements())
+    return op.emitError(
+        "cim.requantize must not change element count (this pins execution "
+        "semantics beyond what the verifier's shape check covers)");
+
+  std::vector<uint8_t> srcBytes;
+  if (failed(gather(src, srcBytes)))
+    return op.emitError("cim.requantize failed to read its input");
+  if (srcBytes.size() != static_cast<size_t>(count) * src.elemBytes)
+    return op.emitError("cim.requantize input has the wrong size");
+
+  const double scale = op.getScale().convertToDouble();
+  if (!(scale > 0.0))
+    return op.emitError("cim.requantize scale must be positive, got ")
+           << scale;
+  const int64_t zeroPoint = static_cast<int32_t>(op.getZeroPoint());
+  const uint32_t effectiveBits = op.getEffectiveBits();
+  // RequantizeOp::verify() already enforces 0 < effective_bits <= the result
+  // element width, so the shift below is always in range. The clamp models
+  // the readout path this op stands for (an analog ADC's real resolution,
+  // or a digital requantizer's narrower accumulator) -- the *signed* range
+  // that many bits can hold, regardless of whether the result element type
+  // is nominally wider than effective_bits.
+  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
+  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
+
+  std::vector<uint8_t> outBytes(static_cast<size_t>(count) * outElemBytes);
+  const unsigned inBits = inElem.getWidth();
+  for (int64_t i = 0; i < count; ++i) {
+    uint64_t raw = 0;
+    std::memcpy(&raw, srcBytes.data() + i * src.elemBytes, src.elemBytes);
+    // Sign-extend from the input's actual bit width (little-endian, as read
+    // by gather/readElement throughout this file).
+    int64_t value = static_cast<int64_t>(raw);
+    if (inBits < 64) {
+      const uint64_t signBit = static_cast<uint64_t>(1) << (inBits - 1);
+      value = static_cast<int64_t>((raw ^ signBit) - signBit);
+    }
+    // quantized = zero_point + round(value / scale), round-half-away-from-
+    // zero -- the one rounding mode that treats positive and negative
+    // accumulator values symmetrically, which matters because cim's i32
+    // accumulator is signed. Then clamp to what effective_bits can hold:
+    // that clamp is this op's whole point on a sub-8-bit target (spec
+    // Sec. 5.3), not a defensive afterthought.
+    const double scaled = static_cast<double>(value) / scale;
+    int64_t quantized = zeroPoint + static_cast<int64_t>(std::llround(scaled));
+    quantized = std::clamp(quantized, clampMin, clampMax);
+
+    const uint64_t bits = static_cast<uint64_t>(quantized);
+    std::memcpy(outBytes.data() + i * outElemBytes, &bits, outElemBytes);
+  }
+
+  cimrt_device *dev = devices.empty() ? nullptr : devices.begin()->second;
+  auto alloc = makeAllocation(resultType, outBytes.size(), dev);
+  if (!alloc)
+    return op.emitError("failed to allocate the requantize result");
+  auto view = viewFromType(resultType, alloc);
+  if (failed(view))
+    return op.emitError("unsupported layout on the requantize result");
+  if (failed(scatter(*view, outBytes)))
+    return op.emitError("failed to write the requantize result");
 
   memrefs[op.getResult()] = *view;
   return success();
@@ -777,6 +960,7 @@ LogicalResult Interpreter::execute(Operation *op) {
       })
       .Case<memref::SubViewOp>([&](auto o) { return runSubView(o); })
       .Case<memref::CopyOp>([&](auto o) { return runMemRefCopy(o); })
+      .Case<linalg::FillOp>([&](auto o) { return runLinalgFill(o); })
       .Case<memref::CastOp>([&](memref::CastOp o) -> LogicalResult {
         // An alias: the cast to an unranked memref for printing keeps the
         // source's sizes and strides.
@@ -814,14 +998,7 @@ LogicalResult Interpreter::execute(Operation *op) {
           return o.emitError("cim.barrier on an unopened device");
         return success(cimrt_barrier(it->second) == CIMRT_OK);
       })
-      .Case<RequantizeOp>([&](RequantizeOp o) -> LogicalResult {
-        // Deliberately unimplemented rather than approximated: the rounding
-        // mode is not pinned down until cim-legalize-precision defines it,
-        // and guessing would produce numbers that look right.
-        return o.emitError(
-            "cim.requantize is not implemented by the interpreter yet "
-            "(cim-legalize-precision has not pinned the rounding mode)");
-      })
+      .Case<RequantizeOp>([&](auto o) { return runRequantize(o); })
       .Default([&](Operation *unknown) -> LogicalResult {
         // Never skip silently: an unmodelled op would yield a
         // wrong-but-plausible result, which is exactly what this

@@ -84,12 +84,28 @@ and the loop's trip count is a compile-time constant proven positive — never
 out of a loop that might run zero times, never out of one nested inside
 another. This reproduces the project's headline claim on real IR for the
 first time: a model that fits entirely in tiles reprograms once, no matter
-how many inferences the loop runs. It does **not** reproduce a full
-N-inference Belady solve — `bench/`'s spill-workload figures still come from
-the standalone simulator, which solves over the whole flattened use sequence
-across iterations rather than asking, tile by tile, whether one iteration
-alone leaves it undisturbed. See `docs/roadmap.md`'s M3 section for exactly
-where that line is drawn and why.
+how many inferences the loop runs.
+
+Under spill it comes close to, but does not exactly match, a full
+N-inference Belady solve — and the interesting part is *why*, which is now
+measured rather than assumed. The pass emits the proven optimum for any
+single loop body: `tiles-1` weights hoisted to permanent residency plus
+`blocks-(tiles-1)` reprogrammed per iteration. The unrestricted solve does
+better only by varying how many weights it programs from one iteration to
+the next, and a fixed loop body executes a fixed set of ops every
+iteration, so it cannot express that. On the standard spill shape the
+difference is 5.5%. The compiler now computes both numbers on the real IR
+and reports the gap, so this is a measurement in the artifact rather than
+a caveat in prose. See `docs/roadmap.md`'s M3 section.
+
+Reaching that `tiles-1`/`blocks-(tiles-1)` bound is deliberate, not
+incidental: `cim::computeSteadyStatePlacement` pins the `tiles-1`
+most-used weights and streams the rest through the one remaining tile —
+provably exact when every weight in a body is used once (`cim-partition`'s
+own shape), a validated heuristic otherwise — and `cim-placement` uses it
+whenever it beats the ordinary per-block solve. This also closes the one
+case the ordinary solve's own eviction tie-break could miss: a weight used
+more than once within a single loop body.
 
 ## Memory spaces
 
