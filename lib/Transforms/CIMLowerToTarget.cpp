@@ -20,12 +20,24 @@
 //    buffer this pass allocates for one iteration would either leak on
 //    every subsequent iteration or need a hoisting analysis of its own;
 //    neither is designed yet.
-// 2. cim.reduce_partial is refused outright, not mislowered: multi-tile
-//    K-reduction needs its own buffer-lifetime story this pass does not
-//    have (multiple partial-sum buffers alive at once, reduced into one).
-//    See the M4 roadmap entry for where that work is tracked.
+// 2. cim.reduce_partial IS lowered (lowerReducePartial, below), against a
+//    new cimrt_reduce_add ABI call that sums two device buffers elementwise
+//    -- an N-operand reduce_partial becomes N-1 chained calls, matching
+//    Interpreter.cpp's runReducePartial's own left-to-right fold. This was
+//    originally refused here with "needs its own buffer-lifetime story
+//    this pass does not have (multiple partial-sum buffers alive at once,
+//    reduced into one)" -- that turned out to overstate the problem, the
+//    same way cim.requantize's original refusal did (see its own note
+//    below): the N partial-sum buffers are not fresh scratch this pass
+//    would need to juggle, they are ALREADY-live cim.mvm results this pass
+//    lowered earlier in the same straight-line walk, exactly like any
+//    other device-space value that outlives its producing op (file header
+//    point 4) -- reduce_partial's only new bookkeeping is the N-2
+//    INTERMEDIATE accumulator buffers lowerReducePartial itself allocates
+//    to chain the adds, which it frees as it goes, keeping only the final
+//    one alive as the op's result.
 //
-//    cim.requantize IS lowered (lowerRequantize, below), against a new
+//    cim.requantize IS also lowered (lowerRequantize, below), against a new
 //    cimrt_requantize ABI call that does the round-half-away-from-zero and
 //    signed-clamp arithmetic device-side -- this pass has never computed a
 //    value itself anywhere else (it stages memory and dispatches calls;
@@ -415,7 +427,8 @@ private:
   /// guess here.
   LogicalResult checkAllowedConsumers(Value deviceValue) {
     for (Operation *user : deviceValue.getUsers()) {
-      if (isa<ProgramOp, MvmOp, CopyOp, RequantizeOp, memref::DeallocOp>(user))
+      if (isa<ProgramOp, MvmOp, CopyOp, RequantizeOp, ReducePartialOp,
+              memref::DeallocOp>(user))
         continue;
       if (auto view = dyn_cast<memref::SubViewOp>(user)) {
         if (isIdentitySubview(view))
@@ -432,8 +445,8 @@ private:
           "cim-lower-to-target: this op consumes a #cim.space<near|insitu> "
           "value with no lowering defined for that use in this v0.1 slice "
           "(only cim.program, cim.mvm, cim.copy, cim.requantize, "
-          "memref.dealloc and an identity memref.subview consuming a "
-          "device-space value are supported)");
+          "cim.reduce_partial, memref.dealloc and an identity "
+          "memref.subview consuming a device-space value are supported)");
     }
     return success();
   }
@@ -458,9 +471,7 @@ private:
     if (auto o = dyn_cast<BarrierOp>(op))
       return lowerBarrier(o);
     if (auto o = dyn_cast<ReducePartialOp>(op))
-      return o.emitError(
-          "cim-lower-to-target: cim.reduce_partial is not lowered yet -- "
-          "v0.1 scope is single-tile only (see this file's header comment)");
+      return lowerReducePartial(o);
     if (auto o = dyn_cast<RequantizeOp>(op))
       return lowerRequantize(o);
     if (auto o = dyn_cast<memref::DeallocOp>(op))
@@ -818,6 +829,144 @@ private:
     }
     op.erase();
     return success();
+  }
+
+  /// Lowers cim.reduce_partial against the new cimrt_reduce_add ABI call
+  /// (see this file's header point 2 and runtime/include/cimrt.h): an
+  /// N-operand reduce becomes N-1 chained pairwise adds, matching
+  /// Interpreter.cpp's runReducePartial's own left-to-right fold. Every
+  /// real operand cim-partition ever produces is already a device-space
+  /// !llvm.ptr by the time this runs (an earlier cim.mvm this same pass
+  /// lowered) -- staged like any other read-only operand (stageForRead)
+  /// for the rare case a hand-written module gives it a real memref
+  /// instead. Every INTERMEDIATE accumulator this function allocates to
+  /// chain the calls is freed once its one consuming call is done, exactly
+  /// like lowerMvm/lowerRequantize's own scratch buffers; only the final
+  /// accumulator survives, as the op's result.
+  LogicalResult lowerReducePartial(ReducePartialOp op) {
+    auto resultType = dyn_cast<MemRefType>(op.getResult().getType());
+    if (!resultType)
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_partial's result must be a "
+          "ranked memref");
+    FailureOr<int64_t> bytes = byteSizeOf(resultType);
+    if (failed(bytes))
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_partial's result must have a "
+          "static shape and a whole-byte element type");
+    const int64_t count = resultType.getNumElements();
+    const unsigned bits = resultType.getElementTypeBitWidth();
+
+    // Raw operand access, not op.getPartials() -- see lowerTileAlloc's
+    // comment; ReducePartialOp's Variadic<AnyMemRef> operands get the same
+    // asserting-cast-typed accessor hazard as every fixed-type operand
+    // this pass has already rewritten. Validated up front, all of them,
+    // before any call is emitted: stageForRead asserts success on a
+    // still-real-memref operand's byte size rather than checking it itself
+    // (every other caller of it -- lowerMvm, lowerRequantize -- already
+    // checks first for the same reason), so this loop is what makes a
+    // malformed operand a clean diagnostic instead of a crash.
+    SmallVector<Value> partials(op->getOperands().begin(),
+                                op->getOperands().end());
+    for (Value partial : partials) {
+      if (partial.getType() == ptrTy)
+        continue;
+      auto type = dyn_cast<MemRefType>(partial.getType());
+      if (!type || failed(byteSizeOf(type)))
+        return op.emitError(
+            "cim-lower-to-target: cim.reduce_partial's operands must be "
+            "ranked memrefs with a static shape and a whole-byte element "
+            "type");
+    }
+
+    // cim.reduce_partial carries no device operand of its own in the
+    // dialect, same as cim.copy/cim.requantize -- "any device opened so
+    // far", see lowerCopy's comment.
+    if (openDevices.empty())
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_partial needs a device to stage "
+          "through, but no cim.device_open has been lowered yet in this "
+          "function");
+    Value dev = openDevices.front();
+
+    // Every real cim-partition output keeps every partial's memory space
+    // consistent with the reduction's result (spec Sec. 5.4 rule 4: all
+    // operands and the result share one shape and element type) -- see
+    // lowerRequantize's identical reasoning for why the stage space
+    // follows the RESULT's declared space, not an operand's.
+    auto resultSpace = dyn_cast_or_null<SpaceAttr>(resultType.getMemorySpace());
+    const bool resultIsDevice =
+        resultSpace && resultSpace.getKind() != SpaceKind::host;
+    const CimrtSpace stageSpace =
+        resultIsDevice
+            ? (resultSpace.getKind() == SpaceKind::insitu ? CimrtSpace::kInsitu
+                                                            : CimrtSpace::kNear)
+            : CimrtSpace::kNear;
+
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    Value original = op.getResult();
+
+    auto finish = [&](Value acc, bool accIsOwnScratch) -> LogicalResult {
+      if (resultIsDevice) {
+        // Check BEFORE rewriting so an unsupported consumer is reported
+        // clearly rather than left as ill-typed IR (file header point 3).
+        // `acc` staying alive as a handle is correct regardless of
+        // accIsOwnScratch: either way it is now this value's one live
+        // reference, exactly like lowerMvm/lowerRequantize's own device
+        // branch.
+        if (failed(checkAllowedConsumers(original)))
+          return failure();
+        original.replaceAllUsesWith(acc);
+        deviceValueElemBits[acc] = bits;
+      } else {
+        auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
+        Value realPtr = hostPointer(b, loc, realAlloc.getResult());
+        readBuffer(b, loc, acc, realPtr, *bytes);
+        if (accIsOwnScratch)
+          freeBuffer(b, loc, acc);
+        original.replaceAllUsesWith(realAlloc.getResult());
+      }
+      op.erase();
+      return success();
+    };
+
+    if (partials.size() == 1) {
+      // cim-partition never emits this -- a single K-tile has "nothing to
+      // reduce" and the op is not created at all (see its own file
+      // header) -- but a hand-written module could, and forwarding the
+      // sole operand is the only correct lowering, not a call with one
+      // fake input.
+      bool scratch = false;
+      Value only = stageForRead(b, loc, dev, partials[0], stageSpace, scratch);
+      return finish(only, scratch);
+    }
+
+    auto fn = getOrInsertFunc(
+        "cimrt_reduce_add",
+        b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
+    Value countVal = constI64(b, loc, count);
+    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
+
+    bool accScratch = false;
+    Value acc = stageForRead(b, loc, dev, partials[0], stageSpace, accScratch);
+    for (size_t i = 1; i < partials.size(); ++i) {
+      bool rhsScratch = false;
+      Value rhs = stageForRead(b, loc, dev, partials[i], stageSpace, rhsScratch);
+      Value sum = allocBuffer(b, loc, dev, *bytes, stageSpace);
+      Value status =
+          b.create<func::CallOp>(
+               loc, fn, ValueRange{dev, sum, acc, rhs, countVal, bitsVal})
+              .getResult(0);
+      checkOk(b, loc, status, "cimrt_reduce_add failed");
+      if (accScratch)
+        freeBuffer(b, loc, acc);
+      if (rhsScratch)
+        freeBuffer(b, loc, rhs);
+      acc = sum;
+      accScratch = true; // every accumulator from here on is our own scratch
+    }
+    return finish(acc, /*accIsOwnScratch=*/true);
   }
 
   LogicalResult lowerCopy(CopyOp op) {

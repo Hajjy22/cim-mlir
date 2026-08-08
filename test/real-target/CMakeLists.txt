@@ -97,8 +97,14 @@ add_real_target_object(wrong check.mlir.in 999)
 # check-requantize.mlir.in's own header.
 add_real_target_object(requantize-correct check-requantize.mlir.in 127)
 add_real_target_object(requantize-wrong check-requantize.mlir.in 999)
+# cim.reduce_partial: two independent partial sums (10 and 15) that must
+# actually be added to reach 25 -- see check-reduce-partial.mlir.in's own
+# header for why neither partial alone can pass this check.
+add_real_target_object(reduce-partial-correct check-reduce-partial.mlir.in 25)
+add_real_target_object(reduce-partial-wrong check-reduce-partial.mlir.in 999)
 
-foreach(variant correct wrong requantize-correct requantize-wrong)
+foreach(variant correct wrong requantize-correct requantize-wrong
+                reduce-partial-correct reduce-partial-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
     ${CIM_REAL_TARGET_OBJ_${variant}})
@@ -114,6 +120,8 @@ add_test(NAME real-target-e2e-correct-value-passes
          COMMAND real-target-e2e-correct)
 add_test(NAME real-target-e2e-requantize-correct-value-passes
          COMMAND real-target-e2e-requantize-correct)
+add_test(NAME real-target-e2e-reduce-partial-correct-value-passes
+         COMMAND real-target-e2e-reduce-partial-correct)
 
 # The whole point of these two variants: cf.assert firing inside the
 # compiled binary is a real SIGABRT, not just a nonzero exit -- and CTest's
@@ -129,3 +137,5 @@ add_test(NAME real-target-e2e-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-wrong>")
 add_test(NAME real-target-e2e-requantize-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-requantize-wrong>")
+add_test(NAME real-target-e2e-reduce-partial-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-partial-wrong>")

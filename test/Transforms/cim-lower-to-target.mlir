@@ -245,12 +245,100 @@ func.func @tile_id_out_of_range() {
 
 // -----
 
-// cim.reduce_partial is refused outright -- v0.1 scope is single-tile only.
-func.func @reduce_partial_is_refused(%p0: memref<4xi32>, %p1: memref<4xi32>) {
-  // expected-error @+1 {{cim.reduce_partial is not lowered yet}}
+// cim.reduce_partial lowers against cimrt_reduce_add. Two independently-
+// staged partials (not sliced from one shared activation buffer -- that
+// shape needs non-identity device-space subview lowering, a separate,
+// still-open scope limit; see checkAllowedConsumers' own comment), each
+// its own tile/program/mvm, reduced into one near-space result that stays
+// a live device handle until a later cim.copy reads it back -- exactly
+// the "device-space result, checked before rewriting" shape lowerMvm's
+// own device branch already uses.
+// CHECK-LABEL: func.func @reduce_two_partials_stays_device_until_copied
+func.func @reduce_two_partials_stays_device_until_copied(
+    %act0: memref<4xi8>, %act1: memref<4xi8>,
+    %w0: memref<4x4xi8>, %w1: memref<4x4xi8>) -> memref<4xi32> {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %a0 = cim.copy %act0 : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  %a1 = cim.copy %act1 : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  %t0 = cim.tile_alloc %dev {id = 0 : i64} : (!cim.device<"t">) -> !cim.tile<4x4xi8>
+  %r0 = cim.program %t0, %w0 {cost_ns = 1 : i64, cost_pj = 1 : i64, persistent = true}
+        : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %p0 = cim.mvm %r0, %a0 {accumulate = false}
+        : (!cim.resident<4x4xi8>, memref<4xi8, #cim.space<near>>) -> memref<4xi32, #cim.space<near>>
+  %t1 = cim.tile_alloc %dev {id = 1 : i64} : (!cim.device<"t">) -> !cim.tile<4x4xi8>
+  %r1 = cim.program %t1, %w1 {cost_ns = 1 : i64, cost_pj = 1 : i64, persistent = true}
+        : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  // CHECK: call @cimrt_program
+  // CHECK: call @cimrt_mvm
+  %p1 = cim.mvm %r1, %a1 {accumulate = false}
+        : (!cim.resident<4x4xi8>, memref<4xi8, #cim.space<near>>) -> memref<4xi32, #cim.space<near>>
+  // CHECK: call @cimrt_program
+  // CHECK: call @cimrt_mvm
+  %s = cim.reduce_partial %p0, %p1
+       : (memref<4xi32, #cim.space<near>>, memref<4xi32, #cim.space<near>>) -> memref<4xi32, #cim.space<near>>
+  // A single call for two operands: N-1 chained adds, N=2. Neither mvm
+  // result is this pass' own scratch, so neither is freed around the call
+  // -- only the fresh sum buffer cimrt_alloc just produced (this call's
+  // own out argument) is a candidate for that, and it must not be freed
+  // here either (it survives as the reduction's own result, checked
+  // below).
+  // CHECK: call @cimrt_reduce_add(%{{[0-9]+}}, %[[SUMBUF:[0-9]+]],
+  // CHECK-NOT: call @cimrt_reduce_add
+  // CHECK-NOT: call @cimrt_free(%[[SUMBUF]])
+  %h = cim.copy %s : memref<4xi32, #cim.space<near>> to memref<4xi32>
+  // The reduction's own result stays a live device handle straight through
+  // to this copy's read-back -- no extra alloc/free pair in between.
+  // CHECK: call @cimrt_read(%[[SUMBUF]],
+  // CHECK-NOT: error
+  return %h : memref<4xi32>
+}
+
+// -----
+
+// Three operands chain exactly two calls (N-1), and every INTERMEDIATE
+// accumulator this pass allocates to do so is freed once consumed -- only
+// the final one survives, matching lowerMvm/lowerRequantize's own scratch
+// discipline. All three partials are real host memrefs here (an
+// unrealistic shape for real cim-partition output, which always produces
+// near-space partials, but a legitimate one this pass must still handle
+// correctly, and a stronger test of stageForRead's own staging path than
+// the near-space case above exercises).
+// CHECK-LABEL: func.func @reduce_three_partials_chains_two_calls
+func.func @reduce_three_partials_chains_two_calls(
+    %h0: memref<4xi32>, %h1: memref<4xi32>, %h2: memref<4xi32>) -> memref<4xi32> {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %p0 = cim.copy %h0 : memref<4xi32> to memref<4xi32, #cim.space<near>>
+  %p1 = cim.copy %h1 : memref<4xi32> to memref<4xi32, #cim.space<near>>
+  %p2 = cim.copy %h2 : memref<4xi32> to memref<4xi32, #cim.space<near>>
+  // CHECK: call @cimrt_write(%[[P0BUF:[0-9]+]],
+  // CHECK: call @cimrt_write(%[[P1BUF:[0-9]+]],
+  // CHECK: call @cimrt_write(%[[P2BUF:[0-9]+]],
+  %s = cim.reduce_partial %p0, %p1, %p2
+       : (memref<4xi32, #cim.space<near>>, memref<4xi32, #cim.space<near>>,
+          memref<4xi32, #cim.space<near>>) -> memref<4xi32>
+  // CHECK: call @cimrt_reduce_add(%{{[0-9]+}}, %[[ACC1:[0-9]+]], %[[P0BUF]], %[[P1BUF]],
+  // CHECK: call @cimrt_reduce_add(%{{[0-9]+}}, %[[ACC2:[0-9]+]], %[[ACC1]], %[[P2BUF]],
+  // The first (intermediate) accumulator is freed once consumed; the
+  // original partials are not this pass' scratch and are never freed here.
+  // CHECK: call @cimrt_free(%[[ACC1]])
+  // A host-declared result: read back and freed, like cimrt_mvm's own
+  // host-result path.
+  // CHECK: call @cimrt_read(%[[ACC2]],
+  // CHECK: call @cimrt_free(%[[ACC2]])
+  // CHECK-NOT: error
+  return %s : memref<4xi32>
+}
+
+// -----
+
+// cim.reduce_partial carries no device operand of its own in the dialect
+// (same as cim.copy/cim.requantize); with no cim.device_open lowered
+// anywhere in the function, there is no device to stage the reduction
+// through.
+func.func @reduce_partial_needs_a_device(%p0: memref<4xi32>, %p1: memref<4xi32>) -> memref<4xi32> {
+  // expected-error @+1 {{cim.reduce_partial needs a device to stage through}}
   %s = cim.reduce_partial %p0, %p1 : (memref<4xi32>, memref<4xi32>) -> memref<4xi32>
-  memref.dealloc %s : memref<4xi32>
-  return
+  return %s : memref<4xi32>
 }
 
 // -----

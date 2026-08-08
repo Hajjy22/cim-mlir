@@ -265,20 +265,52 @@ wrong.
   freed once its one use is done) for the same reason.
 
   v0.1 scope is deliberately narrow, agreed with before starting rather
-  than discovered partway through: straight-line code only (any cim op
-  nested inside a region -- an `scf.for` body, exactly what
-  `cim-placement`'s own loop hoisting produces -- is refused with a
+  than discovered partway through: straight-line code only -- any cim op
+  nested inside a region (an `scf.for` body, exactly what
+  `cim-placement`'s own loop hoisting produces) is refused with a
   diagnostic, since a buffer this pass allocated would either leak every
   iteration or need a hoisting analysis of its own, neither designed
-  here), and `cim.reduce_partial` is refused outright rather than
-  mislowered (multi-tile K-reduction needs its own buffer-lifetime story
-  this pass does not have -- multiple partial-sum buffers alive at once,
-  reduced into one). `cim.requantize`, originally refused for the same
-  stated reason, is now lowered (see the composition-hardening entry
-  above): it turned out to have no such buffer-lifetime problem in the
-  straight-line, single-tile slice, since `cim-legalize-precision` makes
-  it a terminal accumulator's SOLE consumer -- one producer, one consumer,
-  exactly like `cim.mvm`'s own staged activation.
+  here. That is still true; `cim.reduce_partial`, originally refused
+  alongside it for a stated reason ("multi-tile K-reduction needs its own
+  buffer-lifetime story this pass does not have -- multiple partial-sum
+  buffers alive at once, reduced into one"), turned out to overstate the
+  problem the same way `cim.requantize`'s original refusal did (below):
+  the N partial-sum buffers are not fresh scratch this pass would need to
+  juggle, they are already-live `cim.mvm` results this same pass lowered
+  earlier in the straight-line walk, exactly like any other device-space
+  value that outlives its producing op. It is lowered now
+  (`lowerReducePartial`, `lib/Transforms/CIMLowerToTarget.cpp`) against a
+  new `cimrt_reduce_add` ABI call (`runtime/include/cimrt.h`) that sums
+  two device buffers elementwise with wrapping (not saturating)
+  addition -- matching `Interpreter.cpp`'s `runReducePartial` bit for
+  bit, the same "two independent implementations of one contract must
+  agree exactly" discipline `cimrt_requantize`'s rounding mode already
+  follows. An N-operand reduce becomes N-1 chained calls, with each
+  INTERMEDIATE accumulator this function itself allocates freed once
+  consumed; only the final one survives as the op's result -- that
+  chaining is the one piece of real bookkeeping this lowering actually
+  needed, considerably smaller than the original refusal's framing
+  suggested.
+
+  Composing this with a real multi-K-tile matmul from `cim-partition`
+  still hits a second, separate, genuinely-unsolved limit, though:
+  `cim-partition` slices ONE shared staged activation buffer per K-tile
+  (`memref.subview` with a nonzero offset for every tile past the first),
+  and a non-identity slice of a device-space buffer has no lowering here
+  (`checkAllowedConsumers`'s own diagnostic points at the M4 entry below)
+  -- `cimrt_mvm` has no offset/sub-buffer concept, and giving it one is an
+  ABI decision this v0.1 slice does not make. `cim.reduce_partial`'s own
+  tests (`test/Transforms/cim-lower-to-target.mlir`, the
+  `real-target-e2e-reduce-partial-*` binaries) therefore use two
+  INDEPENDENTLY staged activations rather than cim-partition's real
+  output shape -- a real, tested lowering of the op in isolation, not yet
+  a real end-to-end multi-K-tile pipeline through this pass. `cim.requantize`,
+  originally refused for the same stated reason as `cim.reduce_partial`, is
+  also now lowered (see the composition-hardening entry above): it turned
+  out to have no such buffer-lifetime problem in the straight-line,
+  single-tile slice, since `cim-legalize-precision` makes it a terminal
+  accumulator's SOLE consumer -- one producer, one consumer, exactly like
+  `cim.mvm`'s own staged activation.
 
   Memory model: a `#cim.space<near|insitu>` memref is not a real memref
   after this pass runs -- cimrt's buffers are opaque handles, incompatible
@@ -557,13 +589,19 @@ out of scope for v0.1 across the board, not just here.
   working lowering to prove retargetability.
 - `cim-legalize-precision` with real `effective_bits` modeling.
 - `cim-lower-to-target` beyond its v0.1 straight-line, single-tile slice:
-  lowering `cim.reduce_partial` (multiple partial-sum buffers alive at
-  once, reduced into one -- its own real buffer-lifetime story), and
-  lowering a cim op inside an `scf.for` (needs a real buffer-lifetime
-  story across loop iterations, not just within one straight-line block)
-  -- see the Pass 7 entry above for exactly what is and is not covered
-  today. `cim.requantize` lowering is done (composition-hardening entry
-  above).
+  lowering a non-identity `memref.subview` of a device-space buffer
+  (`cimrt_mvm` has no offset/sub-buffer concept, so this needs a real ABI
+  decision -- e.g. a `cimrt_slice`-shaped call, or requiring `cim-partition`
+  to stage each K-tile's activation into its own buffer instead of slicing
+  one shared one) -- this is what still blocks a REAL multi-K-tile matmul
+  from `cim-partition` reaching this pass end to end, and lowering a cim op
+  inside an `scf.for` (needs a real buffer-lifetime story across loop
+  iterations, not just within one straight-line block) -- see the Pass 7
+  entry above for exactly what is and is not covered today.
+  `cim.requantize` and `cim.reduce_partial` lowering are both done
+  (composition-hardening entry and the Pass 7 entry above); reduce_partial's
+  own tests use independently-staged partials rather than cim-partition's
+  real sliced-activation shape for exactly the subview reason above.
 - `cimrt_requantize` accounted in the cost model: the target schema's
   `costs:` section needs a requantize/readout entry before
   `cimrt_profile_stop`/`cim-cost-report` can count it (currently zero-cost,

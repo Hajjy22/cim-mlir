@@ -408,6 +408,136 @@ CIM_TEST(cimrt_requantize_rejects_invalid_arguments) {
 }
 
 //===----------------------------------------------------------------------===//
+// reduce_add: cim-lower-to-target's device-side cim.reduce_partial lowering
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(cimrt_reduce_add_matches_hand_computed_values) {
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+
+  const std::vector<int64_t> lhs = {1, -1, 100, 0};
+  const std::vector<int64_t> rhs = {2, -2, -50, 7};
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &a.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, rhs.size() * 4, CIMRT_SPACE_NEAR, &b.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packedA = packSigned(lhs, 4);
+  const std::vector<uint8_t> packedB = packSigned(rhs, 4);
+  CIM_EXPECT_EQ(cimrt_write(a.buf, 0, packedA.data(), packedA.size()), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(b.buf, 0, packedB.data(), packedB.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(
+      cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, lhs.size(), /*bits=*/32),
+      CIMRT_OK);
+
+  std::vector<uint8_t> raw(lhs.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  for (size_t i = 0; i < lhs.size(); ++i)
+    CIM_EXPECT_EQ(got[i], lhs[i] + rhs[i]);
+}
+
+CIM_TEST(cimrt_reduce_add_wraps_on_overflow_rather_than_saturating) {
+  // cim.reduce_partial sums a real hardware accumulator's partial results,
+  // and a fixed-width accumulator wraps -- matching Interpreter.cpp's
+  // runReducePartial exactly (same reasoning as cimrt_requantize's rounding
+  // mode: two independent implementations of the same contract must agree
+  // bit for bit, not just approximately).
+  Device dev;
+  const std::vector<int64_t> lhs = {2147483647, -2147483648, -1};
+  const std::vector<int64_t> rhs = {1, -1, -2147483648};
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &a.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, rhs.size() * 4, CIMRT_SPACE_NEAR, &b.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packedA = packSigned(lhs, 4);
+  const std::vector<uint8_t> packedB = packSigned(rhs, 4);
+  CIM_EXPECT_EQ(cimrt_write(a.buf, 0, packedA.data(), packedA.size()), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(b.buf, 0, packedB.data(), packedB.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(
+      cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, lhs.size(), /*bits=*/32),
+      CIMRT_OK);
+
+  std::vector<uint8_t> raw(lhs.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  CIM_EXPECT_EQ(got[0], -2147483648LL); // INT32_MAX + 1 wraps to INT32_MIN
+  CIM_EXPECT_EQ(got[1], 2147483647LL);  // INT32_MIN + (-1) wraps to INT32_MAX
+  // -1 (0xFFFFFFFF) + INT32_MIN (0x80000000) = 0x17FFFFFFF, truncated to 32
+  // bits is 0x7FFFFFFF = INT32_MAX.
+  CIM_EXPECT_EQ(got[2], 2147483647LL);
+}
+
+CIM_TEST(cimrt_reduce_add_supports_narrower_element_widths) {
+  // Not hardcoded to i32 -- an explicit `bits` parameter, same reasoning as
+  // cimrt_requantize's in_bits/out_bits, even though today's real pipeline
+  // only ever reduces i32 accumulators.
+  Device dev;
+  const std::vector<int64_t> lhs = {100, -128, 0};
+  const std::vector<int64_t> rhs = {27, 0, -1};
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size(), CIMRT_SPACE_NEAR, &a.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, rhs.size(), CIMRT_SPACE_NEAR, &b.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size(), CIMRT_SPACE_NEAR, &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packedA = packSigned(lhs, 1);
+  const std::vector<uint8_t> packedB = packSigned(rhs, 1);
+  CIM_EXPECT_EQ(cimrt_write(a.buf, 0, packedA.data(), packedA.size()), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(b.buf, 0, packedB.data(), packedB.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(
+      cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, lhs.size(), /*bits=*/8),
+      CIMRT_OK);
+
+  std::vector<uint8_t> raw(lhs.size(), 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 1);
+  CIM_EXPECT_EQ(got[0], 127);  // 100 + 27, fits in i8
+  CIM_EXPECT_EQ(got[1], -128); // -128 + 0
+  CIM_EXPECT_EQ(got[2], -1);   // 0 + (-1)
+}
+
+CIM_TEST(cimrt_reduce_add_rejects_invalid_arguments) {
+  Device dev;
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &a.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &b.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &out.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_reduce_add(nullptr, out.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, nullptr, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, nullptr, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, a.buf, nullptr, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // out must not alias either input.
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, a.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, b.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // Not a whole-byte width.
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, 2, 5),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, 2, 0),
+                CIMRT_ERR_INVALID_ARG);
+  // Buffer sizes must match count * bits/8: all three buffers are 8 bytes,
+  // so count=2 at 32 bits fits but count=4 does not.
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, 4, 32),
+                CIMRT_ERR_SHAPE_MISMATCH);
+}
+
+//===----------------------------------------------------------------------===//
 // program + mvm: the arithmetic that had never run
 //===----------------------------------------------------------------------===//
 

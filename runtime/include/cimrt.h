@@ -158,6 +158,30 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
                                float scale, int32_t zero_point,
                                uint32_t effective_bits);
 
+/* Elementwise wrapping addition of two device-space buffers into a third:
+ * out[i] = a[i] + b[i] (mod 2^bits), for `count` signed integers of
+ * `bits`-wide elements each, in `a`, `b`, and `out` alike. Wrapping, not
+ * saturating -- a real fixed-width hardware accumulator wraps, and this
+ * must agree with Interpreter.cpp's runReducePartial, which computes the
+ * identical reduction host-side over the interpreter's own buffers.
+ *
+ * cim.reduce_partial's job (spec Sec. 5.4 rule 4) when a logical weight
+ * matrix spans multiple K-tiles and their partial sums must be summed into
+ * one: an N-operand reduce_partial lowers to N-1 chained calls here, one
+ * per pairwise add, matching the interpreter's own left-to-right fold.
+ * `out` must not alias `a` or `b`. `bits` must be a positive multiple of
+ * 8, matching every other width parameter in this ABI -- always 32 in
+ * today's real pipeline (cim.mvm's accumulator is i32), but not hardcoded
+ * to it, the same reason cimrt_requantize takes in_bits/out_bits rather
+ * than assuming a width.
+ *
+ * Not yet counted by cimrt_profile_stop, matching cimrt_requantize's own
+ * note: the target schema has no reduce/accumulate cost entry (spec M4).
+ */
+cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
+                               const cimrt_buffer *a, const cimrt_buffer *b,
+                               size_t count, uint32_t bits);
+
 /* --- sync --- */
 cimrt_status cimrt_barrier(cimrt_device *dev);
 

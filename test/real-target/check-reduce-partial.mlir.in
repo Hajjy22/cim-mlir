@@ -1,0 +1,57 @@
+// Sibling of check.mlir.in and check-requantize.mlir.in, configured the
+// same way (see check.mlir.in's own header and
+// test/real-target/CMakeLists.txt) into reduce-partial-correct.mlir
+// (EXPECTED_VALUE=25) and reduce-partial-wrong.mlir (EXPECTED_VALUE=999).
+//
+// Proves cim.reduce_partial's cimrt_reduce_add call for real: two
+// independent tile/program/mvm sequences (not one activation sliced into
+// two K-tiles -- that shape needs non-identity device-space subview
+// lowering, a separate, still-open scope limit; see
+// CIMLowerToTarget.cpp's checkAllowedConsumers) produce two host-declared
+// partial sums, which cim.reduce_partial must actually add together to
+// reach EXPECTED_VALUE -- neither partial alone equals it, so a
+// cimrt_reduce_add that silently forwarded one input instead of adding
+// would be caught here, not just by the FileCheck suite's structural
+// checks (test/Transforms/cim-lower-to-target.mlir).
+func.func @run_check() {
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+
+  %t0 = cim.tile_alloc %dev {id = 0 : i64}
+        : (!cim.device<"@CIM_REAL_TARGET_YAML@">) -> !cim.tile<4x4xi8>
+  %w0 = memref.get_global @w0 : memref<4x4xi8>
+  %r0 = cim.program %t0, %w0 {cost_ns = 1 : i64, cost_pj = 1 : i64}
+        : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %act0 = memref.get_global @act0 : memref<4xi8>
+  %p0 = cim.mvm %r0, %act0 : (!cim.resident<4x4xi8>, memref<4xi8>) -> memref<4xi32>
+
+  %t1 = cim.tile_alloc %dev {id = 1 : i64}
+        : (!cim.device<"@CIM_REAL_TARGET_YAML@">) -> !cim.tile<4x4xi8>
+  %w1 = memref.get_global @w1 : memref<4x4xi8>
+  %r1 = cim.program %t1, %w1 {cost_ns = 1 : i64, cost_pj = 1 : i64}
+        : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %act1 = memref.get_global @act1 : memref<4xi8>
+  %p1 = cim.mvm %r1, %act1 : (!cim.resident<4x4xi8>, memref<4xi8>) -> memref<4xi32>
+
+  %s = cim.reduce_partial %p0, %p1 : (memref<4xi32>, memref<4xi32>) -> memref<4xi32>
+
+  %c0 = arith.constant 0 : index
+  %got = memref.load %s[%c0] : memref<4xi32>
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: cimrt_reduce_add result did not match the expected value"
+  memref.dealloc %s : memref<4xi32>
+  return
+}
+// out0[0] = 1*1 + 1*2 + 1*3 + 1*4 = 10.
+memref.global "private" constant @w0 : memref<4x4xi8> = dense<[[1, 1, 1, 1],
+                                                                [0, 0, 0, 0],
+                                                                [0, 0, 0, 0],
+                                                                [0, 0, 0, 0]]>
+memref.global "private" constant @act0 : memref<4xi8> = dense<[1, 2, 3, 4]>
+// out1[0] = 1*15 = 15. 10 + 15 = 25 = EXPECTED_VALUE, and neither partial
+// alone is 25 -- the whole point.
+memref.global "private" constant @w1 : memref<4x4xi8> = dense<[[1, 0, 0, 0],
+                                                                [0, 0, 0, 0],
+                                                                [0, 0, 0, 0],
+                                                                [0, 0, 0, 0]]>
+memref.global "private" constant @act1 : memref<4xi8> = dense<[15, 0, 0, 0]>

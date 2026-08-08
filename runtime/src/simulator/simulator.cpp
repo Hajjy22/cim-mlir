@@ -354,6 +354,42 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
   return CIMRT_OK;
 }
 
+cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
+                              const cimrt_buffer *a, const cimrt_buffer *b,
+                              size_t count, uint32_t bits) {
+  if (!dev || !out || !a || !b)
+    return CIMRT_ERR_INVALID_ARG;
+  if (out == a || out == b)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: out must not alias a or b.
+  const uint32_t bytes = bitsToBytes(bits);
+  if (bytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (a->data.size() != count * bytes || b->data.size() != count * bytes ||
+      out->data.size() != count * bytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t lhs = 0, rhs = 0;
+    std::memcpy(&lhs, a->data.data() + i * bytes, bytes);
+    std::memcpy(&rhs, b->data.data() + i * bytes, bytes);
+    // Wrapping addition, matching Interpreter.cpp's runReducePartial: a
+    // fixed-width accumulator wraps, it does not saturate. Widened to
+    // uint64_t so the add itself never overflows a C++ type before the
+    // result is truncated back to `bytes` -- correct for bytes up to 8;
+    // this ABI's own byte-addressed contract (bitsToBytes) never produces
+    // more than that from a 32-bit `bits` parameter in practice, but the
+    // truncating memcpy below is what actually enforces the wrap either
+    // way, not this widening.
+    const uint64_t sum = lhs + rhs;
+    std::memcpy(out->data.data() + i * bytes, &sum, bytes);
+  }
+
+  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
+  // on this function for why (no reduce/accumulate entry in the target
+  // schema's costs: section; real M4 work, not a silent omission).
+  return CIMRT_OK;
+}
+
 cimrt_status cimrt_barrier(cimrt_device *dev) {
   if (!dev)
     return CIMRT_ERR_INVALID_ARG;
