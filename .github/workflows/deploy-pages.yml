@@ -1,0 +1,49 @@
+# Publishes docs/website/ (the architecture reference, see that file's own
+# header) as a GitHub Pages site.
+#
+# Uses the "deploy from GitHub Actions" Pages source rather than a
+# gh-pages branch: actions/configure-pages enables Pages for the
+# repository automatically the first time this runs (given the pages:
+# write permission below), so no manual repo-settings step is needed.
+#
+# The tradeoff this makes explicit: GitHub Pages sites are public to
+# anyone with the URL, even when built from a private repository --
+# access-controlled Pages publishing is a GitHub Enterprise Cloud
+# organization feature this repo does not have. Deliberately accepted
+# here in exchange for a real, free, clickable URL.
+name: Deploy architecture reference to GitHub Pages
+
+on:
+  push:
+    branches:
+      - claude/cim-mlir-cost-report-and-hardening
+    paths:
+      - "docs/website/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; let an in-flight one finish rather
+# than cancel it out from under a viewer.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/website
+      - id: deployment
+        uses: actions/deploy-pages@v4
