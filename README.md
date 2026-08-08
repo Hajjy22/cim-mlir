@@ -43,7 +43,11 @@ back to a width-preserving requantize (the value is still genuinely clamped) whe
 doesn't — see `lib/Transforms/CIMLegalizePrecision.cpp`'s file header. `cim-lower-to-target`
 folds an identity `memref.subview` of a device-space value through to its source handle,
 exactly the shape `cim-partition` emits slicing a staged activation for a single K-tile,
-and still refuses a genuine (non-identity) slice rather than mislowering it. And
+and now MATERIALIZES a genuine (non-identity) rank-1 slice into a fresh buffer via a new
+`cimrt_copy_range` ABI call instead of refusing it — exactly the shape `cim-partition`
+emits slicing a staged activation once a matmul spans more than one K-tile, and the fix
+that finally lets a real multi-K-tile matmul reach `cimrt_mvm` through this pass at all
+(a higher-rank or non-unit-stride slice is still refused; see below). And
 `cim-lower-to-target` now lowers `cim.requantize` itself, against a new `cimrt_requantize`
 ABI call that does the round-half-away-from-zero and signed-clamp arithmetic device-side —
 so `cim-legalize-precision` (which always inserts a real `cim.requantize`) and
@@ -160,39 +164,48 @@ interpreter: it converts `cim.device_open`/`cim.tile_alloc`/`cim.program`/`cim.m
 round-half-away-from-zero and signed-clamp arithmetic device-side; `cim.reduce_partial`
 against a new `cimrt_reduce_add`, which sums two device buffers elementwise with the same
 wrapping — not saturating — addition `Interpreter.cpp`'s own `runReducePartial` uses, an
-N-operand reduce becoming N-1 chained calls — neither op reproduces its arithmetic a
-second time in generated IR, matching the discipline this pass follows everywhere), with
-every `cimrt_status` checked via `cf.assert` rather than ignored, so the result can go
-through MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and
-come out as a real binary. v0.1's scope is deliberately straight-line code: any `cim` op
-nested inside a loop is refused with a diagnostic rather than mislowered, matching the
-same "refuse rather than guess" discipline as `cim-partition`'s own scope limits below.
-`cim.reduce_partial`'s own lowering composes with a real multi-K-tile matmul from
-`cim-partition` only partway: `cim-partition` slices one shared staged activation buffer
-per K-tile, and a non-identity slice of a device-space buffer still has no lowering here
-(`cimrt_mvm` has no offset/sub-buffer concept — a real, separate, still-open ABI decision,
-see [`docs/roadmap.md`](docs/roadmap.md)'s M4 entry) — so `cim.reduce_partial`'s tests use
-two independently-staged partials instead, a real and fully tested lowering of the op in
-isolation, not yet an end-to-end multi-K-tile pipeline through this pass.
+N-operand reduce becoming N-1 chained calls; a genuine, non-identity slice of a
+device-space buffer against a new `cimrt_copy_range`, a byte-range generalization of
+`cimrt_copy` the same way `cimrt_write`/`cimrt_read`'s own offset parameters generalize a
+whole-buffer transfer — none of these three ops reproduce their arithmetic a second time
+in generated IR, matching the discipline this pass follows everywhere), with every
+`cimrt_status` checked via `cf.assert` rather than ignored, so the result can go through
+MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and come out
+as a real binary. v0.1's scope is deliberately straight-line code: any `cim` op nested
+inside a loop is refused with a diagnostic rather than mislowered, matching the same
+"refuse rather than guess" discipline as `cim-partition`'s own scope limits below (a
+higher-rank or non-unit-stride slice is refused the same way, for the same reason —
+`cimrt_copy_range` moves one contiguous byte range, not a real sub-buffer/gather concept).
+Closing both `cim.reduce_partial` and the non-identity slice in the same session is what
+finally lets a REAL multi-K-tile matmul reach `cimrt_mvm` through this pass end to end —
+`cim-partition` slices one shared staged activation buffer per K-tile, and both pieces
+were needed together before that could reach a real binary at all.
 
 Verified three ways: `test/Transforms/cim-lower-to-target.mlir`'s structural FileCheck
-suite covers every op, every `cim.copy` space combination, `cim.reduce_partial`'s N-1
-call chaining and intermediate-buffer freeing, and every refusal; `test/mlir/pipeline_e2e_test.cpp`
-checks the composed chain's requantize clamp numerically through the interpreter; and
-beyond that, a `cim.mvm`, a `cim.requantize`, and a `cim.reduce_partial` case were each
+suite covers every op, every `cim.copy` space combination, `cim.reduce_partial`'s N-1 call
+chaining and intermediate-buffer freeing, the subview materialization's byte range, and
+every refusal; `test/Transforms/cim-pipeline-multi-k-tile.mlir` runs cim-detect,
+cim-partition, and cim-lower-to-target (and, in one variant, all eight passes) on a real
+two-K-tile `linalg.matmul_transpose_b` and checks it reaches `cimrt_copy_range`/
+`cimrt_mvm`/`cimrt_reduce_add` with no `cim` ops left; and beyond that, a `cim.mvm`, a
+`cim.requantize`, a `cim.reduce_partial`, and — the strongest case — a genuine
+`cim-detect`/`cim-partition`/`cim-lower-to-target`-compiled multi-K-tile matmul were each
 taken all the way through the real conversion pipeline, `mlir-translate`, `clang`, and
 linked against `runtime/libcimrt.a`, then actually **run** as native binaries — computing
 the correct result against the real (simulated) hardware backend, not the interpreter,
 with the `cim.requantize` case clamping a genuine out-of-range value (an 8-bit signed
-clamp can only hold `[-128, 127]`) and the `cim.reduce_partial` case summing two partials
-(10 and 15) to a value (25) neither one is alone, so a `cimrt_reduce_add` that silently
-forwarded one input would be caught. Reproducible on demand as `test/real-target/` (`cmake
--DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs `mlir-opt`/`mlir-translate`/
-`clang` and a linker the main suite has no business depending on to configure): six
-binaries built from three sources (mvm, requantize, reduce_partial) each differing only in
-a constant a `cf.assert` checks a real result against, run via `ctest -R real-target` —
-the correct ones must exit 0 and the wrong ones must genuinely crash, so a broken
-assertion that "always passes" would be caught, not just a broken one that never fires.
+clamp can only hold `[-128, 127]`), the `cim.reduce_partial` case summing two partials (10
+and 15) to a value (25) neither one is alone, and the multi-K-tile case's all-ones 4x8
+weight against activation `[1..8]` needing both K-tiles' contributions combined to reach
+36 (10 or 26 would mean one was silently dropped) — so a broken slice or a broken
+`cimrt_reduce_add` would be caught, not just well-shaped IR. Reproducible on demand as
+`test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs
+`mlir-opt`/`mlir-translate`/`clang` and a linker the main suite has no business depending
+on to configure): eight binaries built from four sources (mvm, requantize, reduce_partial,
+multi-k-tile) each differing only in a constant a `cf.assert` checks a real result
+against, run via `ctest -R real-target` — the correct ones must exit 0 and the wrong ones
+must genuinely crash, so a broken assertion that "always passes" would be caught, not just
+a broken one that never fires.
 
 `cim-partition`'s remaining scope limits (matrix-vector, output-major weights) are each
 refused with a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).

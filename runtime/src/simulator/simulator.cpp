@@ -173,6 +173,28 @@ cimrt_status cimrt_copy(cimrt_buffer *dst, const cimrt_buffer *src) {
   return CIMRT_OK;
 }
 
+cimrt_status cimrt_copy_range(cimrt_buffer *dst, size_t dst_offset,
+                              const cimrt_buffer *src, size_t src_offset,
+                              size_t bytes) {
+  if (!dst || !src)
+    return CIMRT_ERR_INVALID_ARG;
+  if (dst == src)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: dst and src must differ.
+  if (!dst->dev)
+    return CIMRT_ERR_INVALID_ARG; // orphaned -- see cimrt_close's note
+  // Checked against overflow rather than just `offset + bytes > size`,
+  // which wraps for adversarial offsets -- same guard cimrt_write/
+  // cimrt_read already use.
+  if (dst_offset > dst->data.size() || bytes > dst->data.size() - dst_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  if (src_offset > src->data.size() || bytes > src->data.size() - src_offset)
+    return CIMRT_ERR_INVALID_ARG;
+  std::memcpy(dst->data.data() + dst_offset, src->data.data() + src_offset,
+              bytes);
+  dst->dev->cost.recordTransfer(bytes);
+  return CIMRT_OK;
+}
+
 cimrt_status cimrt_write(cimrt_buffer *dst, size_t dst_offset, const void *src,
                           size_t bytes) {
   if (!dst || !src)

@@ -538,6 +538,93 @@ CIM_TEST(cimrt_reduce_add_rejects_invalid_arguments) {
 }
 
 //===----------------------------------------------------------------------===//
+// copy_range: cim-lower-to-target's device-side non-identity subview
+// materialization (a genuine slice of a device-space buffer into a fresh
+// one of the slice's own size)
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(cimrt_copy_range_matches_hand_computed_values) {
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+
+  const std::vector<int64_t> values = {10, 20, 30, 40, 50, 60};
+  Buffer src, dst;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, values.size(), CIMRT_SPACE_NEAR, &src.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 3, CIMRT_SPACE_NEAR, &dst.buf), CIMRT_OK);
+  const std::vector<uint8_t> packed = packSigned(values, 1);
+  CIM_EXPECT_EQ(cimrt_write(src.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  // The middle 3 elements: [20, 30, 40] at byte offset 1.
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 0, src.buf, 1, 3), CIMRT_OK);
+
+  std::vector<uint8_t> raw(3, 0);
+  CIM_EXPECT_EQ(cimrt_read(dst.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 1);
+  CIM_EXPECT_EQ(got[0], 20);
+  CIM_EXPECT_EQ(got[1], 30);
+  CIM_EXPECT_EQ(got[2], 40);
+}
+
+CIM_TEST(cimrt_copy_range_writes_at_a_nonzero_destination_offset) {
+  Device dev;
+  Buffer src, dst;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &src.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &dst.buf), CIMRT_OK);
+  const std::vector<int64_t> values = {1, 2, 3, 4};
+  const std::vector<uint8_t> packed = packSigned(values, 1);
+  CIM_EXPECT_EQ(cimrt_write(src.buf, 0, packed.data(), packed.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 4, src.buf, 0, 4), CIMRT_OK);
+
+  std::vector<uint8_t> raw(8, 0);
+  CIM_EXPECT_EQ(cimrt_read(dst.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 1);
+  for (int i = 0; i < 4; ++i)
+    CIM_EXPECT_EQ(got[i], 0); // untouched leading region
+  for (int i = 0; i < 4; ++i)
+    CIM_EXPECT_EQ(got[4 + i], values[i]);
+}
+
+CIM_TEST(cimrt_copy_range_rejects_invalid_arguments) {
+  Device dev;
+  Buffer src, dst;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &src.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &dst.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_copy_range(nullptr, 0, src.buf, 0, 4),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 0, nullptr, 0, 4),
+                CIMRT_ERR_INVALID_ARG);
+  // dst and src must differ.
+  CIM_EXPECT_EQ(cimrt_copy_range(src.buf, 0, src.buf, 0, 4),
+                CIMRT_ERR_INVALID_ARG);
+  // Out-of-range destination and source windows, including the
+  // overflow-safe form (offset within bounds, but offset + bytes is not).
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 9, src.buf, 0, 1),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 6, src.buf, 0, 4),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 0, src.buf, 9, 1),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 0, src.buf, 6, 4),
+                CIMRT_ERR_INVALID_ARG);
+}
+
+CIM_TEST(cimrt_copy_range_reports_orphaned_destination) {
+  // Matching cimrt_copy/cimrt_write's own orphan handling -- see
+  // cimrt_close's lifetime note in cimrt.h.
+  Buffer dst, src;
+  {
+    Device dev;
+    CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &dst.buf), CIMRT_OK);
+    CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &src.buf), CIMRT_OK);
+  } // dev closes here, orphaning both buffers.
+  CIM_EXPECT_EQ(cimrt_copy_range(dst.buf, 0, src.buf, 0, 4),
+                CIMRT_ERR_INVALID_ARG);
+}
+
+//===----------------------------------------------------------------------===//
 // program + mvm: the arithmetic that had never run
 //===----------------------------------------------------------------------===//
 

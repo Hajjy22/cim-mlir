@@ -293,19 +293,37 @@ wrong.
   suggested.
 
   Composing this with a real multi-K-tile matmul from `cim-partition`
-  still hits a second, separate, genuinely-unsolved limit, though:
-  `cim-partition` slices ONE shared staged activation buffer per K-tile
-  (`memref.subview` with a nonzero offset for every tile past the first),
-  and a non-identity slice of a device-space buffer has no lowering here
-  (`checkAllowedConsumers`'s own diagnostic points at the M4 entry below)
-  -- `cimrt_mvm` has no offset/sub-buffer concept, and giving it one is an
-  ABI decision this v0.1 slice does not make. `cim.reduce_partial`'s own
-  tests (`test/Transforms/cim-lower-to-target.mlir`, the
-  `real-target-e2e-reduce-partial-*` binaries) therefore use two
-  INDEPENDENTLY staged activations rather than cim-partition's real
-  output shape -- a real, tested lowering of the op in isolation, not yet
-  a real end-to-end multi-K-tile pipeline through this pass. `cim.requantize`,
-  originally refused for the same stated reason as `cim.reduce_partial`, is
+  needed one more fix, closed in the same session: `cim-partition` slices
+  ONE shared staged activation buffer per K-tile (`memref.subview` with a
+  nonzero offset for every tile past the first), and a non-identity slice
+  of a device-space buffer used to have no lowering here at all. It does
+  now: a new `cimrt_copy_range` ABI call (`runtime/include/cimrt.h`) --
+  a byte-range generalization of `cimrt_copy` the same way `cimrt_write`/
+  `cimrt_read`'s own offset parameters generalize a whole-buffer transfer
+  -- materializes a rank-1, unit-stride slice of a rank-1 source into a
+  fresh buffer of its own size. `checkAllowedConsumers` computes that byte
+  range while the slice's SOURCE type is still real and records it in a
+  new `materializedSliceRange` map for `lowerSubview` to use once it no
+  longer can (mirroring how `deviceValueElemBits` already closes the
+  analogous gap for element width); a genuinely higher-rank or
+  non-unit-stride slice is still refused, since it has no
+  `cimrt_copy_range` equivalent (one contiguous byte range) and is a real,
+  separate ABI question. Closing this is what finally lets a REAL
+  multi-K-tile matmul reach `cimrt_mvm` through this pass at all --
+  `test/Transforms/cim-pipeline-multi-k-tile.mlir` runs cim-detect,
+  cim-partition, and cim-lower-to-target (and, in its FULL variant,
+  literally all eight passes) on a genuine `linalg.matmul_transpose_b`
+  spanning two K-tiles and checks it reaches `cimrt_copy_range`/
+  `cimrt_mvm`/`cimrt_reduce_add` with no `cim` ops left, and
+  `test/real-target/multi-k-tile-correct`/`-wrong` takes that same real
+  `cim-detect`/`cim-partition`/`cim-lower-to-target` chain all the way
+  through `mlir-translate`, `clang`, and a linker into an actually-run
+  binary (an all-ones 4x8 weight against activation `[1..8]`: every output
+  row must sum all eight activation values to 36, which only happens if
+  both K-tiles' contributions -- and therefore both the slice and the
+  reduce -- are genuinely combined; 10 or 26 would mean one K-tile's
+  contribution was silently dropped). `cim.requantize`, originally
+  refused for the same stated reason as `cim.reduce_partial`, is
   also now lowered (see the composition-hardening entry above): it turned
   out to have no such buffer-lifetime problem in the straight-line,
   single-tile slice, since `cim-legalize-precision` makes it a terminal
@@ -356,7 +374,14 @@ wrong.
   `identity_subview_of_a_device_value_folds` and
   `non_identity_subview_is_refused` cover both directions, and
   `test/Transforms/cim-pipeline-full.mlir` exercises the fold against real
-  `cim-partition` output.
+  `cim-partition` output. The non-identity case's own refusal did not
+  stay refused: it is lowered now too, against a new `cimrt_copy_range`
+  ABI call -- see the `cim.reduce_partial` entry above, which is where
+  that fix actually landed (both were needed together to let a real
+  multi-K-tile matmul reach this pass at all). `non_identity_subview_is_refused`
+  itself was renamed `non_identity_rank1_slice_is_materialized` to match;
+  a new `non_identity_higher_rank_slice_is_still_refused` covers what is
+  still refused.
 
   `cim.requantize` lowering (originally refused outright, see the v0.1
   scope paragraph above). Against a new `cimrt_requantize` ABI call
@@ -588,20 +613,20 @@ out of scope for v0.1 across the board, not just here.
   second-class target file; needs real (or better-estimated) numbers and a
   working lowering to prove retargetability.
 - `cim-legalize-precision` with real `effective_bits` modeling.
-- `cim-lower-to-target` beyond its v0.1 straight-line, single-tile slice:
-  lowering a non-identity `memref.subview` of a device-space buffer
-  (`cimrt_mvm` has no offset/sub-buffer concept, so this needs a real ABI
-  decision -- e.g. a `cimrt_slice`-shaped call, or requiring `cim-partition`
-  to stage each K-tile's activation into its own buffer instead of slicing
-  one shared one) -- this is what still blocks a REAL multi-K-tile matmul
-  from `cim-partition` reaching this pass end to end, and lowering a cim op
-  inside an `scf.for` (needs a real buffer-lifetime story across loop
+- `cim-lower-to-target` beyond its v0.1 straight-line slice: lowering a cim
+  op inside an `scf.for` (needs a real buffer-lifetime story across loop
   iterations, not just within one straight-line block) -- see the Pass 7
-  entry above for exactly what is and is not covered today.
-  `cim.requantize` and `cim.reduce_partial` lowering are both done
-  (composition-hardening entry and the Pass 7 entry above); reduce_partial's
-  own tests use independently-staged partials rather than cim-partition's
-  real sliced-activation shape for exactly the subview reason above.
+  entry above for exactly what is and is not covered today. This is now
+  the ONLY thing separating this pass from handling cim-placement's own
+  loop-hoisted output, now that straight-line code -- single-tile or
+  genuinely multi-K-tile -- is fully covered: `cim.requantize`,
+  `cim.reduce_partial`, and a non-identity rank-1 `memref.subview` (via a
+  new `cimrt_copy_range` ABI call) are all lowered now (composition-
+  hardening entry and the Pass 7 entry above); a real multi-K-tile
+  `linalg.matmul_transpose_b` reaches a real, run binary end to end
+  (`test/Transforms/cim-pipeline-multi-k-tile.mlir`,
+  `test/real-target/multi-k-tile-correct`/`-wrong`), not just each piece
+  tested in isolation.
 - `cimrt_requantize` accounted in the cost model: the target schema's
   `costs:` section needs a requantize/readout entry before
   `cimrt_profile_stop`/`cim-cost-report` can count it (currently zero-cost,

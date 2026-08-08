@@ -51,9 +51,33 @@
 //    input's element width independently of the (always-safe, own) result
 //    type, and a device-space input operand that was already lowered by an
 //    earlier op in this same pass is just a bare !llvm.ptr with no width
-//    of its own -- see deviceValueElemBits below, the second (and only
-//    other) piece of real bookkeeping this pass keeps, for exactly the
-//    same reason tileDevices exists.
+//    of its own -- see deviceValueElemBits below, for exactly the same
+//    reason tileDevices exists.
+//
+//    A genuine (non-identity) memref.subview of a device-space value IS
+//    also now lowered, when it is a rank-1, unit-stride slice of a rank-1
+//    source -- exactly what cim-partition's subView1D emits slicing a
+//    staged activation once a matmul spans more than one K-tile (spec
+//    Sec. 6). This used to be refused outright alongside cim.reduce_partial
+//    and cim.requantize, for the same reason cimrt_mvm has no offset or
+//    sub-buffer concept: there was no ABI call that could express "give me
+//    a fresh buffer holding bytes [offset, offset+length) of this other
+//    buffer." There is now: cimrt_copy_range (runtime/include/cimrt.h), a
+//    byte-range generalization of cimrt_copy the same way cimrt_write/
+//    cimrt_read's own offset parameters generalize a whole-buffer
+//    transfer. checkAllowedConsumers computes the byte range while the
+//    subview's SOURCE type is still real and records it in
+//    materializedSliceRange (below) for lowerSubview to use once it no
+//    longer can (see that map's own comment); an IDENTITY slice (offset 0,
+//    full extent) still folds through with no new buffer, exactly as
+//    before -- this is strictly additive. A higher-rank source, a
+//    non-unit stride, or a dynamic offset/size is still refused: those
+//    have no cimrt_copy_range equivalent (one contiguous byte range) and
+//    are a real, separate ABI decision (M4 in docs/roadmap.md), not
+//    something to guess at here. Closing this is what lets a REAL
+//    multi-K-tile matmul from cim-partition reach cimrt_mvm through this
+//    pass at all -- before, it could only ever reach the first K-tile's
+//    identity slice before tripping this refusal.
 // 3. Memory model: a #cim.space<near|insitu> memref is NOT a real memref
 //    after this pass runs -- cimrt's buffers are opaque handles (you
 //    cannot get a raw pointer into device memory the way memref-to-llvm
@@ -80,8 +104,11 @@
 //    things: which DEVICE a bare i32 tile id belongs to (an integer
 //    carries no such link -- tileDevices, below), and what element WIDTH
 //    an already-lowered !llvm.ptr device value used to have (a pointer
-//    carries no width -- deviceValueElemBits, below, needed only by
-//    lowerRequantize). Those two maps are the only real bookkeeping this
+//    carries no width -- deviceValueElemBits, below, needed by
+//    lowerRequantize and by a materialized subview's own bookkeeping).
+//    A third map, materializedSliceRange, closes a similar gap for a
+//    genuine subview's byte range specifically (see point 2 above and its
+//    own comment). Those three maps are the only real bookkeeping this
 //    pass keeps.
 // 4. Freeing: this pass frees only the SCRATCH buffers it allocates
 //    itself purely to stage one call (weight/activation staging in
@@ -204,6 +231,40 @@ bool isIdentitySubview(memref::SubViewOp view) {
   return true;
 }
 
+/// A static byte offset and length into some buffer.
+struct ByteRange {
+  int64_t offset = 0;
+  int64_t length = 0;
+};
+
+/// The (byte offset, byte length) a rank-1, unit-stride, statically
+/// shaped-and-offset memref.subview describes, computed from the
+/// subview's own RESULT type alone -- deliberately not the SOURCE type,
+/// which may already be ptrTy by the time lowerSubview needs this (file
+/// header point 3): a device value's element width has no home once
+/// rewritten, but a memref.subview op's own declared RESULT type is never
+/// rewritten, only its OPERAND is, so this is safe to call both before
+/// AND after that rewrite -- unlike isIdentitySubview and the source-rank
+/// check in checkAllowedConsumers, which need the SOURCE type and must
+/// only run before it. Fails on a dynamic offset/stride/shape or a
+/// non-unit stride (a genuinely strided gather has no cimrt_copy_range
+/// equivalent, which moves one contiguous byte range).
+FailureOr<ByteRange> rank1ContiguousSliceByteRange(memref::SubViewOp view) {
+  MemRefType resultType = view.getType();
+  if (resultType.getRank() != 1 || !resultType.hasStaticShape())
+    return failure();
+  FailureOr<int64_t> elemBytes = elementByteWidth(resultType.getElementType());
+  if (failed(elemBytes))
+    return failure();
+  SmallVector<int64_t> strides;
+  int64_t offset = 0;
+  if (failed(getStridesAndOffset(resultType, strides, offset)) ||
+      ShapedType::isDynamic(offset) || strides.size() != 1 ||
+      strides[0] != 1)
+    return failure();
+  return ByteRange{offset * *elemBytes, resultType.getShape()[0] * *elemBytes};
+}
+
 /// Lowers one function's straight-line cim ops to cimrt_* calls. One
 /// instance per function so tileDevices never leaks across functions that
 /// do not share SSA values.
@@ -292,6 +353,17 @@ private:
   /// runCimCopy uses, and for the same reason: cim-partition's real output
   /// never opens more than one.
   llvm::SmallVector<Value> openDevices;
+  /// A memref.subview op proved by checkAllowedConsumers to be a genuine
+  /// (non-identity) rank-1 contiguous slice of a device-space value ->
+  /// the byte range it describes. Populated there because computing it
+  /// needs the SOURCE type's rank, which checkAllowedConsumers can still
+  /// see (the source is still real at that point) but lowerSubview cannot
+  /// (file header point 3; see rank1ContiguousSliceByteRange's own
+  /// comment). Absence of an entry for a given op means checkAllowedConsumers
+  /// proved it was the IDENTITY slice instead: lowerSubview folds that case
+  /// straight through to its source handle with no new buffer, exactly as
+  /// it did before this map existed.
+  llvm::DenseMap<Operation *, ByteRange> materializedSliceRange;
 
   //===--------------------------------------------------------------===//
   // Small builders
@@ -414,17 +486,23 @@ private:
   /// lowering here is reported clearly instead of silently becoming
   /// ill-typed IR that only the post-pass verifier would catch, confusingly.
   ///
-  /// A memref.subview user is allowed only when it is an IDENTITY slice
-  /// (isIdentitySubview) -- exactly what cim-partition emits when slicing a
-  /// staged activation for a single K-tile (spec Sec. 6's single-tile v0.1
-  /// case): offset 0, full extent, unit stride, so the "slice" carves out
-  /// the whole buffer and is safe to fold straight through to the same
-  /// handle once lowerSubview reaches it (see that function). A genuine,
-  /// non-identity slice is refused with its own diagnostic: cimrt_mvm takes
-  /// whole buffers, with no offset or sub-buffer concept in the ABI, so
-  /// slicing a real device-space buffer needs an actual ABI decision this
-  /// v0.1 slice does not make (tracked as M4 in docs/roadmap.md), not a
-  /// guess here.
+  /// A memref.subview user is allowed two ways. An IDENTITY slice
+  /// (isIdentitySubview) -- offset 0, full extent, unit stride, so the
+  /// "slice" carves out the whole buffer -- folds straight through to the
+  /// same handle once lowerSubview reaches it, no new buffer (see that
+  /// function). A genuine rank-1, unit-stride slice of a rank-1 source --
+  /// exactly what cim-partition's subView1D emits slicing a staged
+  /// activation per K-tile once there is more than one (spec Sec. 6) -- is
+  /// instead MATERIALIZED into a fresh buffer via a new cimrt_copy_range
+  /// call (runtime/include/cimrt.h), since cimrt_mvm itself has no
+  /// offset/sub-buffer concept of its own; its byte range is recorded in
+  /// materializedSliceRange for lowerSubview to use once it can no longer
+  /// see the source type. Anything else -- a higher-rank source, a
+  /// non-unit stride, a dynamic offset/size -- is refused with its own
+  /// diagnostic: a genuinely strided or multi-dimensional slice has no
+  /// cimrt_copy_range equivalent (it moves one contiguous byte range),
+  /// which is an actual ABI decision this v0.1 slice does not make
+  /// (tracked as M4 in docs/roadmap.md), not a guess here.
   LogicalResult checkAllowedConsumers(Value deviceValue) {
     for (Operation *user : deviceValue.getUsers()) {
       if (isa<ProgramOp, MvmOp, CopyOp, RequantizeOp, ReducePartialOp,
@@ -433,19 +511,28 @@ private:
       if (auto view = dyn_cast<memref::SubViewOp>(user)) {
         if (isIdentitySubview(view))
           continue;
+        if (view.getSourceType().getRank() == 1) {
+          if (FailureOr<ByteRange> range = rank1ContiguousSliceByteRange(view);
+              succeeded(range)) {
+            materializedSliceRange[user] = *range;
+            continue;
+          }
+        }
         return user->emitError(
             "cim-lower-to-target: this memref.subview of a "
-            "#cim.space<near|insitu> value is not an identity slice "
-            "(offset 0, full extent, unit stride) -- cimrt_mvm has no "
-            "offset/sub-buffer concept, so a genuine slice of a "
-            "device-space buffer has no lowering in this v0.1 slice (see "
-            "the M4 roadmap entry)");
+            "#cim.space<near|insitu> value is neither an identity slice "
+            "(offset 0, full extent, unit stride) nor a supported rank-1 "
+            "contiguous slice of a rank-1 source (static offset, static "
+            "size, unit stride) -- cimrt_copy_range moves one contiguous "
+            "byte range and cimrt_mvm has no offset/sub-buffer concept of "
+            "its own, so any other slice shape has no lowering in this "
+            "v0.1 slice (see the M4 roadmap entry)");
       }
       return user->emitError(
           "cim-lower-to-target: this op consumes a #cim.space<near|insitu> "
           "value with no lowering defined for that use in this v0.1 slice "
           "(only cim.program, cim.mvm, cim.copy, cim.requantize, "
-          "cim.reduce_partial, memref.dealloc and an identity "
+          "cim.reduce_partial, memref.dealloc and a supported "
           "memref.subview consuming a device-space value are supported)");
     }
     return success();
@@ -1099,20 +1186,22 @@ private:
   }
 
   /// Folds an identity memref.subview of an already-lowered device-space
-  /// handle straight through to that same handle. Raw operand access, not
-  /// op.getSource() -- same asserting-cast hazard as lowerDealloc's
-  /// operand access, and for the same reason: this op may be looking at an
-  /// operand already rewritten to !llvm.ptr.
+  /// handle straight through to that same handle, or materializes a
+  /// genuine rank-1 slice into a fresh buffer via cimrt_copy_range. Raw
+  /// operand access, not op.getSource() -- same asserting-cast hazard as
+  /// lowerDealloc's operand access, and for the same reason: this op may
+  /// be looking at an operand already rewritten to !llvm.ptr.
   ///
   /// Reaching this function with a ptrTy source at all means
   /// checkAllowedConsumers already proved, back when the source was still
   /// a real memref and its typed accessors were still safe to call, that
-  /// this specific subview is the identity (see isIdentitySubview) --
+  /// this specific subview is either the identity (isIdentitySubview) or a
+  /// supported rank-1 contiguous slice (materializedSliceRange) --
   /// checkAllowedConsumers is the only gate that ever lets a
   /// memref.subview become a consumer of a device-space value, and it
   /// refuses (failing the whole pass) on anything else before this
-  /// function is ever reached. So no shape re-checking is needed here:
-  /// this is a plain, unconditional fold once that invariant holds.
+  /// function is ever reached. So no shape re-checking is needed here,
+  /// only which of the two shapes this particular op was.
   ///
   /// A memref.subview whose source is NOT device-space (the ordinary case
   /// -- e.g. cim-partition's own slicing of a host output buffer) is left
@@ -1121,7 +1210,55 @@ private:
     Value src = op->getOperand(0);
     if (src.getType() != ptrTy)
       return success();
-    op.getResult().replaceAllUsesWith(src);
+
+    auto rangeIt = materializedSliceRange.find(op);
+    if (rangeIt == materializedSliceRange.end()) {
+      // The identity case: a plain, unconditional fold, no new buffer.
+      op.getResult().replaceAllUsesWith(src);
+      op.erase();
+      return success();
+    }
+
+    // A genuine slice: cimrt_mvm (the only real consumer of this shape in
+    // practice) takes whole buffers with no offset concept of its own, so
+    // the slice is materialized into a fresh buffer of its own size.
+    if (openDevices.empty())
+      return op.emitError(
+          "cim-lower-to-target: materializing this memref.subview needs a "
+          "device to allocate the sliced buffer on, but no cim.device_open "
+          "has been lowered yet in this function");
+    Value dev = openDevices.front();
+
+    const ByteRange range = rangeIt->second;
+    MemRefType resultType = op.getType();
+    auto resultSpace = dyn_cast_or_null<SpaceAttr>(resultType.getMemorySpace());
+    const CimrtSpace space = (resultSpace && resultSpace.getKind() == SpaceKind::insitu)
+                                  ? CimrtSpace::kInsitu
+                                  : CimrtSpace::kNear;
+
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    Value sliced = allocBuffer(b, loc, dev, range.length, space);
+    auto fn = getOrInsertFunc(
+        "cimrt_copy_range",
+        b.getFunctionType({ptrTy, i64Ty, ptrTy, i64Ty, i64Ty}, {i32Ty}));
+    Value dstOffset = constI64(b, loc, 0);
+    Value srcOffset = constI64(b, loc, range.offset);
+    Value lengthVal = constI64(b, loc, range.length);
+    Value status = b.create<func::CallOp>(
+                        loc, fn,
+                        ValueRange{sliced, dstOffset, src, srcOffset, lengthVal})
+                       .getResult(0);
+    checkOk(b, loc, status, "cimrt_copy_range failed");
+
+    // Check BEFORE rewriting so an unsupported consumer of the NEW handle
+    // is reported clearly rather than left as ill-typed IR (file header
+    // point 3) -- exactly the same discipline every other device-producing
+    // lowering here follows.
+    if (failed(checkAllowedConsumers(op.getResult())))
+      return failure();
+    op.getResult().replaceAllUsesWith(sliced);
+    deviceValueElemBits[sliced] = resultType.getElementTypeBitWidth();
     op.erase();
     return success();
   }

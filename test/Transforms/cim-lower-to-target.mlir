@@ -215,18 +215,51 @@ memref.global "private" constant @w2 : memref<4x4xi8> = dense<1>
 
 // -----
 
-// A NON-identity memref.subview (a real slice, offset nonzero) of a
-// device-space value is refused -- cimrt_mvm has no offset/sub-buffer
-// concept, so folding it the way the identity case does would silently
-// read the wrong bytes. This is the real multi-K-tile case, deferred to
-// M4 (docs/roadmap.md), not mislowered here.
-func.func @non_identity_subview_is_refused(%act: memref<8xi8>) {
+// A NON-identity, rank-1, unit-stride memref.subview (a real slice, offset
+// nonzero) of a device-space value is MATERIALIZED into a fresh buffer via
+// cimrt_copy_range -- this is the real multi-K-tile case (cim-partition's
+// subView1D slicing a staged activation per K-tile once there is more than
+// one), and closing it is what lets a real multi-K-tile matmul reach
+// cimrt_mvm through this pass at all (test/Transforms/cim-partition.mlir's
+// output for such a matmul, run through this pass, no longer trips this
+// case -- see cim-pipeline-full.mlir's own MULTI_K run line).
+// CHECK-LABEL: func.func @non_identity_rank1_slice_is_materialized
+func.func @non_identity_rank1_slice_is_materialized(%act: memref<8xi8>) {
   %dev = cim.device_open {target = "t"} : !cim.device<"t">
   %near = cim.copy %act : memref<8xi8> to memref<8xi8, #cim.space<near>>
-  // expected-error @+1 {{not an identity slice}}
+  // CHECK: call @cimrt_write(%[[SRC:[0-9]+]],
   %slice = memref.subview %near[4] [4] [1]
            : memref<8xi8, #cim.space<near>> to memref<4xi8, strided<[1], offset: 4>, #cim.space<near>>
+  // A fresh 4-byte buffer, filled from byte offset 4 of the 8-byte source
+  // -- the slice's own offset and size, not the identity case's whole
+  // buffer.
+  // CHECK: call @cimrt_alloc
+  // CHECK: %[[SLICEDPTR:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+  // CHECK: %[[DSTOFF:.*]] = arith.constant 0 : i64
+  // CHECK: %[[SRCOFF:.*]] = arith.constant 4 : i64
+  // CHECK: %[[LEN:.*]] = arith.constant 4 : i64
+  // CHECK: call @cimrt_copy_range(%[[SLICEDPTR]], %[[DSTOFF]], %[[SRC]], %[[SRCOFF]], %[[LEN]])
+  // CHECK-NOT: error
   memref.dealloc %slice : memref<4xi8, strided<[1], offset: 4>, #cim.space<near>>
+  // The dealloc frees the MATERIALIZED buffer, not the original source.
+  // CHECK: call @cimrt_free(%[[SLICEDPTR]])
+  return
+}
+
+// -----
+
+// A non-identity slice of a RANK-2 (or higher) device-space source is still
+// refused: rank1ContiguousSliceByteRange only materializes a rank-1 slice
+// of a rank-1 source, matching cim-partition's actual subView1D output --
+// a genuine multi-dimensional slice is a different, still-open ABI
+// question (see the M4 roadmap entry).
+func.func @non_identity_higher_rank_slice_is_still_refused(%act: memref<4x8xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %near = cim.copy %act : memref<4x8xi8> to memref<4x8xi8, #cim.space<near>>
+  // expected-error @+1 {{neither an identity slice}}
+  %slice = memref.subview %near[0, 4] [4, 4] [1, 1]
+           : memref<4x8xi8, #cim.space<near>> to memref<4x4xi8, strided<[8, 1], offset: 4>, #cim.space<near>>
+  memref.dealloc %slice : memref<4x4xi8, strided<[8, 1], offset: 4>, #cim.space<near>>
   return
 }
 

@@ -111,6 +111,19 @@ cimrt_status cimrt_copy(cimrt_buffer *dst, const cimrt_buffer *src);
 /* Safe to call on a buffer whose device has already been closed. */
 void cimrt_free(cimrt_buffer *buf);
 
+/* Copies `bytes` starting at `src_offset` in `src` to `bytes` starting at
+ * `dst_offset` in `dst` -- a byte-range generalization of cimrt_copy (which
+ * requires the two buffers be the same whole size) for cim-lower-to-target's
+ * benefit: materializing a genuine (non-identity) memref.subview of a
+ * device-space buffer into a fresh buffer of the slice's own size, the one
+ * case cimrt_copy's whole-buffer-only contract cannot express. `dst` and
+ * `src` must be different buffers (no aliasing support, matching
+ * cimrt_reduce_add's own out/input restriction); `dst_offset + bytes` must
+ * not exceed `dst`'s size, nor `src_offset + bytes` exceed `src`'s. */
+cimrt_status cimrt_copy_range(cimrt_buffer *dst, size_t dst_offset,
+                               const cimrt_buffer *src, size_t src_offset,
+                               size_t bytes);
+
 /* Host <-> buffer transfer.
  *
  * Without these there is no way to get a nonzero byte into a buffer at all:

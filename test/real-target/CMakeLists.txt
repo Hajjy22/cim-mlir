@@ -56,15 +56,36 @@ function(add_real_target_object NAME TEMPLATE EXPECTED_VALUE)
 
   add_custom_command(
     OUTPUT ${lowered_src}
+    # cim-detect/cim-partition run ahead of cim-lower-to-target for every
+    # variant, not just the multi-k-tile ones below: they are true no-ops
+    # on a template with no linalg.matmul_transpose_b in it (detect finds
+    # no candidate, partition has nothing marked to rewrite), so this is
+    # free for check.mlir.in/check-requantize.mlir.in/
+    # check-reduce-partial.mlir.in and is what lets check-multi-k-tile.mlir.in
+    # start from a real linalg op -- the actual compiler front door -- like
+    # a real caller would, rather than hand-writing cim ops cim-partition
+    # itself would have produced.
     COMMAND $<TARGET_FILE:cim-opt> ${configured_src}
+            --cim-detect
+            --cim-partition=target-yaml=${CIM_REAL_TARGET_YAML}
             --cim-lower-to-target=target-yaml=${CIM_REAL_TARGET_YAML}
             -o ${lowered_src}
     DEPENDS cim-opt ${configured_src}
-    COMMENT "real-target-e2e (${NAME}): cim-lower-to-target")
+    COMMENT "real-target-e2e (${NAME}): cim-detect/cim-partition/cim-lower-to-target")
 
   add_custom_command(
     OUTPUT ${llvm_dialect_src}
+    # --expand-strided-metadata ahead of --finalize-memref-to-llvm: without
+    # it, a rank-2 host memref.alloc that is both memref.copy'd into and
+    # memref.subview'd (the shape check-multi-k-tile.mlir.in's staged
+    # activation buffer needs -- see its own header) leaves a dangling
+    # unrealized_conversion_cast --reconcile-unrealized-casts cannot clear,
+    # because FinalizeMemRefToLLVM's own memref.copy pattern does not
+    # otherwise resolve the subview's strided layout back to the alloc's
+    # plain one. The other, simpler templates never exercised that
+    # combination, which is why this was not needed until now.
     COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${lowered_src}
+            --expand-strided-metadata
             --finalize-memref-to-llvm --convert-func-to-llvm
             --convert-arith-to-llvm --convert-cf-to-llvm
             --reconcile-unrealized-casts
@@ -102,9 +123,16 @@ add_real_target_object(requantize-wrong check-requantize.mlir.in 999)
 # header for why neither partial alone can pass this check.
 add_real_target_object(reduce-partial-correct check-reduce-partial.mlir.in 25)
 add_real_target_object(reduce-partial-wrong check-reduce-partial.mlir.in 999)
+# A genuine multi-K-tile linalg.matmul_transpose_b through the real
+# cim-detect/cim-partition/cim-lower-to-target chain -- see
+# check-multi-k-tile.mlir.in's own header for why 36 is the value that
+# proves both K-tiles' contributions were actually combined.
+add_real_target_object(multi-k-tile-correct check-multi-k-tile.mlir.in 36)
+add_real_target_object(multi-k-tile-wrong check-multi-k-tile.mlir.in 999)
 
 foreach(variant correct wrong requantize-correct requantize-wrong
-                reduce-partial-correct reduce-partial-wrong)
+                reduce-partial-correct reduce-partial-wrong
+                multi-k-tile-correct multi-k-tile-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
     ${CIM_REAL_TARGET_OBJ_${variant}})
@@ -122,6 +150,20 @@ add_test(NAME real-target-e2e-requantize-correct-value-passes
          COMMAND real-target-e2e-requantize-correct)
 add_test(NAME real-target-e2e-reduce-partial-correct-value-passes
          COMMAND real-target-e2e-reduce-partial-correct)
+# Needs WORKING_DIRECTORY, unlike every other variant here: those all
+# hand-write cim.device_open with @CIM_REAL_TARGET_YAML@ (an absolute
+# path) substituted directly into the target string. check-multi-k-tile
+# .mlir.in has no cim.device_open of its own -- cim-partition inserts one
+# itself, using the target file's own `name:` field ("tiny-4x4"), which
+# cimrt_open then resolves as a RELATIVE path ("targets/tiny-4x4.yaml")
+# against the process's current directory. tiny-4x4.yaml is a test-only
+# fixture that lives under test/targets/, not the top-level targets/ real
+# target files resolve against, so the working directory has to be
+# test/, specifically -- the repo root is not enough (there is no
+# top-level targets/tiny-4x4.yaml to find there).
+add_test(NAME real-target-e2e-multi-k-tile-correct-value-passes
+         COMMAND real-target-e2e-multi-k-tile-correct
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
 
 # The whole point of these two variants: cf.assert firing inside the
 # compiled binary is a real SIGABRT, not just a nonzero exit -- and CTest's
@@ -139,3 +181,6 @@ add_test(NAME real-target-e2e-requantize-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-requantize-wrong>")
 add_test(NAME real-target-e2e-reduce-partial-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-partial-wrong>")
+add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-multi-k-tile-wrong>"
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
