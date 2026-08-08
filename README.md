@@ -19,7 +19,9 @@ It is not a general ML compiler (it plugs in below IREE/TVM/XLA as a backend), n
 and not analog-first — the first working targets are digital/near-memory, because that is
 what ships today. See [`docs/abstraction.md`](docs/abstraction.md) for the hardware
 abstraction model, which is the actual intellectual contribution of this project — read it
-before the code.
+before the code. [`docs/website/index.html`](docs/website/index.html) is the same material
+laid out as a single reference page (diagrams, the pipeline, the full dialect) — open it
+directly in a browser.
 
 ## Status
 
