@@ -5,10 +5,10 @@
 # documented in lib/Transforms/CIMLowerToTarget.cpp's file header, now
 # reproducible with one build instead of by hand.
 #
-# Two variant PAIRS, each built from its own MLIR template (check.mlir.in
-# for cim.mvm, check-requantize.mlir.in for cim.requantize -- see that
-# file's own header), differing only in the constant a cf.assert checks a
-# real result against:
+# Several variant PAIRS, each built from its own MLIR template (check.mlir.in
+# for cim.mvm, check-requantize.mlir.in for cim.requantize, ...  -- see
+# each template's own header), differing only in the constant a cf.assert
+# checks a real result against:
 #   correct -- the true value; the binary must exit 0.
 #   wrong   -- a deliberately false value; cf.assert must fire, so the
 #              binary must genuinely crash (SIGABRT), not exit cleanly.
@@ -56,22 +56,26 @@ function(add_real_target_object NAME TEMPLATE EXPECTED_VALUE)
 
   add_custom_command(
     OUTPUT ${lowered_src}
-    # cim-detect/cim-partition run ahead of cim-lower-to-target for every
-    # variant, not just the multi-k-tile ones below: they are true no-ops
-    # on a template with no linalg.matmul_transpose_b in it (detect finds
-    # no candidate, partition has nothing marked to rewrite), so this is
-    # free for check.mlir.in/check-requantize.mlir.in/
-    # check-reduce-partial.mlir.in and is what lets check-multi-k-tile.mlir.in
-    # start from a real linalg op -- the actual compiler front door -- like
-    # a real caller would, rather than hand-writing cim ops cim-partition
-    # itself would have produced.
+    # cim-detect/cim-partition/cim-placement all run ahead of
+    # cim-lower-to-target for every variant, not just check-loop.mlir.in/
+    # check-multi-k-tile.mlir.in below: they are true no-ops on a template
+    # with no linalg.matmul_transpose_b in it (detect finds no candidate,
+    # partition has nothing marked to rewrite, placement has no
+    # cim.program to reuse or hoist), so this is free for
+    # check.mlir.in/check-requantize.mlir.in/check-reduce-partial.mlir.in
+    # and is what lets check-loop.mlir.in/check-multi-k-tile.mlir.in start
+    # from a real linalg op -- the actual compiler front door -- like a
+    # real caller would, rather than hand-writing cim ops cim-partition
+    # (and, for a multi-row matmul, cim-placement's own loop hoisting --
+    # see check-loop.mlir.in's own header) would have produced.
     COMMAND $<TARGET_FILE:cim-opt> ${configured_src}
             --cim-detect
             --cim-partition=target-yaml=${CIM_REAL_TARGET_YAML}
+            --cim-placement=target-yaml=${CIM_REAL_TARGET_YAML}
             --cim-lower-to-target=target-yaml=${CIM_REAL_TARGET_YAML}
             -o ${lowered_src}
     DEPENDS cim-opt ${configured_src}
-    COMMENT "real-target-e2e (${NAME}): cim-detect/cim-partition/cim-lower-to-target")
+    COMMENT "real-target-e2e (${NAME}): cim-detect/cim-partition/cim-placement/cim-lower-to-target")
 
   add_custom_command(
     OUTPUT ${llvm_dialect_src}
@@ -84,8 +88,22 @@ function(add_real_target_object NAME TEMPLATE EXPECTED_VALUE)
     # otherwise resolve the subview's strided layout back to the alloc's
     # plain one. The other, simpler templates never exercised that
     # combination, which is why this was not needed until now.
+    #
+    # --convert-scf-to-cf ahead of everything else, and --lower-affine
+    # ahead of THAT: check-loop.mlir.in is the first template whose
+    # cim-lower-to-target output still has a real scf.for in it (a loop
+    # body cim-lower-to-target lowered in place -- see its file header
+    # point 1), and --expand-strided-metadata turns that loop's
+    # per-iteration memref.subview (a dynamic, per-row offset) into an
+    # affine.apply computing the byte offset, which nothing else here
+    # converts to something --convert-to-llvm's interfaces understand
+    # -- --lower-affine is what does. Both must run before
+    # --convert-cf-to-llvm specifically: converting cf.assert into
+    # multi-block LLVM-dialect control flow before scf.for's own single
+    # block has been converted to blocks itself leaves a loop region with
+    # more than the one block scf.for's own verifier allows.
     COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${lowered_src}
-            --expand-strided-metadata
+            --expand-strided-metadata --lower-affine --convert-scf-to-cf
             --finalize-memref-to-llvm --convert-func-to-llvm
             --convert-arith-to-llvm --convert-cf-to-llvm
             --reconcile-unrealized-casts
@@ -129,10 +147,18 @@ add_real_target_object(reduce-partial-wrong check-reduce-partial.mlir.in 999)
 # proves both K-tiles' contributions were actually combined.
 add_real_target_object(multi-k-tile-correct check-multi-k-tile.mlir.in 36)
 add_real_target_object(multi-k-tile-wrong check-multi-k-tile.mlir.in 999)
+# A genuine multi-ROW linalg.matmul_transpose_b, through cim-placement's
+# own loop hoisting this time (not just cim-detect/cim-partition) -- see
+# check-loop.mlir.in's own header for why 951 is the checksum that proves
+# all three loop iterations independently computed and kept their own
+# correct per-row result.
+add_real_target_object(loop-correct check-loop.mlir.in 951)
+add_real_target_object(loop-wrong check-loop.mlir.in 999)
 
 foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
-                multi-k-tile-correct multi-k-tile-wrong)
+                multi-k-tile-correct multi-k-tile-wrong
+                loop-correct loop-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
     ${CIM_REAL_TARGET_OBJ_${variant}})
@@ -164,6 +190,11 @@ add_test(NAME real-target-e2e-reduce-partial-correct-value-passes
 add_test(NAME real-target-e2e-multi-k-tile-correct-value-passes
          COMMAND real-target-e2e-multi-k-tile-correct
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+# Same WORKING_DIRECTORY reason as multi-k-tile above: check-loop.mlir.in
+# also has no cim.device_open of its own -- cim-partition inserts one.
+add_test(NAME real-target-e2e-loop-correct-value-passes
+         COMMAND real-target-e2e-loop-correct
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
 
 # The whole point of these two variants: cf.assert firing inside the
 # compiled binary is a real SIGABRT, not just a nonzero exit -- and CTest's
@@ -183,4 +214,7 @@ add_test(NAME real-target-e2e-reduce-partial-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-partial-wrong>")
 add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-multi-k-tile-wrong>"
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME real-target-e2e-loop-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-loop-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)

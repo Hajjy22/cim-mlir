@@ -171,41 +171,65 @@ whole-buffer transfer — none of these three ops reproduce their arithmetic a s
 in generated IR, matching the discipline this pass follows everywhere), with every
 `cimrt_status` checked via `cf.assert` rather than ignored, so the result can go through
 MLIR's standard `--convert-to-llvm` pipeline, `mlir-translate`, and a linker, and come out
-as a real binary. v0.1's scope is deliberately straight-line code: any `cim` op nested
-inside a loop is refused with a diagnostic rather than mislowered, matching the same
-"refuse rather than guess" discipline as `cim-partition`'s own scope limits below (a
-higher-rank or non-unit-stride slice is refused the same way, for the same reason —
-`cimrt_copy_range` moves one contiguous byte range, not a real sub-buffer/gather concept).
-Closing both `cim.reduce_partial` and the non-identity slice in the same session is what
-finally lets a REAL multi-K-tile matmul reach `cimrt_mvm` through this pass end to end —
-`cim-partition` slices one shared staged activation buffer per K-tile, and both pieces
-were needed together before that could reach a real binary at all.
+as a real binary. v0.1's scope now covers straight-line code PLUS one level of `scf.for`
+nesting — exactly the shape `cim-placement`'s own loop hoisting produces once a matmul's
+activation has more than one row (`cim-partition` implements the matrix-*vector* contract
+only, so a multi-row loop is always the caller's, never something it introduces itself).
+Every buffer this pass allocates while lowering a recognized loop's body — the activation
+stage's device buffer, `cim.mvm`'s result, a readback's host buffer — is created ONCE,
+immediately before the loop, and REUSED every iteration rather than realloc'd at the
+op's own (in-loop) position, which would otherwise leak one buffer's worth of memory on
+every iteration but the last; a buffer's matching free (a `cimrt_free`, or a real
+`memref.dealloc`) is, symmetrically, deferred to just after the loop whenever that
+specific buffer's own allocation was itself hoisted, since freeing the one shared, reused
+handle on whichever iteration the original free sat on would be a use-after-free for
+every later iteration. A cim op nested any deeper than that one level (a second `scf.for`,
+an `scf.if`, or a loop with loop-carried `iter_args`) is still refused with a diagnostic
+rather than mislowered, matching the same "refuse rather than guess" discipline as
+`cim-partition`'s own scope limits below (a higher-rank or non-unit-stride slice is
+refused the same way, for the same reason — `cimrt_copy_range` moves one contiguous byte
+range, not a real sub-buffer/gather concept). Closing both `cim.reduce_partial` and the
+non-identity slice in the same session is what finally lets a REAL multi-K-tile matmul
+reach `cimrt_mvm` through this pass end to end — `cim-partition` slices one shared staged
+activation buffer per K-tile, and both pieces were needed together before that could reach
+a real binary at all.
 
 Verified three ways: `test/Transforms/cim-lower-to-target.mlir`'s structural FileCheck
 suite covers every op, every `cim.copy` space combination, `cim.reduce_partial`'s N-1 call
-chaining and intermediate-buffer freeing, the subview materialization's byte range, and
-every refusal; `test/Transforms/cim-pipeline-multi-k-tile.mlir` runs cim-detect,
-cim-partition, and cim-lower-to-target (and, in one variant, all eight passes) on a real
-two-K-tile `linalg.matmul_transpose_b` and checks it reaches `cimrt_copy_range`/
-`cimrt_mvm`/`cimrt_reduce_add` with no `cim` ops left; and beyond that, a `cim.mvm`, a
-`cim.requantize`, a `cim.reduce_partial`, and — the strongest case — a genuine
-`cim-detect`/`cim-partition`/`cim-lower-to-target`-compiled multi-K-tile matmul were each
-taken all the way through the real conversion pipeline, `mlir-translate`, `clang`, and
-linked against `runtime/libcimrt.a`, then actually **run** as native binaries — computing
-the correct result against the real (simulated) hardware backend, not the interpreter,
-with the `cim.requantize` case clamping a genuine out-of-range value (an 8-bit signed
-clamp can only hold `[-128, 127]`), the `cim.reduce_partial` case summing two partials (10
-and 15) to a value (25) neither one is alone, and the multi-K-tile case's all-ones 4x8
-weight against activation `[1..8]` needing both K-tiles' contributions combined to reach
-36 (10 or 26 would mean one was silently dropped) — so a broken slice or a broken
-`cimrt_reduce_add` would be caught, not just well-shaped IR. Reproducible on demand as
-`test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`, default OFF since it needs
-`mlir-opt`/`mlir-translate`/`clang` and a linker the main suite has no business depending
-on to configure): eight binaries built from four sources (mvm, requantize, reduce_partial,
-multi-k-tile) each differing only in a constant a `cf.assert` checks a real result
-against, run via `ctest -R real-target` — the correct ones must exit 0 and the wrong ones
-must genuinely crash, so a broken assertion that "always passes" would be caught, not just
-a broken one that never fires.
+chaining and intermediate-buffer freeing, the subview materialization's byte range, the
+loop case's buffer hoisting and deferred frees (both a device handle's `cimrt_free` and a
+host buffer's `memref.dealloc` moved to just after the loop), and every refusal (including
+the loop-specific ones — loop-carried values, nesting two levels deep);
+`test/Transforms/cim-pipeline-multi-k-tile.mlir` runs cim-detect, cim-partition, and
+cim-lower-to-target (and, in one variant, all eight passes) on a real two-K-tile
+`linalg.matmul_transpose_b` and checks it reaches `cimrt_copy_range`/`cimrt_mvm`/
+`cimrt_reduce_add` with no `cim` ops left; and beyond that, a `cim.mvm`, a `cim.requantize`,
+a `cim.reduce_partial`, a genuine `cim-detect`/`cim-partition`/`cim-lower-to-target`-compiled
+multi-K-tile matmul, and — the newest, the loop case — a genuine multi-row matmul run
+through `cim-detect`/`cim-partition`/`cim-placement`/`cim-lower-to-target` were each taken
+all the way through the real conversion pipeline (the loop case needs `--lower-affine` and
+`--convert-scf-to-cf` too, ahead of `--convert-cf-to-llvm` specifically — a dynamic
+per-iteration `memref.subview` offset becomes an `affine.apply` no other pass here
+converts, and `cf.assert`'s own multi-block lowering must not run before `scf.for`'s
+single block has itself become real control flow), `mlir-translate`, `clang`, and linked
+against `runtime/libcimrt.a`, then actually **run** as native binaries — computing the
+correct result against the real (simulated) hardware backend, not the interpreter, with
+the `cim.requantize` case clamping a genuine out-of-range value (an 8-bit signed clamp can
+only hold `[-128, 127]`), the `cim.reduce_partial` case summing two partials (10 and 15) to
+a value (25) neither one is alone, the multi-K-tile case's all-ones 4x8 weight against
+activation `[1..8]` needing both K-tiles' contributions combined to reach 36 (10 or 26
+would mean one was silently dropped), and the loop case's three rows (identity weight,
+each row's first activation element distinct — 1, 5, 9) combining into one checksum (951)
+that only comes out right if all three iterations independently computed and *kept* their
+own correct value rather than clobbering or reusing a stale one — so a broken slice, a
+broken `cimrt_reduce_add`, or a broken buffer-hoist would be caught, not just well-shaped
+IR. Reproducible on demand as `test/real-target/` (`cmake -DCIM_ENABLE_REAL_TARGET_E2E=ON`,
+default OFF since it needs `mlir-opt`/`mlir-translate`/`clang` and a linker the main suite
+has no business depending on to configure): ten binaries built from five sources (mvm,
+requantize, reduce_partial, multi-k-tile, loop) each differing only in a constant a
+`cf.assert` checks a real result against, run via `ctest -R real-target` — the correct
+ones must exit 0 and the wrong ones must genuinely crash, so a broken assertion that
+"always passes" would be caught, not just a broken one that never fires.
 
 `cim-partition`'s remaining scope limits (matrix-vector, output-major weights) are each
 refused with a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).

@@ -447,15 +447,164 @@ func.func @requantize_device_narrows_and_stays_a_handle(%act: memref<4xi32>) {
 
 // -----
 
-// A cim op nested inside a region (an scf.for body -- exactly what
-// cim-placement's loop hoisting produces) has no lowering yet.
-func.func @op_inside_a_loop_is_refused(%dev: !cim.device<"t">) {
+// A cim op nested one level inside an scf.for body -- exactly what
+// cim-placement's loop hoisting produces once a matmul does not fit
+// entirely resident (spec Sec. 6) -- IS now lowered: this is the loop
+// case file header point 1 describes. Every buffer this pass allocates
+// while lowering the loop's body (the activation-stage cim.copy's device
+// buffer, cim.mvm's result, the readback cim.copy's host buffer) is
+// created ONCE, immediately before scf.for, and REUSED every iteration --
+// only the write/compute/read calls that use those buffers stay inside
+// the loop body. The per-row activation is staged into a local buffer
+// FIRST, at a static offset, before ever reaching cim.copy -- exactly
+// what real cim-placement output does (see this file's own top comment
+// and test/Transforms/cim-placement-loop.mlir) and for the same reason:
+// a memref.subview's dynamic per-iteration offset is not something
+// memref.extract_aligned_pointer_as_index (hostPointer, this file's own
+// helper) accounts for, so cim.copy itself is only ever fed a statically
+// (here, zero-)offset memref, never a dynamically offset one directly.
+//
+// Manually verified once beyond what this structural check covers, the
+// same way @straight_line_lowers_every_op's own header comment does for
+// the non-loop case: this exact shape, taken through MLIR's
+// --convert-to-llvm pipeline (plus --expand-strided-metadata and
+// --lower-affine, which a dynamic per-iteration subview offset needs and
+// no straight-line template exercised before), mlir-translate, clang,
+// and linked against the real runtime/libcimrt.a, computed the correct
+// per-row result for all three rows of a real multi-row matmul when
+// actually RUN as a native binary (test/real-target/check-loop.mlir.in).
+// CHECK-LABEL: func.func @loop_hoists_and_reuses_its_buffers
+func.func @loop_hoists_and_reuses_its_buffers(%acts: memref<3x4xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %t = cim.tile_alloc %dev {id = 0 : i64} : (!cim.device<"t">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w3 : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c3 = arith.constant 3 : index
   scf.for %i = %c0 to %c3 step %c1 {
-    // expected-error @+1 {{only lowers straight-line code}}
+    %rowview = memref.subview %acts[%i, 0] [1, 4] [1, 1]
+               : memref<3x4xi8> to memref<1x4xi8, strided<[4, 1], offset: ?>>
+    %local = memref.alloc() : memref<1x4xi8>
+    memref.copy %rowview, %local : memref<1x4xi8, strided<[4, 1], offset: ?>> to memref<1x4xi8>
+    %row = memref.subview %local[0, 0] [1, 4] [1, 1]
+           : memref<1x4xi8> to memref<4xi8, strided<[1]>>
+    %near = cim.copy %row : memref<4xi8, strided<[1]>> to memref<4xi8, #cim.space<near>>
+    %out = cim.mvm %r, %near : (!cim.resident<4x4xi8>, memref<4xi8, #cim.space<near>>) -> memref<4xi32, #cim.space<near>>
+    %host = cim.copy %out : memref<4xi32, #cim.space<near>> to memref<4xi32>
+    memref.dealloc %local : memref<1x4xi8>
+    memref.dealloc %host : memref<4xi32>
+  }
+  return
+}
+memref.global "private" constant @w3 : memref<4x4xi8> = dense<1>
+// CHECK: call @cimrt_program
+// Both cimrt_alloc calls this loop's body needs (the activation-stage
+// copy's device buffer, the mvm's result buffer) happen ONCE, before
+// scf.for -- not one of them repeated inside it.
+// CHECK: %[[ACTBUF:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// CHECK: %[[OUTBUF:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// The readback copy's host buffer is a real memref.alloc, also hoisted
+// before the loop.
+// CHECK: %[[HOSTBUF:.*]] = memref.alloc()
+// CHECK: scf.for
+// CHECK-NOT: cimrt_alloc
+// Every iteration writes fresh activation bytes into the SAME %[[ACTBUF]],
+// computes into the SAME %[[OUTBUF]], and reads back into the SAME
+// %[[HOSTBUF]] -- reused, not reallocated.
+// CHECK: call @cimrt_write(%[[ACTBUF]]
+// CHECK: call @cimrt_mvm(%{{.*}}, %{{.*}}, %[[ACTBUF]], %[[OUTBUF]]
+// CHECK: call @cimrt_read(%[[OUTBUF]]
+// CHECK-NOT: cimrt_alloc
+// %local's own real memref.dealloc is left completely alone (it is not a
+// buffer this pass created, so hoistedThisLoop never has it) -- an
+// ordinary per-iteration alloc/dealloc pair cim-placement's own
+// scaffolding is responsible for, matching the traced real pipeline
+// shape exactly. (The printer does not preserve %local's source name, so
+// this matches on its type instead of a specific SSA name.)
+// CHECK: memref.dealloc %{{.*}} : memref<1x4xi8>
+// The readback host buffer's dealloc is different: %[[HOSTBUF]] IS a
+// buffer this pass hoisted out of the loop, so its dealloc must not stay
+// at this (every-iteration) position -- it is relocated to just after
+// the loop instead (see the next test for a device buffer's equivalent).
+// CHECK: }
+// CHECK-NEXT: memref.dealloc %[[HOSTBUF]]
+// CHECK-NOT: cim.copy
+// CHECK-NOT: cim.mvm
+
+// -----
+
+// The device-buffer equivalent of the previous test's host-buffer check:
+// an explicit memref.dealloc INSIDE the loop body, targeting a device
+// value this pass itself hoisted out of the loop (a cim.copy result kept
+// alive as a handle -- file header point 4), must have its cimrt_free
+// deferred to just after the loop too, not left at the dealloc's own
+// (every-iteration) position: freeing the one shared, reused buffer on
+// the first iteration would make every later iteration's cimrt_write
+// into it a use-after-free.
+// CHECK-LABEL: func.func @loop_defers_a_hoisted_device_buffers_free
+func.func @loop_defers_a_hoisted_device_buffers_free(%acts: memref<3x4xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c3 = arith.constant 3 : index
+  scf.for %i = %c0 to %c3 step %c1 {
+    %rowview = memref.subview %acts[%i, 0] [1, 4] [1, 1]
+               : memref<3x4xi8> to memref<1x4xi8, strided<[4, 1], offset: ?>>
+    %local = memref.alloc() : memref<1x4xi8>
+    memref.copy %rowview, %local : memref<1x4xi8, strided<[4, 1], offset: ?>> to memref<1x4xi8>
+    %row = memref.subview %local[0, 0] [1, 4] [1, 1]
+           : memref<1x4xi8> to memref<4xi8, strided<[1]>>
+    %near = cim.copy %row : memref<4xi8, strided<[1]>> to memref<4xi8, #cim.space<near>>
+    memref.dealloc %local : memref<1x4xi8>
+    memref.dealloc %near : memref<4xi8, #cim.space<near>>
+  }
+  return
+}
+// CHECK: call @cimrt_alloc
+// CHECK: %[[BUF:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// CHECK: scf.for
+// CHECK: call @cimrt_write(%[[BUF]]
+// CHECK-NOT: call @cimrt_free
+// CHECK: }
+// CHECK-NEXT: call @cimrt_free(%[[BUF]])
+
+// -----
+
+// An scf.for with loop-carried values (iter_args) whose body contains a
+// cim op has no lowering in this v0.1 slice: loopHoistBefore's hoisting
+// design assumes a buffer created before the loop is the only value that
+// needs to survive across iterations, and says nothing about a value
+// that is itself part of the loop's own carried state.
+func.func @loop_with_carried_values_is_refused(%dev: !cim.device<"t">) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c3 = arith.constant 3 : index
+  %init = arith.constant 0 : i32
+  // expected-error @+1 {{loop-carried values}}
+  %result = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %init) -> i32 {
     cim.barrier %dev : !cim.device<"t">
+    scf.yield %acc : i32
+  }
+  return
+}
+
+// -----
+
+// A cim op nested TWO levels deep -- inside an scf.if inside an scf.for --
+// is still refused: "one level" is the whole of what loopHoistBefore's
+// hoisting handles (file header point 1). A doubly nested scf.for would
+// trip the same check the same way.
+func.func @doubly_nested_cim_op_is_refused(%dev: !cim.device<"t">, %cond: i1) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c3 = arith.constant 3 : index
+  // expected-error @+1 {{nested more than one level deep}}
+  scf.for %i = %c0 to %c3 step %c1 {
+    scf.if %cond {
+      cim.barrier %dev : !cim.device<"t">
+    }
   }
   return
 }

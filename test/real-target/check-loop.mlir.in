@@ -1,0 +1,73 @@
+// Sibling of check.mlir.in and check-multi-k-tile.mlir.in, configured the
+// same way (see check.mlir.in's own header and this directory's
+// CMakeLists.txt) into loop-correct.mlir (EXPECTED_VALUE=951) and
+// loop-wrong.mlir (EXPECTED_VALUE=999).
+//
+// Unlike every other template here, this one needs cim-placement in the
+// pass chain too, not just cim-detect/cim-partition, AND hand-writes its
+// own scf.for: cim-partition implements the v0.1 matrix-VECTOR contract
+// only (a single output row per linalg.matmul_transpose_b -- a multi-row
+// matmul is left unoffloaded, with a diagnostic saying so), so a loop
+// over rows is the CALLER's job, not something cim-partition introduces
+// itself. This is exactly the shape
+// test/Transforms/cim-placement-loop.mlir's own @fits_hoists_entirely
+// uses to test cim-placement's loop-hoisting structurally: a hand-written
+// scf.for whose body does one row's linalg.matmul_transpose_b (a real
+// v0.1-shaped candidate cim-detect DOES accept) against a per-row staged
+// activation buffer. cim-partition rewrites that single-row matmul into
+// cim ops on each pass through the (textual) loop body; cim-placement
+// then hoists the loop-invariant weight programming entirely above
+// scf.for, leaving the per-row activation-stage/mvm/readback sequence
+// inside it -- lowering ops INSIDE that loop body is this session's
+// newest capability in cim-lower-to-target (see its file header point 1).
+//
+// A 4x4 IDENTITY weight, so cim.mvm's result is just each activation row
+// unchanged: out[i][j] = act[i][j]. Three rows, each with a DIFFERENT
+// first element (1, 5, 9) -- if the loop's hoisted buffers were reused
+// incorrectly (a write landing in the wrong iteration's buffer, or a
+// stale value surviving from a previous iteration instead of being
+// overwritten), at least one row would read back some OTHER row's value
+// instead of its own. The checksum below (out[0][0] + 10*out[1][0] +
+// 100*out[2][0] = 1 + 50 + 900 = 951) only comes out right if all three
+// iterations independently computed and preserved their own correct
+// value.
+func.func @run_check() {
+  %actInit = memref.get_global @actInit : memref<3x4xi8>
+  %acts = memref.alloc() : memref<3x4xi8>
+  memref.copy %actInit, %acts : memref<3x4xi8> to memref<3x4xi8>
+  %w = memref.get_global @w : memref<4x4xi8>
+  %out = memref.alloc() : memref<3x4xi32>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c3 = arith.constant 3 : index
+  scf.for %i = %c0 to %c3 step %c1 {
+    %actRow = memref.subview %acts[%i, 0] [1, 4] [1, 1]
+      : memref<3x4xi8> to memref<1x4xi8, strided<[4, 1], offset: ?>>
+    %actLocal = memref.alloc() : memref<1x4xi8>
+    memref.copy %actRow, %actLocal
+      : memref<1x4xi8, strided<[4, 1], offset: ?>> to memref<1x4xi8>
+    %outRow = memref.subview %out[%i, 0] [1, 4] [1, 1]
+      : memref<3x4xi32> to memref<1x4xi32, strided<[4, 1], offset: ?>>
+    linalg.matmul_transpose_b ins(%actLocal, %w : memref<1x4xi8>, memref<4x4xi8>)
+      outs(%outRow : memref<1x4xi32, strided<[4, 1], offset: ?>>)
+    memref.dealloc %actLocal : memref<1x4xi8>
+  }
+  %c2 = arith.constant 2 : index
+  %row0 = memref.load %out[%c0, %c0] : memref<3x4xi32>
+  %row1 = memref.load %out[%c1, %c0] : memref<3x4xi32>
+  %row2 = memref.load %out[%c2, %c0] : memref<3x4xi32>
+  %c10 = arith.constant 10 : i32
+  %c100 = arith.constant 100 : i32
+  %row1x10 = arith.muli %row1, %c10 : i32
+  %row2x100 = arith.muli %row2, %c100 : i32
+  %sum0 = arith.addi %row0, %row1x10 : i32
+  %got = arith.addi %sum0, %row2x100 : i32
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: loop-body matmul's per-row results did not match the expected checksum"
+  memref.dealloc %acts : memref<3x4xi8>
+  memref.dealloc %out : memref<3x4xi32>
+  return
+}
+memref.global "private" constant @actInit : memref<3x4xi8> = dense<[[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]>
+memref.global "private" constant @w : memref<4x4xi8> = dense<[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]>

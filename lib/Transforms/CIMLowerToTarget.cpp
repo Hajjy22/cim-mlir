@@ -13,13 +13,47 @@
 //
 // v0.1 SCOPE -- READ BEFORE EXTENDING THIS PASS:
 //
-// 1. Straight-line code only. Every cim op must sit directly in its
-//    function's entry block; any cim op nested inside a region (an
-//    scf.for body, in practice -- cim-placement's own loop hoisting is
-//    exactly what would put one there) is refused with a diagnostic. A
-//    buffer this pass allocates for one iteration would either leak on
-//    every subsequent iteration or need a hoisting analysis of its own;
-//    neither is designed yet.
+// 1. Straight-line code, plus at most ONE level of scf.for nesting. Every
+//    cim op must sit directly in its function's entry block, or directly
+//    in the body of a single, plain (no iter_args) scf.for that itself
+//    sits in that entry block -- exactly the shape cim-placement's own
+//    loop hoisting produces once a matmul does not fit entirely resident
+//    (spec Sec. 6): the resident-programming ops it can hoist stay
+//    straight-line before the loop, and the per-row activation-stage/mvm/
+//    readback ops that cannot are left in the loop body. Anything nested
+//    even one level deeper than that (a second scf.for, an scf.if, ...)
+//    is still refused with a diagnostic, exactly as every case was before
+//    this loop support existed: a buffer this pass allocated INSIDE such
+//    a region, at the position the un-lowered op used to sit, would
+//    either leak on every iteration but the last (this pass frees a
+//    device buffer only on an explicit memref.dealloc -- point 4 below --
+//    and real pipeline output rarely has one for an mvm/copy/requantize
+//    result) or need a hoisting analysis to avoid that, which a doubly-
+//    nested region does not have here.
+//
+//    The hoisting analysis a single level of scf.for DOES have: every
+//    buffer this pass allocates while lowering a recognized loop's body
+//    (loopHoistBefore, below) is created ONCE, immediately before the
+//    loop, instead of at the un-lowered op's own position inside it --
+//    the loop body keeps only the write/compute/read calls that use the
+//    result, which is an ordinary SSA value the loop body can reference
+//    with no special capture (scf.for's region has no capture-list
+//    concept to begin with). This is what keeps a real, multi-row matmul
+//    from leaking one buffer's worth of device memory per row: the SAME
+//    handle is reused (overwritten) every iteration, matching how actual
+//    scratchpad hardware would behave, rather than a fresh one being
+//    handed out and then abandoned. A buffer's matching free (either this
+//    pass' own cimrt_free for a device handle, or a real memref.dealloc
+//    for a host one) is, symmetrically, deferred to just after the loop
+//    if -- and only if -- that specific buffer's own allocation was
+//    itself hoisted (hoistedThisLoop, below): freeing the one shared,
+//    reused buffer on whichever iteration the original free happened to
+//    sit on would make every later iteration's use of it a use-after-
+//    free. A buffer this pass allocates AND frees within the same op's
+//    own lowering (e.g. stageForRead's scratch buffer, cim.program's
+//    weight-staging buffer, reduce_partial's non-final accumulators) is
+//    hoisted exactly the same way, for the same reason -- reused every
+//    iteration instead of realloc'd -- its free just moves with it.
 // 2. cim.reduce_partial IS lowered (lowerReducePartial, below), against a
 //    new cimrt_reduce_add ABI call that sums two device buffers elementwise
 //    -- an N-operand reduce_partial becomes N-1 chained calls, matching
@@ -142,6 +176,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -288,25 +323,78 @@ public:
           "supported in this v0.1 slice");
     Block &body = func.getBody().front();
 
-    // Validate before rewriting anything: every cim op must sit directly in
-    // this block. A cim op nested in some other region (checked via a full
-    // walk, so it is caught regardless of how deeply nested) gets a clear
-    // diagnostic instead of being silently skipped by the block-only loop
-    // below and left as a dangling, stale-typed op for the verifier to
-    // report confusingly once this pass has already rewritten everything
-    // around it.
+    // Recognize, and validate, at most one level of scf.for nesting
+    // around a cim op -- see file header point 1 for why. A for-loop
+    // with no cim op anywhere inside it is not this pass' concern either
+    // way; the generic nesting-check walk just below still accepts it
+    // exactly like any other non-cim region (an scf.if, ...).
+    llvm::DenseSet<Block *> loopBodies;
+    LogicalResult loopScan = success();
+    for (Operation &opRef : body) {
+      auto forOp = dyn_cast<scf::ForOp>(&opRef);
+      if (!forOp)
+        continue;
+      bool hasCimOp = false;
+      forOp->walk([&](Operation *nested) {
+        if (isCimDialectOp(nested))
+          hasCimOp = true;
+      });
+      if (!hasCimOp)
+        continue;
+      if (!forOp.getInitArgs().empty()) {
+        forOp.emitError(
+            "cim-lower-to-target: an scf.for with loop-carried values "
+            "(iter_args) whose body contains a cim op has no lowering in "
+            "this v0.1 slice -- only a plain counting loop with no "
+            "carried state is supported");
+        loopScan = failure();
+        continue;
+      }
+      // Refuse a cim op nested even deeper than this one level (a second
+      // scf.for, or an scf.if, within this loop's own body) -- "one
+      // level" is the whole of what loopHoistBefore's hoisting handles.
+      bool tooDeep = false;
+      for (Operation &inner : forOp.getBody()->getOperations()) {
+        inner.walk([&](Operation *nested) {
+          if (nested != &inner && isCimDialectOp(nested))
+            tooDeep = true;
+        });
+      }
+      if (tooDeep) {
+        forOp.emitError(
+            "cim-lower-to-target: a cim op nested more than one level "
+            "deep (inside a further region within this scf.for's own "
+            "body, e.g. a second scf.for or an scf.if) has no lowering "
+            "in this v0.1 slice -- only one level of loop nesting is "
+            "supported");
+        loopScan = failure();
+        continue;
+      }
+      loopBodies.insert(forOp.getBody());
+    }
+    if (failed(loopScan))
+      return failure();
+
+    // Validate before rewriting anything: every cim op must sit directly
+    // in this block, or in the body of one of the recognized loops
+    // above. A cim op anywhere else (checked via a full walk, so it is
+    // caught regardless of how deeply nested) gets a clear diagnostic
+    // instead of being silently skipped by the dispatch loop below and
+    // left as a dangling, stale-typed op for the verifier to report
+    // confusingly once this pass has already rewritten everything around
+    // it.
     LogicalResult nestingCheck = success();
     func.walk([&](Operation *op) {
-      if (op->getBlock() == &body || !isCimDialectOp(op))
+      if (!isCimDialectOp(op))
+        return;
+      if (op->getBlock() == &body || loopBodies.contains(op->getBlock()))
         return;
       op->emitError(
           "cim-lower-to-target: this v0.1 slice only lowers straight-line "
-          "code directly in a function's entry block; this op is nested "
-          "inside a region (e.g. an scf.for body -- exactly what "
-          "cim-placement's loop hoisting produces), which has no lowering "
-          "yet: a buffer this pass allocated would either leak every "
-          "iteration or need a hoisting analysis of its own, neither "
-          "designed here");
+          "code directly in a function's entry block, or in the body of "
+          "a single, plain scf.for loop directly in that block; this op "
+          "is nested more deeply than that (e.g. a second level of loop "
+          "nesting, or an scf.if), which has no lowering yet");
       nestingCheck = failure();
     });
     if (failed(nestingCheck))
@@ -315,13 +403,46 @@ public:
     // make_early_inc_range: several op handlers below erase the op they are
     // visiting, which would invalidate a plain iterator over the same
     // block.
-    for (Operation &opRef : llvm::make_early_inc_range(body))
+    for (Operation &opRef : llvm::make_early_inc_range(body)) {
+      if (auto forOp = dyn_cast<scf::ForOp>(&opRef);
+          forOp && loopBodies.contains(forOp.getBody())) {
+        if (failed(lowerLoopBody(forOp)))
+          return failure();
+        continue;
+      }
       if (failed(lowerOp(&opRef)))
         return failure();
+    }
     return success();
   }
 
 private:
+  /// Lowers every op directly in a recognized loop's body, with
+  /// loopHoistBefore set so every buffer this pass creates along the way
+  /// is hoisted to just before `forOp` instead of built at its own (in-
+  /// loop) position -- see that field's own comment. `forOp` itself is
+  /// left in the IR untouched (it is not a cim op; lowerOp's dispatch has
+  /// no case for it and nothing here erases it) -- only its body's ops
+  /// are rewritten, exactly like the entry block's own ops are.
+  LogicalResult lowerLoopBody(scf::ForOp forOp) {
+    assert(!loopHoistBefore &&
+           "v0.1 supports only one level of loop nesting -- the caller's "
+           "own tooDeep check is what is supposed to prevent reaching "
+           "this while already lowering an outer loop's body");
+    loopHoistBefore = forOp;
+    hoistedThisLoop.clear();
+    LogicalResult result = success();
+    for (Operation &opRef : llvm::make_early_inc_range(*forOp.getBody())) {
+      if (failed(lowerOp(&opRef))) {
+        result = failure();
+        break;
+      }
+    }
+    loopHoistBefore = nullptr;
+    hoistedThisLoop.clear();
+    return result;
+  }
+
   ModuleOp module;
   MLIRContext *ctx;
   const ::cim::TargetSpec &spec;
@@ -364,10 +485,52 @@ private:
   /// straight through to its source handle with no new buffer, exactly as
   /// it did before this map existed.
   llvm::DenseMap<Operation *, ByteRange> materializedSliceRange;
+  /// Non-null exactly while lowering the body of a one-level scf.for this
+  /// pass recognized (run()/lowerLoopBody), set to that scf.for itself --
+  /// see file header point 1 for why a loop needs this at all.
+  /// creationBuilder() is what actually redirects a buffer-creation call
+  /// site to build immediately before this op instead of at its own
+  /// (in-loop) position; freeBuffer and lowerDealloc consult
+  /// hoistedThisLoop (below) to decide whether a given buffer's free must
+  /// move too.
+  Operation *loopHoistBefore = nullptr;
+  /// Every buffer (a device !llvm.ptr from allocBuffer, or a host memref
+  /// from memref::AllocOp) this pass has itself created via
+  /// creationBuilder()/noteHoisted() while lowering the CURRENT loop
+  /// body. Cleared on entry to, and exit from, lowerLoopBody -- see
+  /// loopHoistBefore's own comment for why this exists.
+  llvm::DenseSet<Value> hoistedThisLoop;
 
   //===--------------------------------------------------------------===//
   // Small builders
   //===--------------------------------------------------------------===//
+
+  /// The builder a buffer-creation call site (allocBuffer, or a host
+  /// memref.alloc this pass creates for a readback buffer) should
+  /// actually build with: `atOp` unchanged in straight-line code, or one
+  /// positioned immediately before the enclosing scf.for when lowering a
+  /// recognized loop body -- see loopHoistBefore's own comment. Every
+  /// value such a call site passes in when building (a byte size, a
+  /// space kind, a device handle already itself hoisted or opened before
+  /// the loop, ...) is already loop-invariant by construction, so
+  /// hoisting the whole creation sequence changes nothing about what
+  /// value it computes, only when, and how often, it runs. The caller
+  /// must pass the Value it goes on to create to noteHoisted() right
+  /// after creating it, so freeBuffer/lowerDealloc can later recognize it.
+  OpBuilder creationBuilder(OpBuilder &atOp) {
+    if (!loopHoistBefore)
+      return atOp;
+    return OpBuilder(loopHoistBefore);
+  }
+
+  /// Records that `buf` was just created via a creationBuilder() this
+  /// pass returned -- a no-op in straight-line code, since
+  /// hoistedThisLoop only matters while loopHoistBefore is set. Always
+  /// safe to call unconditionally right after any buffer creation.
+  void noteHoisted(Value buf) {
+    if (loopHoistBefore)
+      hoistedThisLoop.insert(buf);
+  }
 
   func::FuncOp getOrInsertFunc(StringRef name, FunctionType type) {
     if (auto fn = module.lookupSymbol<func::FuncOp>(name))
@@ -429,6 +592,18 @@ private:
 
   void freeBuffer(OpBuilder &b, Location loc, Value buf) {
     auto fn = getOrInsertFunc("cimrt_free", b.getFunctionType({ptrTy}, {}));
+    if (loopHoistBefore && hoistedThisLoop.contains(buf)) {
+      // This buffer's own allocation was itself hoisted to before the
+      // loop (see loopHoistBefore's own comment) -- its free must move
+      // with it, to just after the loop, not stay at this call's own
+      // position inside the loop body: freeing the one shared, reused
+      // buffer on whichever iteration reaches this call would make every
+      // later iteration's use of it a use-after-free.
+      OpBuilder afterLoop(loopHoistBefore->getContext());
+      afterLoop.setInsertionPointAfter(loopHoistBefore);
+      afterLoop.create<func::CallOp>(loc, fn, ValueRange{buf});
+      return;
+    }
     b.create<func::CallOp>(loc, fn, ValueRange{buf});
   }
 
@@ -473,7 +648,9 @@ private:
     auto type = cast<MemRefType>(memrefOperand.getType());
     FailureOr<int64_t> bytes = byteSizeOf(type);
     assert(succeeded(bytes) && "checked by the caller before this is reached");
-    Value buf = allocBuffer(b, loc, dev, *bytes, space);
+    OpBuilder allocB = creationBuilder(b);
+    Value buf = allocBuffer(allocB, loc, dev, *bytes, space);
+    noteHoisted(buf);
     Value ptr = hostPointer(b, loc, memrefOperand);
     writeBuffer(b, loc, buf, ptr, *bytes);
     isScratch = true;
@@ -689,7 +866,9 @@ private:
 
     OpBuilder b(op);
     Location loc = op.getLoc();
-    Value buf = allocBuffer(b, loc, dev, *bytes, CimrtSpace::kInsitu);
+    OpBuilder allocB = creationBuilder(b);
+    Value buf = allocBuffer(allocB, loc, dev, *bytes, CimrtSpace::kInsitu);
+    noteHoisted(buf);
     Value ptr = hostPointer(b, loc, weightsOperand);
     writeBuffer(b, loc, buf, ptr, *bytes);
 
@@ -758,7 +937,9 @@ private:
     // The mvm always computes into a fresh near-space buffer -- cimrt_mvm
     // has no notion of writing straight to host memory, matching the
     // interpreter's own non-device-space path in runMvm.
-    Value outBuf = allocBuffer(b, loc, dev, *resultBytes, CimrtSpace::kNear);
+    OpBuilder outAllocB = creationBuilder(b);
+    Value outBuf = allocBuffer(outAllocB, loc, dev, *resultBytes, CimrtSpace::kNear);
+    noteHoisted(outBuf);
     Value accumulate = b.create<arith::ConstantOp>(
         loc, b.getIntegerAttr(i1Ty, op.getAccumulate() ? 1 : 0));
 
@@ -786,7 +967,8 @@ private:
     } else {
       // A host-declared result: this pass must leave real, readable bytes
       // behind for whatever consumes it (a print, a dealloc, ...).
-      auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
+      auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, resultType);
+      noteHoisted(realAlloc.getResult());
       Value realPtr = hostPointer(b, loc, realAlloc.getResult());
       readBuffer(b, loc, outBuf, realPtr, *resultBytes);
       freeBuffer(b, loc, outBuf);
@@ -868,7 +1050,9 @@ private:
     bool inputScratch = false;
     Value inputBuf =
         stageForRead(b, loc, dev, inputOperand, stageSpace, inputScratch);
-    Value outBuf = allocBuffer(b, loc, dev, *resultBytes, stageSpace);
+    OpBuilder outAllocB = creationBuilder(b);
+    Value outBuf = allocBuffer(outAllocB, loc, dev, *resultBytes, stageSpace);
+    noteHoisted(outBuf);
 
     Value countVal = constI64(b, loc, count);
     Value inBitsVal = constI32(b, loc, static_cast<int32_t>(inBits));
@@ -908,7 +1092,8 @@ private:
       original.replaceAllUsesWith(outBuf);
       deviceValueElemBits[outBuf] = outBits;
     } else {
-      auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
+      auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, resultType);
+      noteHoisted(realAlloc.getResult());
       Value realPtr = hostPointer(b, loc, realAlloc.getResult());
       readBuffer(b, loc, outBuf, realPtr, *resultBytes);
       freeBuffer(b, loc, outBuf);
@@ -1007,7 +1192,8 @@ private:
         original.replaceAllUsesWith(acc);
         deviceValueElemBits[acc] = bits;
       } else {
-        auto realAlloc = b.create<memref::AllocOp>(loc, resultType);
+        auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, resultType);
+        noteHoisted(realAlloc.getResult());
         Value realPtr = hostPointer(b, loc, realAlloc.getResult());
         readBuffer(b, loc, acc, realPtr, *bytes);
         if (accIsOwnScratch)
@@ -1040,7 +1226,9 @@ private:
     for (size_t i = 1; i < partials.size(); ++i) {
       bool rhsScratch = false;
       Value rhs = stageForRead(b, loc, dev, partials[i], stageSpace, rhsScratch);
-      Value sum = allocBuffer(b, loc, dev, *bytes, stageSpace);
+      OpBuilder sumAllocB = creationBuilder(b);
+      Value sum = allocBuffer(sumAllocB, loc, dev, *bytes, stageSpace);
+      noteHoisted(sum);
       Value status =
           b.create<func::CallOp>(
                loc, fn, ValueRange{dev, sum, acc, rhs, countVal, bitsVal})
@@ -1093,7 +1281,8 @@ private:
     if (!srcIsDevice && !destIsDevice) {
       // Host to host: no cimrt involvement, and no device needed at all --
       // a plain memref.copy into a freshly allocated real destination.
-      auto realAlloc = b.create<memref::AllocOp>(loc, destType);
+      auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, destType);
+      noteHoisted(realAlloc.getResult());
       b.create<memref::CopyOp>(loc, srcOperand, realAlloc.getResult());
       original.replaceAllUsesWith(realAlloc.getResult());
       op.erase();
@@ -1114,7 +1303,9 @@ private:
       CimrtSpace space = destSpace.getKind() == SpaceKind::insitu
                              ? CimrtSpace::kInsitu
                              : CimrtSpace::kNear;
-      Value buf = allocBuffer(b, loc, dev, bytes, space);
+      OpBuilder allocB = creationBuilder(b);
+      Value buf = allocBuffer(allocB, loc, dev, bytes, space);
+      noteHoisted(buf);
       Value ptr = hostPointer(b, loc, srcOperand);
       writeBuffer(b, loc, buf, ptr, bytes);
       if (failed(checkAllowedConsumers(original)))
@@ -1125,7 +1316,8 @@ private:
       return success();
     }
     if (srcIsDevice && !destIsDevice) {
-      auto realAlloc = b.create<memref::AllocOp>(loc, destType);
+      auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, destType);
+      noteHoisted(realAlloc.getResult());
       Value ptr = hostPointer(b, loc, realAlloc.getResult());
       readBuffer(b, loc, srcOperand, ptr, bytes);
       original.replaceAllUsesWith(realAlloc.getResult());
@@ -1137,7 +1329,9 @@ private:
     CimrtSpace space = destSpace.getKind() == SpaceKind::insitu
                            ? CimrtSpace::kInsitu
                            : CimrtSpace::kNear;
-    Value dstBuf = allocBuffer(b, loc, dev, bytes, space);
+    OpBuilder dstAllocB = creationBuilder(b);
+    Value dstBuf = allocBuffer(dstAllocB, loc, dev, bytes, space);
+    noteHoisted(dstBuf);
     auto fn = getOrInsertFunc("cimrt_copy",
                               b.getFunctionType({ptrTy, ptrTy}, {i32Ty}));
     Value status =
@@ -1177,8 +1371,23 @@ private:
     // exactly the op that may be looking at an operand already rewritten
     // to !llvm.ptr by an earlier cim.mvm/cim.copy this pass lowered.
     Value operand = op->getOperand(0);
-    if (operand.getType() != ptrTy)
-      return success(); // a real memref: an ordinary dealloc, untouched.
+    if (operand.getType() != ptrTy) {
+      // A real memref: an ordinary dealloc. If it targets a buffer this
+      // pass itself hoisted out of an enclosing loop (a host readback
+      // buffer allocated once, before the loop, and reused every
+      // iteration -- see loopHoistBefore's own comment), it must run
+      // once AFTER the loop too, not on whichever iteration reaches this
+      // op in the original body: freeing the single, shared allocation
+      // on that iteration would leave every later iteration's use of it
+      // a use-after-free. Relocating the op is enough -- memref.dealloc
+      // needs no rewriting, only to run at the right time. Anything
+      // else (a real per-iteration local like cim-placement's own
+      // staged-activation scratch alloc, which this pass never touches
+      // at all) is left exactly where it is.
+      if (loopHoistBefore && hoistedThisLoop.contains(operand))
+        op->moveAfter(loopHoistBefore);
+      return success();
+    }
     OpBuilder b(op);
     freeBuffer(b, op.getLoc(), operand);
     op.erase();
@@ -1238,7 +1447,9 @@ private:
 
     OpBuilder b(op);
     Location loc = op.getLoc();
-    Value sliced = allocBuffer(b, loc, dev, range.length, space);
+    OpBuilder allocB = creationBuilder(b);
+    Value sliced = allocBuffer(allocB, loc, dev, range.length, space);
+    noteHoisted(sliced);
     auto fn = getOrInsertFunc(
         "cimrt_copy_range",
         b.getFunctionType({ptrTy, i64Ty, ptrTy, i64Ty, i64Ty}, {i32Ty}));
