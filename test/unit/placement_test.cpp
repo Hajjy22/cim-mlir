@@ -315,3 +315,63 @@ CIM_TEST(spill_rows_actually_spill) {
     CIM_EXPECT(r.programs > r.distinctWeights);
   }
 }
+
+// The evidence behind decision 4 in lib/Transforms/CIMPlacement.cpp's file
+// header, pinned here so a future reader cannot dispute it without a
+// failing test.
+//
+// The optimal N-inference schedule for a spill workload is NOT expressible
+// as a single loop body, and the reason is specifically that its
+// per-iteration cim.program COUNT varies. A fixed loop body executes a
+// fixed set of ops on every iteration and therefore emits a constant
+// number of programs per iteration; the optimum emits 8 on some iterations
+// and 9 on others. No choice of tile ids -- including ids computed from
+// the induction variable -- can change that, because the count, not the
+// assignment, is what differs.
+//
+// This matters because it is the argument against a much more invasive
+// change (making cim.tile_alloc's id dynamic so the assignment could
+// rotate). That change would ripple through the dialect, the lowering, the
+// interpreter and every test spelling `{id = N}`, and would buy exactly
+// zero programs. This test is why that is a fact rather than an opinion.
+CIM_TEST(the_n_inference_optimum_is_not_a_constant_per_iteration_count) {
+  constexpr uint32_t kBlocks = 16;
+  constexpr uint32_t kTiles = 8;
+  constexpr uint32_t kIterations = 30;
+
+  PlacementProblem problem;
+  problem.numTiles = kTiles;
+  problem.name = "cyclic-sweep";
+  for (uint32_t rep = 0; rep < kIterations; ++rep)
+    for (uint32_t b = 0; b < kBlocks; ++b)
+      problem.useSequence.push_back(b);
+
+  const PlacementResult result =
+      runValidated(problem, EvictionPolicy::Belady);
+
+  // Programs per iteration, sliced the same way computeCostReport's own
+  // windowing does.
+  std::vector<uint64_t> perIteration(kIterations, 0);
+  for (const PlacementAction &action : result.actions)
+    if (action.kind != ActionKind::Reuse)
+      ++perIteration[action.step / kBlocks];
+
+  // Iteration 0 is the cold-start install: every block is a miss.
+  CIM_EXPECT_EQ(perIteration[0], uint64_t(kBlocks));
+
+  // The load-bearing assertion: past the install, the count is NOT
+  // constant. If this ever becomes constant, a single loop body could
+  // reach the optimum and decision 4's reasoning needs revisiting.
+  bool sawEight = false, sawNine = false;
+  for (uint32_t i = 1; i < kIterations; ++i) {
+    if (perIteration[i] == 8) sawEight = true;
+    if (perIteration[i] == 9) sawNine = true;
+    // Nothing outside {8, 9} should appear in steady state -- the lower
+    // bound is blocks - (tiles - 1) = 9 for a body where each weight is
+    // used once, and 8 occurs only where a previous iteration's residency
+    // carries one extra block across the boundary.
+    CIM_EXPECT(perIteration[i] == 8 || perIteration[i] == 9);
+  }
+  CIM_EXPECT(sawEight);
+  CIM_EXPECT(sawNine);
+}

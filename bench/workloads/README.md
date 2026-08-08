@@ -64,11 +64,40 @@ generated workload, not from running `cim-placement` on compiled MLIR.
 `cim-placement` on real compiled IR does reproduce the `mm-fit` result above
 — a model whose weights entirely fit in tiles reprograms once, however many
 inferences run, checked by executing hoisted IR through a real interpreter
-(`test/mlir/pipeline_e2e_test.cpp`) — but it does **not** reproduce the
-`mm-spill-2x`/`mm-spill-8x`/`mlp-3layer`/`bert-ffn` figures: those come from
-Belady solved over the whole flattened N-inference sequence, which can find
-reuse that `cim-placement`'s single-iteration, tile-local hoisting check
-cannot see. `docs/roadmap.md`'s M3 section has the full explanation.
+(`test/mlir/pipeline_e2e_test.cpp`).
+
+On the spill rows it comes close rather than matching, and the distance is
+measured, not hand-waved. `cim-placement` emits `tiles-1` weights hoisted
+plus `blocks-(tiles-1)` reprogrammed per iteration:
+
+| Workload | simulator (this table) | `cim-placement` on compiled IR | gap |
+|---|---|---|---|
+| `mm-fit` | 8 | 8 | 0% |
+| `mm-spill-2x` | 8538 | 7 + 9×1000 = 9007 | +5.5% |
+| `mm-spill-8x` | 56895 | 7 + 57×1000 = 57007 | +0.2% |
+| `mlp-3layer` | 4370 | 7 + 5×1000 = 5007 | +14.6% |
+| `bert-ffn` | 24776 | 7 + 25×1000 = 25007 | +0.9% |
+
+The `tiles-1` / `blocks-(tiles-1)` split is verified directly against the
+compiler at two very different sizes — 16 blocks and 64 blocks over 8
+tiles, both giving exactly 7 hoisted (see
+`test/Transforms/cim-placement-spill-loop.mlir`). The `mlp-3layer` and
+`bert-ffn` rows apply the same formula to their own block counts rather
+than being measured one by one.
+
+So against LRU's 16000 on `mm-spill-2x`, the compiler's own output is a
+43.7% reduction where this table's 8538 is 47%. That is the honest version
+of the claim, and it is a much smaller caveat than the previous wording
+here implied.
+
+`blocks-(tiles-1)` per iteration is the proven optimum for any single loop
+body — a weight no op in the body programs holds a tile permanently, and
+at most `tiles-1` weights can. The unrestricted solve wins the remainder
+only by varying its per-iteration program count, which a fixed loop body
+cannot express. `cim-placement` now runs the flattened solve on the real
+IR and `cim-cost-report` prints both numbers plus the gap, so these rows
+can be checked against the compiler rather than trusted.
+`docs/roadmap.md`'s M3 section has the full explanation.
 
 ## Volatile-vs-non-volatile: persistence changes the optimum
 

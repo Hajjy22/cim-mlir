@@ -72,10 +72,73 @@
 //    anyway, since it reads a per-iteration value, but the op-kind
 //    allowlist is the belt to that suspenders.
 //
+// 4. WHAT DECISION 3 CANNOT SEE, AND WHY THE PASS NOW SAYS SO OUT LOUD.
+//    Decision 3 asks a local question -- "is this one tile undisturbed for
+//    one whole iteration?" -- and rewrites when the answer is yes. That
+//    exactly reproduces the fits-entirely claim (a model whose weights all
+//    fit reprograms once, however many inferences run) and nothing more.
+//    It does NOT reproduce what cim-bench's standalone simulator computes
+//    for the spill workloads, because that solves Belady over the WHOLE
+//    flattened N-inference sequence and can find reuse a single-iteration,
+//    tile-local check cannot.
+//
+//    That difference was, for a long time, documented in four separate
+//    markdown files and nowhere in the compiler -- so the compiler could
+//    silently emit a schedule far off the optimum while the project's own
+//    published table advertised the optimum. This pass now closes that by
+//    COMPUTING the flattened optimum on the real IR
+//    (accumulateNInferenceOptimum below) and recording it on the module,
+//    where cim-cost-report reports it beside what the emitted IR actually
+//    costs. It does not rewrite to reach it -- and the reason is the
+//    interesting part, because it is a proof rather than a to-do.
+//
+//    WHY THE REMAINING GAP IS NOT REACHABLE FROM ONE LOOP BODY. The
+//    tempting reading of the measurement is that the optimal schedule
+//    merely ROTATES which physical tile holds which weight -- a renaming,
+//    which a tile id computed from the induction variable could express
+//    (at the cost of making cim.tile_alloc's id dynamic, today a
+//    compile-time I64Attr, and rippling through the verifier, the
+//    lowering's compile-time tiles.count check, and the interpreter).
+//    That reading is WRONG, and expensively so.
+//
+//    What the optimum actually varies is the per-iteration cim.program
+//    COUNT. On the real spill shape (16 weight blocks over 8 tiles) it
+//    emits 8 programs on some iterations and 9 on others -- 7 eights and
+//    8 nines per 15-iteration period, averaging the 8.538 that the
+//    published 8538-per-1000-inferences figure comes from. A fixed loop
+//    body executes a fixed set of ops on every iteration and therefore
+//    emits a CONSTANT number of programs per iteration. No choice of tile
+//    ids can make a fixed body emit 8 ops on one iteration and 9 on the
+//    next, so rotation buys exactly zero.
+//    test/unit/placement_test.cpp's
+//    the_n_inference_optimum_is_not_a_constant_per_iteration_count pins
+//    this, because it is the argument that stops someone reaching for the
+//    dialect change.
+//
+//    And what this pass emits is already the best a single body can do:
+//    tiles-1 weights hoisted to permanent residency plus
+//    blocks-(tiles-1) reprogrammed per iteration. A weight that no op in
+//    the body programs is never written and so holds a tile forever; at
+//    most tiles-1 weights can, since something must stream through the
+//    remainder. Measured at two very different sizes -- 16 blocks and 64
+//    blocks over 8 tiles, both giving exactly 7 hoisted -- in
+//    test/Transforms/cim-placement-spill-loop.mlir.
+//
+//    THE REAL OPEN ITEM, then, is not the gap: it is that this pass hits
+//    that bound by ACCIDENT. Belady's victim scan starts at tile 0 and
+//    breaks immediately on a never-again next-use, so tile 0 absorbs the
+//    entire spill and tiles 1..n-1 are each written exactly once -- which
+//    is precisely the programCountPerTile == 1 condition below. Spread
+//    evictions across tiles and nothing is hoisted at all, regressing
+//    this workload to blocks*T, i.e. exactly what an LRU cache would do.
+//    cim-placement-spill-loop.mlir is the guard on that, and its own
+//    header explains why no other test in the suite would catch it.
+//
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
 #include "cim/Dialect/CIMOps.h"
+#include "cim/Placement/CostReport.h"
 #include "cim/Placement/Placement.h"
 #include "cim/Target/TargetSpec.h"
 #include "cim/Transforms/LoopAnalysis.h"
@@ -240,11 +303,120 @@ struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
     // interleaves with (and cannot disturb) the per-block rewrite above.
     llvm::DenseSet<Operation *> hoistCandidates;
 
+    optimum = NInferenceOptimum{};
+
     for (auto &entry : byBlock)
       if (failed(placeBlock(entry.second, spec, hoistCandidates)))
         return signalPassFailure();
 
     hoistFromLoops(module, hoistCandidates);
+
+    // Record the flattened N-inference optimum for cim-cost-report to
+    // publish beside what the emitted IR actually costs -- decision 4 in
+    // the file header. Only set when at least one loop body was actually
+    // solved this way: an attribute that is absent means "not applicable
+    // here", which is a different statement from "the optimum is zero",
+    // and cim-cost-report distinguishes them.
+    if (optimum.applicable) {
+      Builder b(module.getContext());
+      module->setAttr(
+          "cim.n_inference_optimum",
+          b.getDictionaryAttr({
+              b.getNamedAttr("programs",
+                             b.getI64IntegerAttr(static_cast<int64_t>(
+                                 optimum.programs))),
+              b.getNamedAttr("install_programs",
+                             b.getI64IntegerAttr(static_cast<int64_t>(
+                                 optimum.installPrograms))),
+              b.getNamedAttr("steady_state_programs_per_inference",
+                             b.getI64IntegerAttr(static_cast<int64_t>(
+                                 optimum.steadyStatePrograms))),
+          }));
+    }
+  }
+
+  /// The flattened-sequence optimum accumulated across every loop body this
+  /// pass placed -- decision 4 in the file header. Summed across blocks
+  /// rather than kept per block: two independent loops in one module each
+  /// contribute their own install and steady-state cost, and the report is
+  /// a whole-module number.
+  struct NInferenceOptimum {
+    bool applicable = false;
+    uint64_t programs = 0;
+    uint64_t installPrograms = 0;
+    uint64_t steadyStatePrograms = 0;
+  };
+  NInferenceOptimum optimum;
+
+  /// Solve Belady over `perIteration` repeated `tripCount` times -- what a
+  /// scheduler with the whole flattened use sequence in front of it would
+  /// emit, as opposed to decision 3's one-iteration-at-a-time question.
+  ///
+  /// Deliberately reuses cim::computePlacement and cim::computeCostReport
+  /// unchanged: computeCostReport already slices a flattened schedule into
+  /// per-inference windows and reports the first as install and the last as
+  /// steady state, which is exactly this question, and it is the same
+  /// function cim-bench's published numbers come from. A second
+  /// implementation here could drift from that one, and then the
+  /// compiler-vs-simulator comparison this exists to make would be
+  /// comparing two different things.
+  void accumulateNInferenceOptimum(const ::cim::PlacementProblem &perIteration,
+                                    const ::cim::TargetSpec &spec,
+                                    int64_t tripCount, ProgramOp anchor) {
+    const size_t steps = perIteration.useSequence.size();
+    if (steps == 0 || tripCount <= 0)
+      return;
+
+    // Guard the flattening itself: steps * tripCount is a real allocation,
+    // and a loop with a huge constant trip count would otherwise turn a
+    // compile into an out-of-memory. 4M steps is far past any workload
+    // this v0.1 targets (cim-bench's own largest is 64k) and is checked
+    // rather than assumed.
+    constexpr uint64_t kMaxFlattenedSteps = 4u << 20;
+    const uint64_t flattened =
+        static_cast<uint64_t>(steps) * static_cast<uint64_t>(tripCount);
+    if (flattened > kMaxFlattenedSteps) {
+      anchor->emitWarning(
+          "cim-placement: not computing the N-inference optimum for this "
+          "loop; flattening ")
+          << steps << " steps over " << tripCount << " iterations would be "
+          << flattened << " steps, past the " << kMaxFlattenedSteps
+          << "-step cap this pass will materialize. The emitted schedule is "
+             "unaffected -- only the reported optimum is omitted";
+      return;
+    }
+
+    ::cim::PlacementProblem problem;
+    problem.numTiles = perIteration.numTiles;
+    problem.name = "cim-placement/n-inference";
+    problem.useSequence.reserve(static_cast<size_t>(flattened));
+    for (int64_t rep = 0; rep < tripCount; ++rep)
+      problem.useSequence.insert(problem.useSequence.end(),
+                                 perIteration.useSequence.begin(),
+                                 perIteration.useSequence.end());
+
+    const ::cim::PlacementResult result =
+        ::cim::computePlacement(problem, ::cim::EvictionPolicy::Belady);
+
+    // Same discipline as the per-block solve below: replay the schedule
+    // before trusting a number derived from it.
+    std::string error;
+    if (!::cim::validatePlacement(problem, result, &error)) {
+      anchor->emitWarning(
+          "cim-placement: the N-inference schedule did not validate (")
+          << error
+          << "); omitting the reported optimum rather than publishing a "
+             "number that failed its own replay. The emitted schedule is "
+             "unaffected";
+      return;
+    }
+
+    const ::cim::CostReport report =
+        ::cim::computeCostReport(spec, result, steps);
+    optimum.applicable = true;
+    optimum.programs += result.programs;
+    optimum.installPrograms += report.installPrograms;
+    optimum.steadyStatePrograms += report.steadyStateProgramsPerInference;
   }
 
   /// Move every hoisting candidate that survived placeBlock out of its
@@ -359,6 +531,25 @@ struct CIMPlacementPass : public CIMPlacementBase<CIMPlacementPass> {
                << " evictions over " << problem.useSequence.size()
                << " steps (" << result.distinctWeights
                << " distinct weights, " << problem.numTiles << " tiles)\n");
+
+    // Decision 4: when this block is a loop body that provably runs a
+    // known number of times, `problem` is one inference's use sequence and
+    // the flattened N-inference sequence is it repeated that many times.
+    // Computed BEFORE the rewrite below, while `problem` still describes
+    // the IR as cim-partition emitted it -- the rewrite erases the reused
+    // programs, so recovering the same sequence afterwards is impossible.
+    if (auto forOp = dyn_cast_or_null<scf::ForOp>(
+            programs.front()->getBlock()->getParentOp())) {
+      // One level only, matching decision 3's own hoisting limit: for a
+      // loop nested inside another, "one inference" is not this block's
+      // trip count and treating it as such would report a number for a
+      // question nobody asked.
+      if (!forOp->getParentOfType<scf::ForOp>()) {
+        FailureOr<int64_t> trip = ::mlir::cim::getConstantTripCount(forOp);
+        if (succeeded(trip))
+          accumulateNInferenceOptimum(problem, spec, *trip, programs.front());
+      }
+    }
 
     // How many surviving cim.program ops target each physical tile within
     // THIS block. A tile programmed more than once here has content that

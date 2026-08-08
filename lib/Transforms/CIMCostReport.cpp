@@ -30,6 +30,9 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdio>
+#include <string>
+
 using namespace mlir;
 using namespace mlir::cim;
 
@@ -116,6 +119,40 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
       out += ")";
     }
     out += "\n";
+
+    // The N-inference optimum cim-placement recorded, if it computed one
+    // (decision 4 in CIMPlacement.cpp's file header). Reported BESIDE what
+    // the emitted IR actually costs, never instead of it: the whole point
+    // is that these two numbers are allowed to differ and the difference
+    // should be visible in the artifact rather than only in prose. An
+    // absent attribute means "no loop body was solvable this way here",
+    // which is a different statement from a zero gap, so the fields are
+    // omitted entirely rather than printed as 0.
+    if (auto opt = module->getAttrOfType<DictionaryAttr>(
+            "cim.n_inference_optimum")) {
+      if (auto programs = opt.getAs<IntegerAttr>("programs")) {
+        const uint64_t optimal = static_cast<uint64_t>(programs.getInt());
+        out += "// n-inference-optimum-programs: ";
+        out += std::to_string(optimal);
+        out += "\n// emitted-programs: ";
+        out += std::to_string(counts.programs);
+        // Only meaningful when the emitted count is itself complete --
+        // an incomplete count is a lower bound, and a "gap" computed
+        // against a lower bound would read as better than reality.
+        if (counts.complete() && optimal > 0) {
+          const double gap =
+              100.0 * (static_cast<double>(counts.programs) -
+                       static_cast<double>(optimal)) /
+              static_cast<double>(optimal);
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%.2f", gap);
+          out += "\n// placement-gap-percent: ";
+          out += buf;
+        }
+        out += "\n";
+      }
+    }
+
     out += json;
 
     if (outputPath.empty()) {

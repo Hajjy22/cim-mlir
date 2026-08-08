@@ -87,9 +87,17 @@ too: a `cim.program` is hoisted above the loop when its tile is provably untouch
 anything else for the whole iteration and the loop's trip count is a compile-time
 constant known positive. That reproduces the headline claim — a model that fits entirely
 reprograms once, no matter how many inferences the loop runs — on compiled IR, checked by
-executing the loop through a real interpreter, not just by inspecting its shape. It does
-**not** replicate a full N-inference Belady solve, which is what the spill-workload
-figures below still come from (`docs/roadmap.md`'s M3 section draws the exact line).
+executing the loop through a real interpreter, not just by inspecting its shape.
+
+Under spill it does not exactly match a full N-inference Belady solve, and the distance is
+now measured rather than left vague: on the `mm-spill-2x` shape (16 weight blocks, 8 tiles)
+the pass emits `7 + 9*T` programs — 9007 at 1000 inferences against the optimum's 8538, a
+**5.5%** gap, not the 16000 that "does not replicate a full solve" could easily be read as.
+`cim-placement` now runs that flattened solve itself on the real IR and `cim-cost-report`
+publishes both numbers and the gap, so it stays measured. The residual is not a missing
+optimization — `7 + 9*T` is the proven optimum for any single loop body, and the flattened
+solve beats it only by varying its per-iteration program count, which a fixed loop body
+cannot do. `docs/roadmap.md`'s M3 section has the measurement and the proof sketch.
 
 `cim-cost-report` (Pass 8) also rewrites nothing but walks the final, already-placed IR
 and emits the project's publishable numbers as JSON — the same `CostReport`/`toJson`

@@ -55,16 +55,31 @@ physical tile is written by no other `cim.program` within one textual loop
 iteration, and only out of a loop whose trip count is a compile-time
 constant proven positive. This exactly reproduces the headline `mm-fit`
 result on real IR -- a model whose weights entirely fit in tiles reprograms
-once, however many inferences run. It does **not** reproduce `cim-bench`'s
-`mm-spill-*` numbers: those come from Belady solved over the *whole*
-flattened N-inference sequence, which can find reuse this pass's
-single-iteration, tile-local check cannot see. Under spill, hoisting still
-finds and moves whatever subset of tiles genuinely stays stable for a full
-iteration -- see `placement_partially_hoists_when_only_some_tiles_are_stable`
-in `test/mlir/pipeline_e2e_test.cpp` -- but the spill workloads in
-`bench/workloads/README.md` still describe what the standalone simulator
-computes, not what this pass emits. A full N-inference Belady solve on
-compiled IR, if it is ever wanted, is separate work from what landed here.
+once, however many inferences run. It does not exactly reproduce
+`cim-bench`'s `mm-spill-*` numbers, and the size of that difference is now
+measured rather than left as a disclaimer: on the `mm-spill-2x` shape (16
+weight blocks over 8 tiles) this pass emits `7 + 9*T` programs -- 9007 at
+1000 inferences, against the simulator's optimal 8538. **5.5%**, not the
+16000 the old phrasing here ("does not reproduce the spill numbers") could
+easily be read as. `cim-cost-report` now prints both numbers and the gap
+between them, so this stays measured instead of asserted.
+
+The residual 5.5% is not a missing optimization. `7 + 9*T` is `tiles-1`
+hoisted plus `blocks-(tiles-1)` per iteration, which is the proven optimum
+for any single loop body -- a weight no op in the body programs is never
+written and therefore holds a tile permanently, at most `tiles-1` weights
+can do that, and everything else is reprogrammed every iteration. The
+flattened solve beats it only by varying its per-iteration program count
+(8 on some iterations, 9 on others), and a fixed loop body cannot emit a
+varying number of ops. See the M3 checkbox below for the measurement and
+`the_n_inference_optimum_is_not_a_constant_per_iteration_count` in
+`test/unit/placement_test.cpp` for the test that pins it.
+
+What is genuinely still open is making that per-body optimum deliberate:
+today it falls out of a tie-break in Belady's victim scan rather than
+being aimed at, and `test/Transforms/cim-placement-spill-loop.mlir` exists
+to catch the silent regression to `16*T` that a reasonable-looking cleanup
+of that scan would otherwise cause.
 
 **Composition hardening.** Individually-real passes are not the same claim
 as a pipeline that composes, and for a while this project made the former
@@ -617,11 +632,57 @@ out of scope for v0.1 across the board, not just here.
   moving. This is the `mm-fit` claim (fits entirely -> reprograms once) on
   compiled IR; it is not a full N-inference Belady solve -- see the note
   above the milestone list.
-- [ ] A full N-inference Belady solve on compiled IR, matching what
-  `cim-bench`'s simulator computes for the spill workloads. The current
-  hoist is deliberately more conservative (see above); closing this gap
-  means reasoning about the whole flattened use sequence across iterations,
-  not just whether one tile is stable within one.
+- [x] A full N-inference Belady solve on compiled IR. The solve itself now
+  runs in `cim-placement` (`accumulateNInferenceOptimum`, decision 4 in
+  that file's header): for a loop body with a compile-time-constant trip
+  count it flattens the body's use sequence across all iterations, solves
+  it with the same `cim::computePlacement` `cim-bench` uses, replays it
+  through `validatePlacement`, and records the result on the module.
+  `cim-cost-report` publishes it beside what the emitted IR actually
+  costs, as `n-inference-optimum-programs` / `emitted-programs` /
+  `placement-gap-percent`.
+
+  The original wording of this box -- "matching what `cim-bench`'s
+  simulator computes for the spill workloads" -- turned out to be asking
+  for something impossible, and finding out why is the actual result here.
+  Measured on the real spill shape (16 weight blocks over 8 tiles): the
+  optimal schedule's per-iteration `cim.program` count is **not constant**.
+  It emits 8 on some iterations and 9 on others (7 eights and 8 nines per
+  15-iteration period, averaging the 8.538 the published 8538-per-1000
+  figure comes from). A single loop body executes a fixed set of ops every
+  iteration and therefore emits a constant number of programs per
+  iteration, so no rewrite of one loop body -- including one that computed
+  tile ids from the induction variable, which was the obvious candidate --
+  can reach it. `the_n_inference_optimum_is_not_a_constant_per_iteration_count`
+  in `test/unit/placement_test.cpp` pins that, because it is the argument
+  against a much more invasive dialect change that would have bought
+  exactly zero.
+
+  What the gap actually is, which was never measured before: on the
+  `mm-spill-2x` shape `cim-placement` emits `7 + 9*T` programs, so 9007 at
+  1000 inferences against the simulator's 8538 -- **5.5%**, not the 16000
+  a reader could reasonably infer from the old "does not reproduce the
+  spill numbers" phrasing. `7 + 9*T` is `tiles-1` hoisted plus
+  `blocks-(tiles-1)` per iteration, which is the proven optimum for any
+  single loop body: a weight no op in the body programs is never written
+  and so holds a tile permanently, at most `tiles-1` weights can do that,
+  and the rest must be reprogrammed every iteration.
+- [ ] Make that per-body optimum **deliberate** rather than a consequence.
+  `cim-placement` reaches `tiles-1` hoisted today only because Belady's
+  victim scan starts at tile 0 and breaks immediately on a never-again
+  next-use, so tile 0 absorbs the whole spill and tiles 1..n-1 are each
+  written exactly once -- which is precisely the `programCountPerTile == 1`
+  condition that fills `hoistCandidates`. Any change that spreads
+  evictions across tiles drops hoisting to zero and regresses this
+  workload to `16*T`, i.e. exactly LRU.
+  `test/Transforms/cim-placement-spill-loop.mlir` is the guard on that and
+  explains it at length, but a guard is not the same as aiming at the
+  result on purpose. Doing it deliberately means a pin-and-stream schedule
+  computed in the MLIR-free engine and validated by replaying the body
+  three times through the existing `validatePlacement`; it would also fix
+  the case where a weight repeats within one loop body, where today's
+  accident stops working and strictly fewer programs are hoisted than
+  could be.
 - [x] `cim-cost-report` (Pass 8): walks the final, already-placed IR and
   emits a JSON cost report, reusing `cim::CostReport`/`toJson`
   (`lib/Placement/CostReport.cpp`) rather than a second cost model that
