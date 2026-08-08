@@ -38,6 +38,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -750,6 +751,128 @@ void checkLoopValues(const char *label, const RunResult &result,
              ": loop output disagrees with the per-iteration reference");
 }
 
+/// Six matmuls per iteration against four weight globals A, B, C, D, used
+/// in the order A, B, C, A, A, D -- A three times, the others once each.
+/// This is the numerical-invariance counterpart to
+/// test/Transforms/cim-placement-deliberate-hoist.mlir's hand-written IR:
+/// the same intra-body repetition shape where the ordinary per-block
+/// Belady solve's own tile-0-first eviction tie-break hoists nothing (see
+/// decision 4 in lib/Transforms/CIMPlacement.cpp's file header), and
+/// decision 5's deliberate steady-state schedule is what actually reaches
+/// the achievable bound -- but built through the real
+/// cim-detect/cim-partition pipeline rather than hand-rolled cim ops. Each
+/// matmul is its own isolated n x k block (cim-partition sees no tiling to
+/// do), fed through six separate per-position activation/output buffers so
+/// each of the six calls can be checked against its own reference
+/// independently, the same way buildTwoMatmulModule's two calls are.
+std::string buildLoopRepeatedWeightModule(
+    const std::array<std::vector<int8_t>, 4> &weights,
+    const std::array<std::vector<std::vector<int8_t>>, 6> &acts, int n,
+    int k) {
+  static const char *const kWeightNames[4] = {"wa", "wb", "wc", "wd"};
+  static const int kOrder[6] = {0, 1, 2, 0, 0, 3};
+  const int iters = static_cast<int>(acts[0].size());
+
+  std::ostringstream os;
+  for (int w = 0; w < 4; ++w) {
+    os << "memref.global \"private\" constant @" << kWeightNames[w]
+       << " : memref<" << n << "x" << k << "xi8> = dense<[";
+    for (int i = 0; i < n; ++i) {
+      os << (i ? ", [" : "[");
+      for (int j = 0; j < k; ++j)
+        os << (j ? ", " : "") << static_cast<int>(weights[static_cast<size_t>(w)][static_cast<size_t>(i * k + j)]);
+      os << "]";
+    }
+    os << "]>\n";
+  }
+  for (int p = 0; p < 6; ++p) {
+    os << "memref.global \"private\" constant @acts" << p << " : memref<"
+       << iters << "x" << k << "xi8> = dense<[";
+    for (int r = 0; r < iters; ++r)
+      os << (r ? ", [" : "[")
+         << denseList(acts[static_cast<size_t>(p)][static_cast<size_t>(r)])
+         << "]";
+    os << "]>\n";
+  }
+
+  os << "func.func private @cim_print_i32(memref<*xi32>)\n";
+  os << "func.func @main() {\n";
+  for (int w = 0; w < 4; ++w)
+    os << "  %" << kWeightNames[w] << " = memref.get_global @"
+       << kWeightNames[w] << " : memref<" << n << "x" << k << "xi8>\n";
+  for (int p = 0; p < 6; ++p) {
+    os << "  %acts" << p << " = memref.get_global @acts" << p << " : memref<"
+       << iters << "x" << k << "xi8>\n";
+    os << "  %out" << p << " = memref.alloc() : memref<" << iters << "x" << n
+       << "xi32>\n";
+  }
+  os << "  %c0 = arith.constant 0 : index\n";
+  os << "  %c1 = arith.constant 1 : index\n";
+  os << "  %cN = arith.constant " << iters << " : index\n";
+  os << "  scf.for %i = %c0 to %cN step %c1 {\n";
+  for (int p = 0; p < 6; ++p) {
+    const char *wn = kWeightNames[kOrder[p]];
+    os << "    %actRow" << p << " = memref.subview %acts" << p
+       << "[%i, 0] [1, " << k << "] [1, 1] : memref<" << iters << "x" << k
+       << "xi8> to memref<1x" << k << "xi8, strided<[" << k
+       << ", 1], offset: ?>>\n";
+    os << "    %actLocal" << p << " = memref.alloc() : memref<1x" << k
+       << "xi8>\n";
+    os << "    memref.copy %actRow" << p << ", %actLocal" << p
+       << " : memref<1x" << k << "xi8, strided<[" << k
+       << ", 1], offset: ?>> to memref<1x" << k << "xi8>\n";
+    os << "    %outRow" << p << " = memref.subview %out" << p << "[%i, 0] [1, "
+       << n << "] [1, 1] : memref<" << iters << "x" << n
+       << "xi32> to memref<1x" << n << "xi32, strided<[" << n
+       << ", 1], offset: ?>>\n";
+    os << "    linalg.matmul_transpose_b ins(%actLocal" << p << ", %" << wn
+       << " : memref<1x" << k << "xi8>, memref<" << n << "x" << k
+       << "xi8>) outs(%outRow" << p << " : memref<1x" << n
+       << "xi32, strided<[" << n << ", 1], offset: ?>>)\n";
+    os << "    memref.dealloc %actLocal" << p << " : memref<1x" << k
+       << "xi8>\n";
+  }
+  os << "  }\n";
+  for (int p = 0; p < 6; ++p) {
+    os << "  %cast" << p << " = memref.cast %out" << p << " : memref<"
+       << iters << "x" << n << "xi32> to memref<*xi32>\n";
+    os << "  func.call @cim_print_i32(%cast" << p
+       << ") : (memref<*xi32>) -> ()\n";
+  }
+  for (int p = 0; p < 6; ++p)
+    os << "  memref.dealloc %out" << p << " : memref<" << iters << "x" << n
+       << "xi32>\n";
+  os << "  return\n}\n";
+  return os.str();
+}
+
+/// buildLoopRepeatedWeightModule prints its six per-position buffers, in
+/// position order, once each, after the loop.
+void checkRepeatedWeightLoopValues(
+    const char *label, const RunResult &result,
+    const std::array<std::vector<int8_t>, 4> &weights,
+    const std::array<std::vector<std::vector<int8_t>>, 6> &acts, int n,
+    int k) {
+  static const int kOrder[6] = {0, 1, 2, 0, 0, 3};
+  if (result.prints.size() != 6) {
+    CIM_FAIL(std::string(label) + ": expected 6 printed buffers (one per "
+             "matmul position), got " +
+             std::to_string(result.prints.size()));
+    return;
+  }
+  for (int p = 0; p < 6; ++p) {
+    std::vector<int32_t> want;
+    for (const std::vector<int8_t> &act : acts[static_cast<size_t>(p)]) {
+      const std::vector<int32_t> row =
+          reference(weights[static_cast<size_t>(kOrder[p])], act, n, k);
+      want.insert(want.end(), row.begin(), row.end());
+    }
+    if (result.prints[static_cast<size_t>(p)] != want)
+      CIM_FAIL(std::string(label) + ": position " + std::to_string(p) +
+               " disagrees with its own per-iteration reference");
+  }
+}
+
 } // namespace
 
 CIM_TEST(placement_never_changes_the_numbers_on_any_single_matmul_case) {
@@ -1050,4 +1173,40 @@ CIM_TEST(placement_leaves_a_zero_trip_count_loop_alone) {
   if (!placed.prints.empty())
     for (int32_t value : placed.prints.front())
       CIM_EXPECT_EQ(value, 0);
+}
+
+CIM_TEST(placement_never_changes_values_with_a_weight_repeated_in_one_body) {
+  // The numerical-invariance counterpart to
+  // test/Transforms/cim-placement-deliberate-hoist.mlir: the same
+  // [A, B, C, A, A, D] use sequence per iteration (A used three times, B/C/D
+  // once each), built through the real cim-detect/cim-partition pipeline
+  // rather than hand-written cim ops. runBothWays already requires the
+  // plain and placed prints to agree byte-for-byte; this additionally pins
+  // both of them to an independent C++ reference, so a bug that moved both
+  // pipelines to the same WRONG answer would still be caught.
+  std::array<std::vector<int8_t>, 4> weights = {
+      sequential(4 * 4, -8, 1), sequential(4 * 4, 1, 1),
+      sequential(4 * 4, -16, 2), sequential(4 * 4, 3, -1)};
+  const int iters = 3;
+  std::array<std::vector<std::vector<int8_t>>, 6> acts;
+  for (int p = 0; p < 6; ++p)
+    for (int i = 0; i < iters; ++i)
+      acts[static_cast<size_t>(p)].push_back(sequential(4, p - 3 * i, 1));
+
+  const auto [plain, placed] = runBothWays(
+      "repeated-weight-loop", buildLoopRepeatedWeightModule(weights, acts, 4, 4));
+  if (plain.programs == 0)
+    return;
+
+  // 6 cim.program ops textually per iteration either way -- the loop body
+  // does not multiply them in the IR, and which of them survive placement
+  // (and whether it is the ordinary per-block solve or decision 5's
+  // deliberate steady-state schedule that placeBlock's own cost comparison
+  // picks) is test/Transforms/cim-placement-deliberate-hoist.mlir's job,
+  // not this test's. This test's only claim is that whatever placement
+  // does to program count, the six computed matmul results never move.
+  checkRepeatedWeightLoopValues("repeated-weight-loop", plain, weights, acts,
+                                4, 4);
+  checkRepeatedWeightLoopValues("repeated-weight-loop (placed)", placed,
+                                weights, acts, 4, 4);
 }

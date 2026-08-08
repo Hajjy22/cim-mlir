@@ -113,6 +113,102 @@ PlacementResult computePlacement(const PlacementProblem &problem,
 bool validatePlacement(const PlacementProblem &problem,
                         const PlacementResult &result, std::string *error);
 
+/// A steady-state placement problem: one loop iteration's use sequence,
+/// solved for a schedule that stays valid under arbitrary repetition --
+/// see computeSteadyStatePlacement's own comment for what that means and
+/// why it is a different question from PlacementProblem/computePlacement,
+/// which only ever sees one pass over its use sequence.
+struct SteadyStateProblem {
+  /// Number of physical tiles (from the target file's `tiles.count`).
+  uint32_t numTiles = 0;
+  /// One loop iteration's use sequence, in program order. Every entry is
+  /// necessarily loop-invariant -- the same physical weight sub-matrix on
+  /// every iteration -- by construction of how a caller recovers this
+  /// from real IR (`lib/Transforms/CIMPlacement.cpp`'s `weightIdentity`
+  /// refuses a weight with a dynamic offset outright, and cim-partition's
+  /// own tiling never produces one: the loop induction variable only
+  /// ever appears in an activation- or output-side subview, not a
+  /// weight's).
+  std::vector<WeightId> bodySequence;
+  /// Human-readable label, used in reports.
+  std::string name;
+};
+
+/// What computeSteadyStatePlacement decided for one iteration.
+struct SteadyStateResult {
+  /// One action per step of `bodySequence`, in the same order -- the
+  /// same shape as PlacementResult::actions, and meant to be rewritten
+  /// by exactly the same caller logic: a Reuse means erase this step's
+  /// cim.program and rewire its consumers to the earlier one; anything
+  /// else means keep it and assign it the named tile.
+  std::vector<PlacementAction> body;
+  /// Tile ids `[0, pinnedTileCount)` named in `body` are safe to hoist to
+  /// permanent, cross-iteration residency: installed once, before the
+  /// loop, and never reprogrammed again. Tile ids
+  /// `[pinnedTileCount, numTiles)` are "stream" tiles, whose content
+  /// changes within a single iteration -- mirroring the rule
+  /// `lib/Transforms/CIMPlacement.cpp`'s own accidental hoisting already
+  /// followed (a tile written more than once per iteration cannot be
+  /// assumed stable across iterations either), nothing programmed into
+  /// one of these may be hoisted.
+  uint32_t pinnedTileCount = 0;
+  /// This body's own program count: what a real `cim.program` fires once
+  /// PER ITERATION, as opposed to a pinned tile's install, which fires
+  /// once total no matter how many iterations run.
+  uint64_t programsPerIteration = 0;
+  /// False for an infeasible problem (an empty `bodySequence`, or zero
+  /// tiles); callers must not act on an infeasible result.
+  bool feasible = false;
+};
+
+/// Solve for a placement that stays valid across arbitrarily many
+/// repetitions of `problem.bodySequence` -- pin-and-stream: the
+/// `numTiles - 1` (at most) weights used most often within the body are
+/// held permanently resident, and every other weight streams through the
+/// one remaining tile, reprogrammed whenever it changes.
+///
+/// This is the DELIBERATE version of what `lib/Transforms/CIMPlacement
+/// .cpp`'s own hoisting used to reach only as an accidental consequence
+/// of Belady's own victim-selection tie-break (see that file's decision
+/// 4 for the full account of why that was fragile). Provably optimal
+/// when every weight in `bodySequence` is used exactly once -- the shape
+/// cim-partition itself emits, one cim.program per weight block per
+/// matmul: pinning the `numTiles - 1` most-used weights and streaming
+/// the remainder through the last tile achieves the proven lower bound
+/// `distinctWeights - (numTiles - 1)` programs per iteration, because a
+/// weight nothing in the body ever reprograms holds its tile permanently
+/// and at most `numTiles - 1` weights can do that at once.
+///
+/// When a weight is used MORE than once within one body, pin-and-stream
+/// is a correct heuristic rather than a proven optimum -- the exact
+/// answer there is a residency fixed-point problem over the whole body
+/// (letting the one streaming tile hold a weight across a gap between
+/// two of its own uses can occasionally beat evicting it for something
+/// used exactly once in between), which this does not attempt to solve
+/// exactly. The caller is expected to compare this against its own
+/// existing schedule and keep whichever costs less, so a case where the
+/// heuristic falls short is never worse than not calling this at all.
+SteadyStateResult computeSteadyStatePlacement(const SteadyStateProblem &problem);
+
+/// Confirms `result` really is a fixed point, using nothing but the
+/// existing, already-trusted `validatePlacement` -- not a second,
+/// separately-trusted checker. Builds one ordinary, flattened
+/// PlacementProblem/PlacementResult: a bootstrap installing each pinned
+/// tile's real starting content plus (if streaming is used) the stream
+/// tile's own first-ever content, followed by THREE repetitions of
+/// `result.body` back to back -- the first using `body`'s own actions
+/// verbatim (valid starting from the bootstrap), the second and third
+/// substituting freshly recomputed labels for the stream tile's steps
+/// only (a pinned tile's Reuse claim needs no relabeling: once installed
+/// its content never changes again, so the same claim stays true
+/// forever). A bug that makes the SECOND repetition's claims false --
+/// the entire content of "steady state" -- is caught by
+/// `validatePlacement`'s own replay exactly the way any other invalid
+/// schedule would be.
+bool validateSteadyStatePlacement(const SteadyStateProblem &problem,
+                                   const SteadyStateResult &result,
+                                   std::string *error);
+
 } // namespace cim
 
 #endif // CIM_PLACEMENT_PLACEMENT_H

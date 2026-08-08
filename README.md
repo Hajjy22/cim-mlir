@@ -99,7 +99,13 @@ the pass emits `7 + 9*T` programs — 9007 at 1000 inferences against the optimu
 publishes both numbers and the gap, so it stays measured. The residual is not a missing
 optimization — `7 + 9*T` is the proven optimum for any single loop body, and the flattened
 solve beats it only by varying its per-iteration program count, which a fixed loop body
-cannot do. `docs/roadmap.md`'s M3 section has the measurement and the proof sketch.
+cannot do. Reaching that per-body optimum is deliberate, not a side effect: a pin-and-stream
+schedule (`cim::computeSteadyStatePlacement`) pins the `tiles-1` most-used weights and
+streams the rest through the remaining tile — provably exact when every weight in a body is
+used once, and a validated heuristic (never worse than doing nothing) otherwise — and
+`cim-placement` takes it whenever it beats the ordinary per-block solve, including the case
+the ordinary solve could miss: a weight used more than once within one loop body.
+`docs/roadmap.md`'s M3 section has the measurement and the proof sketch.
 
 `cim-cost-report` (Pass 8) also rewrites nothing but walks the final, already-placed IR
 and emits the project's publishable numbers as JSON — the same `CostReport`/`toJson`

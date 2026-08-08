@@ -98,6 +98,15 @@ difference is 5.5%. The compiler now computes both numbers on the real IR
 and reports the gap, so this is a measurement in the artifact rather than
 a caveat in prose. See `docs/roadmap.md`'s M3 section.
 
+Reaching that `tiles-1`/`blocks-(tiles-1)` bound is deliberate, not
+incidental: `cim::computeSteadyStatePlacement` pins the `tiles-1`
+most-used weights and streams the rest through the one remaining tile —
+provably exact when every weight in a body is used once (`cim-partition`'s
+own shape), a validated heuristic otherwise — and `cim-placement` uses it
+whenever it beats the ordinary per-block solve. This also closes the one
+case the ordinary solve's own eviction tie-break could miss: a weight used
+more than once within a single loop body.
+
 ## Memory spaces
 
 Three address spaces are modeled as MLIR memory-space attributes on

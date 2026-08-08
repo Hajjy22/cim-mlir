@@ -75,11 +75,32 @@ varying number of ops. See the M3 checkbox below for the measurement and
 `the_n_inference_optimum_is_not_a_constant_per_iteration_count` in
 `test/unit/placement_test.cpp` for the test that pins it.
 
-What is genuinely still open is making that per-body optimum deliberate:
-today it falls out of a tie-break in Belady's victim scan rather than
-being aimed at, and `test/Transforms/cim-placement-spill-loop.mlir` exists
-to catch the silent regression to `16*T` that a reasonable-looking cleanup
-of that scan would otherwise cause.
+That per-body optimum used to fall out of a tie-break in Belady's victim
+scan rather than being aimed at -- `test/Transforms/cim-placement-spill-loop.mlir`
+exists to catch the silent regression to `16*T` that a reasonable-looking
+cleanup of that scan would otherwise cause. It is now reached
+deliberately: `cim::computeSteadyStatePlacement`/`validateSteadyStatePlacement`
+(`lib/Placement/Placement.h`/`.cpp`) compute a pin-and-stream schedule --
+pin the `tiles-1` most-used weights to permanent tiles by occurrence count,
+stream everything else through the one remaining tile -- and
+`placeBlock` (`lib/Transforms/CIMPlacement.cpp`, decision 5) uses it
+whenever its cost is strictly cheaper than the ordinary per-block solve's
+own hoist. Proved exactly optimal, not just no-worse, when every weight in
+a body is used once (`cim-partition`'s own shape, matching every workload
+in `bench/workloads/`) via exhaustive search over every permutation up to
+7 distinct weights against every tile count
+(`steady_state_matches_brute_force_when_each_weight_is_used_once` in
+`test/unit/steady_state_property_test.cpp`); when a weight repeats within
+one body the pin choice is a heuristic (the true optimum there is a
+residency fixed-point problem this project does not solve exactly), but
+proved never worse than pinning nothing and always a genuine replay fixed
+point, on both exhaustive small alphabets and 500 random instances.
+`test/Transforms/cim-placement-deliberate-hoist.mlir` proves the real pass
+reaches for it on the exact case where the old accidental tie-break failed
+(`[A, B, C, A, A, D]`, A repeated three times, over 2 tiles), checked both
+structurally (FileCheck) and numerically
+(`placement_never_changes_values_with_a_weight_repeated_in_one_body` in
+`test/mlir/pipeline_e2e_test.cpp`).
 
 **Composition hardening.** Individually-real passes are not the same claim
 as a pipeline that composes, and for a while this project made the former
@@ -667,22 +688,38 @@ out of scope for v0.1 across the board, not just here.
   single loop body: a weight no op in the body programs is never written
   and so holds a tile permanently, at most `tiles-1` weights can do that,
   and the rest must be reprogrammed every iteration.
-- [ ] Make that per-body optimum **deliberate** rather than a consequence.
-  `cim-placement` reaches `tiles-1` hoisted today only because Belady's
-  victim scan starts at tile 0 and breaks immediately on a never-again
-  next-use, so tile 0 absorbs the whole spill and tiles 1..n-1 are each
-  written exactly once -- which is precisely the `programCountPerTile == 1`
-  condition that fills `hoistCandidates`. Any change that spreads
-  evictions across tiles drops hoisting to zero and regresses this
-  workload to `16*T`, i.e. exactly LRU.
-  `test/Transforms/cim-placement-spill-loop.mlir` is the guard on that and
-  explains it at length, but a guard is not the same as aiming at the
-  result on purpose. Doing it deliberately means a pin-and-stream schedule
-  computed in the MLIR-free engine and validated by replaying the body
-  three times through the existing `validatePlacement`; it would also fix
-  the case where a weight repeats within one loop body, where today's
-  accident stops working and strictly fewer programs are hoisted than
-  could be.
+- [x] Make that per-body optimum **deliberate** rather than a consequence.
+  Before this, `cim-placement` reached `tiles-1` hoisted only because
+  Belady's victim scan starts at tile 0 and breaks immediately on a
+  never-again next-use, so tile 0 absorbed the whole spill and tiles
+  1..n-1 were each written exactly once -- precisely the
+  `programCountPerTile == 1` condition that fills `hoistCandidates`. Any
+  change that spread evictions across tiles dropped hoisting to zero and
+  regressed this workload to `16*T`, i.e. exactly LRU --
+  `test/Transforms/cim-placement-spill-loop.mlir` guards that regression
+  and explains it at length, but a guard is not the same as aiming at the
+  result on purpose. Now it is aimed at: `cim::computeSteadyStatePlacement`
+  pins the `tiles-1` most-used weights by occurrence count (ties by
+  first-use order) and streams everything else through the one remaining
+  tile via a single-tile Belady sub-solve, and
+  `cim::validateSteadyStatePlacement` proves the result replays as a
+  genuine fixed point by re-running it through the existing
+  `validatePlacement` three times. `placeBlock` computes both the ordinary
+  per-block solve and this deliberate schedule for every constant-trip
+  loop and takes whichever is strictly cheaper, so every existing test
+  where the two already coincide is rewritten byte-for-byte unchanged, and
+  the case where they didn't -- a weight repeated within one loop body,
+  where the old tie-break's luck ran out -- now reaches the better
+  schedule too:
+  `test/Transforms/cim-placement-deliberate-hoist.mlir` (structural,
+  `[A, B, C, A, A, D]` over 2 tiles, the exact case the old accidental
+  mechanism hoisted nothing for) and
+  `placement_never_changes_values_with_a_weight_repeated_in_one_body`
+  (`test/mlir/pipeline_e2e_test.cpp`, the same shape checked against a
+  numerical reference) are the proof on real IR;
+  `test/unit/steady_state_property_test.cpp` is the proof on the engine
+  itself, exhaustive for the provably-optimal once-per-body case and
+  property-based for the heuristic repeated-weight case.
 - [x] `cim-cost-report` (Pass 8): walks the final, already-placed IR and
   emits a JSON cost report, reusing `cim::CostReport`/`toJson`
   (`lib/Placement/CostReport.cpp`) rather than a second cost model that

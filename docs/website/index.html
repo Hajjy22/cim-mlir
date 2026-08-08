@@ -756,8 +756,8 @@
             </tr>
             <tr>
               <td>…reached deliberately</td>
-              <td><span class="pill partial">by accident</span></td>
-              <td>Falls out of an eviction tie-break rather than being aimed at. Guarded by a test, not yet designed</td>
+              <td><span class="pill works">deliberate</span></td>
+              <td>Pin-and-stream schedule, proven optimal when weights repeat at most once per body, validated heuristic otherwise. See the note below</td>
             </tr>
             <tr>
               <td>ONNX front end</td>
@@ -782,9 +782,10 @@
       </div>
 
       <div class="limit">
-        <span class="tag">What is genuinely still open there</span>
-        <p>The compiler reaches that per-iteration bound <strong>by accident rather than by aiming at it</strong>. The eviction scan starts at tile 0 and stops at the first weight with no future use, so tile 0 absorbs the whole spill and every other tile is written exactly once — which is precisely the condition that marks a weight as permanently resident. Change the scan to spread evictions and nothing is held permanently, and the workload silently degrades to what a plain LRU cache would do.</p>
-        <p>There is now a test guarding that specific regression, because no other test in the suite could catch it: the numerical suites cannot see it, since a compiler that holds nothing permanently still computes identical values. Making the result deliberate instead of incidental is the next piece of work.</p>
+        <span class="tag">Now reached deliberately, not by accident</span>
+        <p>Until recently the compiler reached that per-iteration bound <strong>by accident rather than by aiming at it</strong>: an eviction scan that starts at tile 0 and stops at the first weight with no future use happens to leave tile 0 absorbing the whole spill and every other tile written exactly once — precisely the condition that marks a weight as permanently resident. A reasonable-looking cleanup of that scan would have spread evictions instead, silently degrading the workload to what a plain LRU cache does. A structural test guards exactly that regression, because the numerical suites cannot see it — a compiler that holds nothing permanently still computes identical values, just more of them per iteration.</p>
+        <p>The bound is now aimed at directly. A <strong>pin-and-stream</strong> schedule pins the <code>tiles−1</code> most-used weights to permanent tiles by occurrence count (ties broken by first-use order) and streams everything else through the one remaining tile via a single-tile Belady sub-solve — single-tile solves are trivial and deterministic, since there is never a victim to choose between. The compiler computes both this schedule and the ordinary per-block solve for every constant-trip loop and takes whichever is strictly cheaper, so every case where the two already agreed is rewritten byte-for-byte unchanged.</p>
+        <p>When every weight in a loop body is used exactly once — <code>cim-partition</code>'s own shape, and every workload in the benchmark table above — pin-and-stream is <strong>provably optimal</strong>, checked by exhaustive search over every permutation up to 7 distinct weights against every tile count. When a weight repeats within one body the pin choice becomes a heuristic (the true optimum there is a residency fixed-point problem this project does not solve exactly), but it is proven never worse than pinning nothing at all, and its own output always replays as a genuine fixed point — checked exhaustively on small alphabets and on 500 random instances. That repeated-weight case is exactly the one the old accidental mechanism could fail on; there is now a test built specifically to hit it, on both the structural IR shape and the computed numbers.</p>
       </div>
 
       <div class="limit">

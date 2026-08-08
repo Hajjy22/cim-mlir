@@ -99,6 +99,18 @@ IR and `cim-cost-report` prints both numbers plus the gap, so these rows
 can be checked against the compiler rather than trusted.
 `docs/roadmap.md`'s M3 section has the full explanation.
 
+`cim-placement` reaches that `tiles-1`/`blocks-(tiles-1)` split
+deliberately: a pin-and-stream schedule
+(`cim::computeSteadyStatePlacement`, `lib/Placement/Placement.h`/`.cpp`)
+pins the `tiles-1` most-used weights and streams the rest through the
+remaining tile, provably exact for the once-per-body shape every workload
+in this table has, and `cim-placement` takes it whenever it beats the
+ordinary per-block solve. This also fixes the one case the ordinary
+solve's own eviction tie-break could miss on its own — a weight used more
+than once within a single loop body — which none of the five workloads
+above exercise, but which `test/Transforms/cim-placement-deliberate-hoist.mlir`
+and `test/unit/steady_state_property_test.cpp` cover directly.
+
 ## Volatile-vs-non-volatile: persistence changes the optimum
 
 The counts above are Belady/LRU/FIFO's reprogramming counts, which do not
