@@ -2,9 +2,12 @@
 # header) as a GitHub Pages site.
 #
 # Uses the "deploy from GitHub Actions" Pages source rather than a
-# gh-pages branch: actions/configure-pages enables Pages for the
-# repository automatically the first time this runs (given the pages:
-# write permission below), so no manual repo-settings step is needed.
+# gh-pages branch: actions/configure-pages, with enablement: true below,
+# creates the Pages site itself the first time this runs (given the
+# pages: write permission below), so no manual repo-settings step is
+# needed. Without that input the action only DETECTS an existing site and
+# fails with "Get Pages site failed... Not Found" on a repo where Pages
+# has never been turned on -- confirmed by running this once without it.
 #
 # The tradeoff this makes explicit: GitHub Pages sites are public to
 # anyone with the URL, even when built from a private repository --
@@ -42,6 +45,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/website
