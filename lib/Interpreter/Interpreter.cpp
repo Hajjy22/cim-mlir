@@ -7,6 +7,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -144,6 +145,7 @@ private:
   LogicalResult runAlloc(Operation *op, MemRefType type);
   LogicalResult runSubView(memref::SubViewOp op);
   LogicalResult runMemRefCopy(memref::CopyOp op);
+  LogicalResult runLinalgFill(linalg::FillOp op);
   LogicalResult runCall(func::CallOp op);
   LogicalResult runDeviceOpen(DeviceOpenOp op);
   LogicalResult runTileAlloc(TileAllocOp op);
@@ -484,6 +486,42 @@ LogicalResult Interpreter::runMemRefCopy(memref::CopyOp op) {
   if (failed(scatter(dstIt->second, bytes)))
     return op.emitError("memref.copy failed to write its target");
   return success();
+}
+
+LogicalResult Interpreter::runLinalgFill(linalg::FillOp op) {
+  // cim-partition's ragged-shape zero-padding is the only source of
+  // linalg.fill in this pipeline (see CIMPartition.cpp): always exactly one
+  // scalar input and one destination buffer, memref (not tensor) semantics,
+  // so there is no result to bind, only the side effect on the destination.
+  if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
+    return op.emitError("the interpreter only models linalg.fill with "
+                        "exactly one scalar input and one destination");
+
+  // The fill value must be something this interpreter has already computed
+  // -- in practice always an arith.constant -- never guessed: a fill this
+  // interpreter cannot evaluate could silently write the wrong pad value
+  // into memory a later cim.mvm reads as real data.
+  FailureOr<int64_t> value = evalIndex(op.getInputs()[0]);
+  if (failed(value))
+    return op.emitError("linalg.fill's scalar operand must be a constant "
+                        "the interpreter can evaluate");
+
+  auto dstIt = memrefs.find(op.getOutputs()[0]);
+  if (dstIt == memrefs.end())
+    return op.emitError("linalg.fill of an unknown buffer");
+  const MemRefValue &dst = dstIt->second;
+
+  // Same little-endian byte layout runAlloc/runProgram already use for
+  // writing a scalar into host memory (see the cursor loop in runAlloc).
+  std::vector<uint8_t> pattern(dst.elemBytes);
+  for (unsigned b = 0; b < dst.elemBytes; ++b)
+    pattern[b] = static_cast<uint8_t>((*value >> (8 * b)) & 0xFF);
+
+  std::vector<uint8_t> bytes(static_cast<size_t>(dst.numElements()) *
+                             dst.elemBytes);
+  for (size_t i = 0; i < bytes.size(); i += dst.elemBytes)
+    std::memcpy(bytes.data() + i, pattern.data(), dst.elemBytes);
+  return scatter(dst, bytes);
 }
 
 LogicalResult Interpreter::runCall(func::CallOp op) {
@@ -922,6 +960,7 @@ LogicalResult Interpreter::execute(Operation *op) {
       })
       .Case<memref::SubViewOp>([&](auto o) { return runSubView(o); })
       .Case<memref::CopyOp>([&](auto o) { return runMemRefCopy(o); })
+      .Case<linalg::FillOp>([&](auto o) { return runLinalgFill(o); })
       .Case<memref::CastOp>([&](memref::CastOp o) -> LogicalResult {
         // An alias: the cast to an unranked memref for printing keeps the
         // source's sizes and strides.

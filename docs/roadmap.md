@@ -410,14 +410,41 @@ wrong.
   simulator, so there is no numerical check across the whole pipeline.
 
 ### Known limits of cim-partition
-Each is refused with a warning and the `linalg` op left intact, so the
-module stays correct and is simply not offloaded:
+Each of the remaining two is refused with a warning and the `linalg` op left
+intact, so the module stays correct and is simply not offloaded:
 - Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
   output-major convention). A plain `linalg.matmul` needs a transpose first.
 - Only a single output row: `cim.mvm` is a matrix-vector primitive and the
   v0.1 contract is matrix-vector.
-- Only exact multiples of the tile geometry. Spec Sec. 6 calls for
-  zero-padding ragged edges; that needs a pad-and-copy sequence.
+
+A third limit is closed: N and K no longer need to be exact multiples of the
+tile geometry. Spec Sec. 6's zero-padding is implemented as the pad-and-copy
+sequence this note used to say was missing -- when a dimension falls short
+of the next tile multiple, a fresh `memref.alloc` host buffer of the padded
+shape is zero-filled (`linalg.fill`) and the real weight/activation data is
+copied into its top-left corner (`memref.copy`) before tiling proceeds
+exactly as in the exact-multiple case. Padding rows/columns can only ever
+contribute a `0 * x` term to the MVM they take part in, so they cannot
+change any answer; the write-back is the one place raggedness still has to
+be handled explicitly, cropping each block's (possibly padded)
+tileRows-sized result down to however many of its rows are real before
+copying it into `%out`. Verified both ways this project verifies a
+composition: `test/Transforms/cim-partition.mlir`'s
+`ragged_n_is_zero_padded`/`ragged_k_is_zero_padded` pin the exact IR shape
+(the alloc, the fill, the copy, the crop), and
+`test/mlir/pipeline_e2e_test.cpp`'s `e2e_ragged_n_is_zero_padded_and_cropped`/
+`e2e_ragged_k_is_zero_padded`/`e2e_ragged_in_both_dimensions` execute the
+padded IR through the interpreter and check it against the plain, unpadded
+reference -- which has no idea padding happened, so any leak of a padding
+row or column into a real output would show up as a wrong number, not just
+a structurally-odd one. That numerical path needed one addition to the
+interpreter itself: `linalg.fill` execution (`lib/Interpreter/Interpreter.cpp`),
+since cim-partition's zero-padding is the only source of that op in this
+pipeline and nothing previously modeled it. The scratch buffers this
+allocates are never freed, matching this pipeline's existing convention:
+none of cim-partition's other scratch buffers (the staged activation, each
+block's host output copy) are freed either -- buffer lifetime management is
+out of scope for v0.1 across the board, not just here.
 
 ## M3 — The placement pass
 - [x] Belady/MIN eviction implemented and unit-tested, with LRU and FIFO

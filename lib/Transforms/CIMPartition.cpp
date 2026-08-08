@@ -20,9 +20,26 @@
 // not offloaded):
 //   - buffer (memref) semantics
 //   - a single output row: the v0.1 contract is matrix-vector
-//   - N and K exact multiples of the tile geometry. Spec Sec. 6 calls for
-//     zero-padding ragged edges; that needs a pad-and-copy sequence and is
-//     not implemented yet.
+//
+// N and K need not be exact multiples of the tile geometry: spec Sec. 6
+// calls for zero-padding the ragged edge, and that is what happens here.
+// When N and/or K falls short of the next tile multiple, a fresh
+// memref.alloc host buffer of the padded shape is zero-filled
+// (linalg.fill) and the real weight/activation data is copied into its
+// top-left corner (memref.copy) before tiling proceeds exactly as in the
+// exact-multiple case -- so a partially-empty tile is genuinely
+// programmed with zeros in its unused rows/columns, not left holding
+// whatever the physical array last held. Padding rows/columns can only
+// ever contribute a 0 * x term to the MVM they take part in, so they
+// cannot change any answer; the only place raggedness still shows through
+// is the write-back, which copies only the `n` real output rows out of
+// each block's (possibly padded) tileRows-sized result -- see
+// `validRows` in partition() below. Both new host buffers are compiler
+// scratch this pass allocates and never frees, matching this pipeline's
+// existing convention: none of cim-partition's other scratch buffers
+// (the staged activation, each block's host output copy) are freed
+// either -- buffer lifetime management is out of scope for v0.1 across
+// the board, not just here.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,11 +48,15 @@
 #include "cim/Target/TargetSpec.h"
 #include "cim/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <algorithm>
 
 #define DEBUG_TYPE "cim-partition"
 
@@ -129,16 +150,16 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
                       "candidate unoffloaded");
       return;
     }
-    if (n % tileRows != 0 || k % tileCols != 0) {
-      // Spec Sec. 6 says zero-pad the ragged edge. Emitting a partial tile
-      // instead would compute silently wrong results, so refuse.
-      op->emitWarning("cim-partition: weight shape ")
-          << n << "x" << k << " is not an exact multiple of the target's "
-          << tileRows << "x" << tileCols
-          << " tile geometry; zero-padding of ragged edges is not implemented "
-             "yet, so this candidate is left unoffloaded";
-      return;
-    }
+    // Spec Sec. 6 says zero-pad a ragged edge rather than emit a partial
+    // tile (which would silently compute wrong results by reading or
+    // writing past the real matrix). Round each dimension up to the next
+    // tile multiple; when a dimension already is one, paddedN == n /
+    // paddedK == k and every branch below that only fires "when padded"
+    // is simply dead, so the exact-multiple case emits identical IR to
+    // before this padding support existed.
+    const int64_t paddedN = llvm::divideCeil(n, tileRows) * tileRows;
+    const int64_t paddedK = llvm::divideCeil(k, tileCols) * tileCols;
+    const bool needsPadding = paddedN != n || paddedK != k;
 
     OpBuilder builder(op);
     const Location loc = op.getLoc();
@@ -146,6 +167,7 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     Type i32 = builder.getI32Type();
     Type actElem = actType.getElementType();
     Type outElem = outType.getElementType();
+    Type weightElem = weightType.getElementType();
     (void)i8;
     (void)i32;
 
@@ -154,16 +176,57 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     Value device = builder.create<DeviceOpenOp>(loc, deviceType,
                                                  builder.getStringAttr(spec.name));
 
-    // Activations: collapse the 1 x K input to a K-vector, then stage it in
-    // near memory once. Every tile reads a slice of that one staged copy --
-    // spec Sec. 3.4 requires the transfer to be explicit, and hoisting it
-    // out of the tile loop is the whole point of making it visible.
-    Value actRow = rankReducedSubView(builder, loc, act, {0, 0}, {1, k}, {k});
-    auto actNearType = nearMemRef(ctx, {k}, actElem, SpaceKind::near);
-    Value actNear = builder.create<CopyOp>(loc, actNearType, actRow);
+    // The weight sub-matrix a tile-block subview reads from, and the width
+    // to slice the staged activation against -- the real weights/k in the
+    // common case, or a zero-padded stand-in sized to the tile geometry
+    // when N and/or K are ragged. Padding rows/columns are provably inert:
+    // a row or column of zero weight can only ever contribute 0 * x to an
+    // MVM's accumulator, so this cannot change any answer -- only the
+    // write-back below (`validRows`) has to know which output rows are
+    // real.
+    Value workWeights = weights;
+    int64_t workN = n;
+    int64_t workK = k;
+    if (needsPadding) {
+      Value weightZero = builder.create<arith::ConstantOp>(
+          loc, weightElem, builder.getIntegerAttr(weightElem, 0));
+      auto paddedWeightType = MemRefType::get({paddedN, paddedK}, weightElem);
+      Value paddedWeights =
+          builder.create<memref::AllocOp>(loc, paddedWeightType);
+      builder.create<linalg::FillOp>(loc, ValueRange{weightZero},
+                                     ValueRange{paddedWeights});
+      Value weightDst = subView(builder, loc, paddedWeights, {0, 0}, {n, k});
+      builder.create<memref::CopyOp>(loc, weights, weightDst);
+      workWeights = paddedWeights;
+      workN = paddedN;
+      workK = paddedK;
+    }
 
-    const int64_t tilesN = n / tileRows;
-    const int64_t tilesK = k / tileCols;
+    // Activations: collapse the 1 x K input to a K-vector. If K itself is
+    // ragged, zero-pad that vector the same way before staging it, since
+    // every tile-block slice below reads workK-wide columns; if only N is
+    // ragged, workK == k and the real row is staged as-is. Either way it
+    // is staged in near memory once -- spec Sec. 3.4 requires the transfer
+    // to be explicit, and hoisting it out of the tile loop is the whole
+    // point of making it visible.
+    Value actRow = rankReducedSubView(builder, loc, act, {0, 0}, {1, k}, {k});
+    Value actSource = actRow;
+    if (workK != k) {
+      Value actZero = builder.create<arith::ConstantOp>(
+          loc, actElem, builder.getIntegerAttr(actElem, 0));
+      auto paddedActType = MemRefType::get({workK}, actElem);
+      Value paddedAct = builder.create<memref::AllocOp>(loc, paddedActType);
+      builder.create<linalg::FillOp>(loc, ValueRange{actZero},
+                                     ValueRange{paddedAct});
+      Value actDst = subView1D(builder, loc, paddedAct, 0, k);
+      builder.create<memref::CopyOp>(loc, actRow, actDst);
+      actSource = paddedAct;
+    }
+    auto actNearType = nearMemRef(ctx, {workK}, actElem, SpaceKind::near);
+    Value actNear = builder.create<CopyOp>(loc, actNearType, actSource);
+
+    const int64_t tilesN = workN / tileRows;
+    const int64_t tilesK = workK / tileCols;
     int64_t blockId = 0;
 
     auto tileType = TileType::get(ctx, {tileRows, tileCols}, actElem);
@@ -177,8 +240,9 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
       for (int64_t kb = 0; kb < tilesK; ++kb) {
         const int64_t k0 = kb * tileCols;
 
-        // The weight sub-matrix for this tile: W[n0:n0+rows, k0:k0+cols].
-        Value weightBlock = subView(builder, loc, weights, {n0, k0},
+        // The weight sub-matrix for this tile: W[n0:n0+rows, k0:k0+cols],
+        // read from the padded stand-in when one was built above.
+        Value weightBlock = subView(builder, loc, workWeights, {n0, k0},
                                     {tileRows, tileCols});
 
         // Tile ids must stay within the target's declared tile count (spec
@@ -226,11 +290,23 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
       // Bring the result back to host memory and write it into the output
       // buffer. Requantization is deliberately not done here -- it is
       // cim-legalize-precision's job (spec Sec. 6, Pass 6).
+      //
+      // A block always produces tileRows results, but the *real* output
+      // only has n rows -- when N was padded, the last block's tail rows
+      // are the padding rows manufactured above, computed from an
+      // all-zero weight sub-matrix and therefore always zero, but with no
+      // home in `out` to be written to. validRows is tileRows for every
+      // block except (at most) this last one, so this is a no-op change
+      // in the exact-multiple case.
+      const int64_t validRows = std::min(tileRows, n - n0);
       auto hostOutType = MemRefType::get({tileRows}, outElem);
       Value hostOut = builder.create<CopyOp>(loc, hostOutType, sum);
-      Value outSlice =
-          rankReducedSubView(builder, loc, out, {0, n0}, {1, tileRows}, {tileRows});
-      builder.create<memref::CopyOp>(loc, hostOut, outSlice);
+      Value hostOutValid = validRows == tileRows
+                                ? hostOut
+                                : subView1D(builder, loc, hostOut, 0, validRows);
+      Value outSlice = rankReducedSubView(builder, loc, out, {0, n0},
+                                          {1, validRows}, {validRows});
+      builder.create<memref::CopyOp>(loc, hostOutValid, outSlice);
     }
 
     LLVM_DEBUG(llvm::dbgs() << "cim-partition: lowered a " << n << "x" << k

@@ -180,9 +180,18 @@ binaries built from two sources (mvm, requantize) each differing only in a const
 must exit 0 and the wrong ones must genuinely crash, so a broken assertion that "always
 passes" would be caught, not just a broken one that never fires.
 
-`cim-partition`'s own scope limits (matrix-vector, output-major weights,
-exact tile multiples) are each refused with a warning rather than silently mislowered — see
-[`docs/roadmap.md`](docs/roadmap.md).
+`cim-partition`'s remaining scope limits (matrix-vector, output-major weights) are each
+refused with a warning rather than silently mislowered — see [`docs/roadmap.md`](docs/roadmap.md).
+A third limit, N and K needing to be exact multiples of the tile geometry, is closed:
+a ragged edge is zero-padded up to the next tile multiple (`memref.alloc` + `linalg.fill`
++ a `memref.copy` of the real data into the top-left corner) before tiling proceeds
+exactly as in the exact-multiple case, and the write-back crops each block back down to
+its real output rows so a padding row's all-zero result never reaches `%out`
+(`test/Transforms/cim-partition.mlir`'s `ragged_n_is_zero_padded`/`ragged_k_is_zero_padded`
+check the IR shape; `test/mlir/pipeline_e2e_test.cpp`'s `e2e_ragged_*` cases check the
+padding is numerically inert against the plain, unpadded reference). The interpreter
+gained `linalg.fill` execution to make that checkable — `cim-partition`'s zero-padding is
+its only source in this pipeline.
 
 `cimrt` (the C ABI everything above eventually calls through) went through a hardening
 pass: a use-after-free when a buffer outlived its device, an allocation failure that

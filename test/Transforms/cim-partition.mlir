@@ -50,20 +50,78 @@ memref.global "private" constant @weights_512x512 : memref<512x512xi8> = dense<1
 
 // -----
 
-// Ragged shapes must be refused rather than lowered to partially-filled
-// tiles, which would compute silently wrong results. Spec Sec. 6 calls for
-// zero-padding; until that exists the candidate stays as linalg.
-// CHECK-LABEL: func.func @ragged_shape_is_left_alone
-func.func @ragged_shape_is_left_alone(%act: memref<1x256xi8>, %out: memref<1x300xi32>) {
+// Ragged N: 300 rows is not a multiple of erbium-8t's 256-row tile, so the
+// weight matrix is zero-padded up to 512 rows (linalg.fill, then the real
+// 300x256 data copied into the top-left corner) before tiling proceeds
+// exactly as in the exact-multiple case above. K is already exact, so no
+// activation padding is needed.
+// CHECK-LABEL: func.func @ragged_n_is_zero_padded
+func.func @ragged_n_is_zero_padded(%act: memref<1x256xi8>, %out: memref<1x300xi32>) {
   %w = memref.get_global @weights_300x256 : memref<300x256xi8>
-  // expected-warning @+2 {{not an exact multiple}}
-  // CHECK: linalg.matmul_transpose_b
+
+  // CHECK: %[[ZERO:.*]] = arith.constant 0 : i8
+  // CHECK: %[[PAD:.*]] = memref.alloc() : memref<512x256xi8>
+  // CHECK: linalg.fill ins(%[[ZERO]] : i8) outs(%[[PAD]] : memref<512x256xi8>)
+  // CHECK: %[[DST:.*]] = memref.subview %[[PAD]][0, 0] [300, 256] [1, 1]
+  // CHECK: memref.copy %{{.*}}, %[[DST]]
+
+  // Two N-blocks (512 / 256 tile rows), one K-block: nothing to reduce.
+  // The first block is a full, real 256 rows, written back in between the
+  // two cim.program ops...
+  // CHECK: cim.program
+  // CHECK: memref.copy %{{.*}} : memref<256xi32> to memref<256xi32, strided<[1]>>
+  // CHECK: cim.program
+  // CHECK-NOT: cim.program
+  // CHECK-NOT: cim.reduce_partial
+
+  // ...but the second block's tile computes 256 rows and only 44 of them
+  // (300 - 256) are real output -- the rest are the zero-padded rows'
+  // all-zero results, which have no home in %out.
+  // CHECK: memref.subview %{{.*}}[0] [44] [1] : memref<256xi32> to memref<44xi32
+  // CHECK: memref.subview %arg1[0, 256] [1, 44] [1, 1]
   linalg.matmul_transpose_b ins(%act, %w : memref<1x256xi8>, memref<300x256xi8>)
                             outs(%out : memref<1x300xi32>)
-  // CHECK-NOT: cim.program
   return
 }
 memref.global "private" constant @weights_300x256 : memref<300x256xi8> = dense<1>
+
+// -----
+
+// Ragged K: 300 columns is not a multiple of erbium-8t's 256-column tile,
+// so both the weight matrix and the staged activation are zero-padded up
+// to 512 columns -- a padded activation column can only ever multiply a
+// padded (zero) weight column, so it contributes 0 to every reduced sum
+// and cannot change the answer. N is already exact, so the write-back is
+// unaffected (see the N-ragged case above for that half).
+// CHECK-LABEL: func.func @ragged_k_is_zero_padded
+func.func @ragged_k_is_zero_padded(%act: memref<1x300xi8>, %out: memref<1x256xi32>) {
+  %w = memref.get_global @weights_256x300 : memref<256x300xi8>
+
+  // The weight matrix is padded first...
+  // CHECK: %[[WZERO:.*]] = arith.constant 0 : i8
+  // CHECK: %[[WPAD:.*]] = memref.alloc() : memref<256x512xi8>
+  // CHECK: linalg.fill ins(%[[WZERO]] : i8) outs(%[[WPAD]] : memref<256x512xi8>)
+  // CHECK: memref.subview %[[WPAD]][0, 0] [256, 300]
+
+  // ...then the staged activation, separately, since it is a different
+  // buffer with its own ragged edge to zero-pad up to the same 512.
+  // CHECK: %[[AZERO:.*]] = arith.constant 0 : i8
+  // CHECK: %[[APAD:.*]] = memref.alloc() : memref<512xi8>
+  // CHECK: linalg.fill ins(%[[AZERO]] : i8) outs(%[[APAD]] : memref<512xi8>)
+  // CHECK: memref.subview %[[APAD]][0] [300]
+
+  // One N-block, two K-blocks (512 / 256 tile columns): the two partial
+  // sums are reduced even though the second block is entirely padding --
+  // this pass has no way to know a block is all-zero without inspecting
+  // data it does not have at compile time, only shape.
+  // CHECK-COUNT-2: cim.program
+  // CHECK-NOT: cim.program
+  // CHECK: cim.reduce_partial
+  linalg.matmul_transpose_b ins(%act, %w : memref<1x300xi8>, memref<256x300xi8>)
+                            outs(%out : memref<1x256xi32>)
+  return
+}
+memref.global "private" constant @weights_256x300 : memref<256x300xi8> = dense<1>
 
 // -----
 

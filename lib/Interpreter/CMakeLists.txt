@@ -9,6 +9,7 @@ add_mlir_library(MLIRCIMInterpreter
   MLIRIR
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRLinalgDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRSupport

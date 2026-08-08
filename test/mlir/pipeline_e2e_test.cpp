@@ -533,6 +533,48 @@ CIM_TEST(e2e_many_blocks_stress_reuse_in_both_dimensions) {
 }
 
 //===----------------------------------------------------------------------===//
+// Ragged shapes: N and/or K not exact multiples of the tile geometry.
+// cim-partition zero-pads up to the next tile multiple (test/Transforms/
+// cim-partition.mlir's ragged_*_is_zero_padded cases check the IR shape);
+// these cases check that the padding is numerically inert and the
+// write-back crop lands on exactly the real rows, using the plain
+// (unpadded) reference as ground truth -- it has no idea padding
+// happened, so any leak of a padding row/column into a real output
+// changes the comparison.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(e2e_ragged_n_is_zero_padded_and_cropped) {
+  // N = 6 over 4-row tiles: paddedN = 8, so the second block's tile
+  // computes a full 4-row result but only 2 of those rows (6 - 4) are
+  // real output. Deliberately nonzero, non-symmetric weights so that a
+  // write-back that copied all 4 rows instead of cropping to 2 -- either
+  // overrunning %out or overwriting real memory just past it -- would be
+  // caught, not masked by a padding row that happens to be zero anyway.
+  const std::vector<int8_t> w = sequential(6 * 4, -12, 1);
+  const std::vector<int8_t> act = {3, -5, 7, -11};
+  checkCase("ragged N", w, act, 6, 4);
+}
+
+CIM_TEST(e2e_ragged_k_is_zero_padded) {
+  // K = 6 over 4-column tiles: paddedK = 8, so both the weight matrix's
+  // extra columns and the staged activation are zero-padded before the
+  // two K-blocks' partial sums are reduced. Getting the pad value wrong
+  // (anything but zero) would corrupt every output, not just an edge one.
+  const std::vector<int8_t> w = sequential(4 * 6, -10, 1);
+  const std::vector<int8_t> act = sequential(6, -3, 2);
+  checkCase("ragged K", w, act, 4, 6);
+}
+
+CIM_TEST(e2e_ragged_in_both_dimensions) {
+  // N = 5, K = 7: both dimensions ragged at once, padding up to 8x8 (a
+  // 2x2 grid of tile blocks) -- weight padding, activation padding, and
+  // the cropped write-back all exercised together in the same matmul.
+  const std::vector<int8_t> w = sequential(5 * 7, -17, 1);
+  const std::vector<int8_t> act = sequential(7, 4, -3);
+  checkCase("ragged N and K", w, act, 5, 7);
+}
+
+//===----------------------------------------------------------------------===//
 // cim-placement: the flagship pass
 //
 // Until this section existed, cim-placement was unreachable dead code -- its
