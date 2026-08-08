@@ -3,6 +3,7 @@
 #include "cim/Placement/Placement.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -438,7 +439,8 @@ bool validateSteadyStatePlacement(const SteadyStateProblem &problem,
                                streamed.end());
     const PlacementResult solved =
         computePlacement(doubled, EvictionPolicy::Belady);
-    continuation.assign(solved.actions.begin() + streamed.size(),
+    continuation.assign(solved.actions.begin() +
+                            static_cast<std::ptrdiff_t>(streamed.size()),
                         solved.actions.end());
     // The internal solve above used a single tile numbered 0 (it knows
     // nothing about the real target's tile count); remap every action to
