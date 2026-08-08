@@ -508,8 +508,48 @@ out of scope for v0.1 across the board, not just here.
   `cimrt`'s own counters, for straight-line, spill, and both hoisted and
   unhoisted loop cases -- and a mutation test (disabling the trip-count
   weighting) confirms the loop cases actually fail without it.
-- [ ] Volatile-vs-non-volatile comparison plot showing that persistence
-  changes the optimum, not just the magnitude.
+- [x] Volatile-vs-non-volatile comparison plot showing that persistence
+  changes the optimum, not just the magnitude. Found on the way: the
+  target schema's `standby_leakage_uw_per_tile` field
+  (`docs/target-format.md`) was parsed and printed by `dump-target` but
+  never actually fed into any cost number -- `amortizedInstallEnergyPjPerInference`
+  divided `installEnergyPj` by `inferences` regardless of `persistent`, even
+  though its own doc comment already said "on a volatile target the install
+  cost recurs and this is a floor, not a limit." It is wired in now: a
+  non-volatile target (`report.persistent`) amortizes exactly as before,
+  since retaining its weights costs nothing once written; a volatile target
+  additionally pays `numTiles * standbyLeakageUwPerTile` for as long as one
+  steady-state inference takes (`report.steadyStateElapsedNsPerInference`,
+  a new field -- the run's program-only latency plus its mvm latency, which
+  nothing before this needed combined), and that term scales with elapsed
+  time rather than with the install event, so it does not shrink as
+  `inferences` grows. `test/unit/cost_report_test.cpp` checks the actual
+  claim: the non-volatile curve keeps shrinking by ~10x per decade of
+  `inferences` out to 10^12, the volatile one converges to (not just
+  approaches) a computed floor and never drops below it, and a target
+  declaring zero leakage reproduces the pre-fix formula exactly (backward
+  compatibility, since `erbium-8t.yaml` itself declares
+  `standby_leakage_uw_per_tile: 0.0`).
+
+  `cim-bench` gained an `amortize` subcommand: one placement run (a single
+  `CostReport`, since the amortization formula is closed-form over an
+  arbitrary inference count -- re-simulating per sweep point would not
+  change a single number and would not scale to the sweep's high end
+  regardless) swept over a fixed log-spaced range of inference counts,
+  emitted as JSON `points`. `bench/plots/plot_amortization.py` takes one
+  non-volatile and one volatile run and plots both curves log-log: on
+  `erbium-8t` vs. `generic-digital-cim` at the `mm-fit` workload, the two
+  curves visibly cross -- the volatile target's cheaper install cost wins
+  at low inference counts, the non-volatile target's amortization wins once
+  its curve drops below the other's leakage floor -- which is the actual
+  "changes the optimum" claim: a reader comparing the two targets at a
+  single inference count would see only a magnitude difference and could
+  not tell the crossover exists. `test/python/test_amortization_curve.py`
+  is the second, independent check on the real shipped binary rather than
+  the library directly: it asserts the non-volatile curve is still
+  shrinking ~10x per decade at the end of the sweep, the volatile curve has
+  visibly flattened (its last two points within 1%), and the two curves
+  cross at least once.
 
 ## M4 — Second target and generalization (future)
 - `targets/generic-digital-cim.yaml` already exists as a placeholder

@@ -70,6 +70,36 @@ Belady solved over the whole flattened N-inference sequence, which can find
 reuse that `cim-placement`'s single-iteration, tile-local hoisting check
 cannot see. `docs/roadmap.md`'s M3 section has the full explanation.
 
+## Volatile-vs-non-volatile: persistence changes the optimum
+
+The counts above are Belady/LRU/FIFO's reprogramming counts, which do not
+depend on persistence — a `cim.program` costs the same whether the tile
+that holds it is volatile SRAM or non-volatile MRAM/RRAM. What differs is
+whether holding a weight resident *between* uses is free, and that shows up
+not in the counts but in how install cost amortizes:
+
+```sh
+cim-bench amortize --target erbium-8t --out nonvolatile.json
+cim-bench amortize --target generic-digital-cim --out volatile.json
+python3 bench/plots/plot_amortization.py nonvolatile.json volatile.json -o amortization.png
+```
+
+`erbium-8t` (non-volatile, `standby_leakage_uw_per_tile: 0.0`) amortizes
+`mm-fit`'s one-time install cost down by ~10x for every 10x more inferences
+it is spread over — the number that makes weight-stationary CIM worth
+compiling for. `generic-digital-cim` (volatile, `4.5` µW/tile) amortizes the
+same way at first, since its install cost is cheaper to begin with, but its
+curve flattens and never drops below a fixed per-inference floor: the array
+must stay continuously powered to retain what was just programmed into it,
+and that leakage cost scales with elapsed time, not with how many
+inferences share the install event. The two curves cross — at few
+inferences the volatile target wins on install cost, at many the
+non-volatile target wins because its curve keeps falling while the volatile
+one is stuck at its floor. That crossover, not just a different number at
+one fixed inference count, is what "persistence changes the optimum" means
+(`docs/roadmap.md`'s M3 section has the full derivation and the unit tests
+that pin it).
+
 ## Still to come
 
 - ONNX ingestion, so the shapes come from a real model file rather than
@@ -77,6 +107,3 @@ cannot see. `docs/roadmap.md`'s M3 section has the full explanation.
 - Numerical correctness against a PyTorch reference alongside these counts
   (spec Sec. 10) — needs the compiler pipeline to actually emit runnable
   artifacts.
-- The volatile-vs-non-volatile comparison plot (spec M3): the same workload
-  against `generic-digital-cim.yaml` to show that persistence changes the
-  optimum, not just the magnitude.

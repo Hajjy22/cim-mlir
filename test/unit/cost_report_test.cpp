@@ -136,6 +136,79 @@ CIM_TEST(action_kind_and_policy_names_round_trip) {
                 "program+evict");
 }
 
+CIM_TEST(amortization_matches_the_old_formula_when_leakage_is_zero) {
+  // erbium-8t.yaml itself declares standby_leakage_uw_per_tile: 0.0 even
+  // though it is nonvolatile -- backward-compatibility case: a volatile
+  // target that happens to declare zero leakage must amortize exactly like
+  // the pre-leakage formula (plain division), not acquire a floor from
+  // nowhere.
+  TargetSpec volatileNoLeakage = erbium8t();
+  volatileNoLeakage.tiles.persistent = false;
+  volatileNoLeakage.tiles.persistence = "volatile";
+  volatileNoLeakage.costs.standbyLeakageUwPerTile = 0.0;
+
+  const Workload wl = makeMatmulWorkload("mm-fit", "", 8, 8, 1000);
+  const PlacementResult r = computePlacement(wl.problem, EvictionPolicy::Belady);
+  const CostReport report =
+      computeCostReport(volatileNoLeakage, r, wl.stepsPerInference);
+
+  const double over1M = amortizedInstallEnergyPjPerInference(report, 1000000);
+  const double over100M =
+      amortizedInstallEnergyPjPerInference(report, 100000000);
+  CIM_EXPECT(over100M < over1M);
+  CIM_EXPECT_EQ(over100M, report.installEnergyPj / 100000000.0);
+}
+
+CIM_TEST(amortization_has_a_nonzero_floor_on_a_volatile_target_with_leakage) {
+  // The actual roadmap claim (docs/roadmap.md's M3 section): persistence
+  // changes which curve the amortized cost is on, not just where a single
+  // curve sits. Two reports built from the identical placement result and
+  // install cost, differing only in persistence and leakage -- so any
+  // difference below is provably caused by that, and nothing else.
+  TargetSpec volatileSpec = erbium8t();
+  volatileSpec.tiles.persistent = false;
+  volatileSpec.tiles.persistence = "volatile";
+  volatileSpec.costs.standbyLeakageUwPerTile = 4.5; // generic-digital-cim.yaml
+
+  const Workload wl = makeMatmulWorkload("mm-fit", "", 8, 8, 1000);
+  const PlacementResult r = computePlacement(wl.problem, EvictionPolicy::Belady);
+  const CostReport nonvolatileReport = computeCostReport(erbium8t(), r, wl.stepsPerInference);
+  const CostReport volatileReport = computeCostReport(volatileSpec, r, wl.stepsPerInference);
+
+  const double floorPj = static_cast<double>(volatileReport.numTiles) *
+                         volatileReport.standbyLeakageUwPerTile *
+                         volatileReport.steadyStateElapsedNsPerInference * 1e-3;
+  CIM_EXPECT(floorPj > 0.0);
+
+  // Amortizing over ever more inferences keeps shrinking the non-volatile
+  // number toward zero...
+  const double nonvolatile1M =
+      amortizedInstallEnergyPjPerInference(nonvolatileReport, 1000000);
+  const double nonvolatile100M =
+      amortizedInstallEnergyPjPerInference(nonvolatileReport, 100000000);
+  CIM_EXPECT(nonvolatile100M < nonvolatile1M);
+  CIM_EXPECT(nonvolatile100M < floorPj);
+
+  // ...but the volatile number never drops below the leakage floor, no
+  // matter how many more inferences it is amortized over -- the qualitative
+  // difference, not merely a different number at the same N.
+  const double volatile1M =
+      amortizedInstallEnergyPjPerInference(volatileReport, 1000000);
+  const double volatile100M =
+      amortizedInstallEnergyPjPerInference(volatileReport, 100000000);
+  CIM_EXPECT(volatile100M >= floorPj);
+  CIM_EXPECT(volatile1M >= floorPj);
+  // At a large enough N the install term is negligible and the reported
+  // value converges to (not just approaches) the floor.
+  const double volatileHugeN =
+      amortizedInstallEnergyPjPerInference(volatileReport, 1000000000000ULL);
+  CIM_EXPECT(volatileHugeN - floorPj < floorPj * 1e-6 + 1e-9);
+
+  // At the same N, the volatile number must be strictly worse -- this is
+  // the number a plot of both curves actually shows.
+  CIM_EXPECT(volatile100M > nonvolatile100M);
+}
+
 CIM_TEST(amortization_is_monotone_and_guards_division_by_zero) {
   const CostReport report = fitReport(1000);
   const double over1 = amortizedInstallEnergyPjPerInference(report, 1);

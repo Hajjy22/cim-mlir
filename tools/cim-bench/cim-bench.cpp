@@ -42,19 +42,31 @@ struct Options {
   std::string targetFile;
   std::string outPath = "results.json";
   uint32_t inferences = 1000;
+  std::string workload = "mm-fit";
+  std::string policy = "belady";
 };
 
 void printUsage() {
   std::cout
       << "cim-bench: cim-mlir benchmark harness\n\n"
          "usage: cim-bench run --target <name> [--out <path>] [--inferences <n>]\n"
-         "       cim-bench dump-target --target <name>\n\n"
+         "       cim-bench dump-target --target <name>\n"
+         "       cim-bench amortize --target <name> [--workload <name>] "
+         "[--policy <p>] [--out <path>]\n\n"
          "  dump-target        print the parsed target as canonical key=value\n"
          "                     lines, for differential-testing the reader\n"
+         "  amortize           sweep amortizedInstallEnergyPjPerInference over a\n"
+         "                     fixed range of inference counts for one workload,\n"
+         "                     to plot how install cost amortizes -- or, on a\n"
+         "                     volatile target, does not (docs/roadmap.md's M3\n"
+         "                     section; bench/plots/plot_amortization.py)\n"
          "  --target <name>    target name; resolved to targets/<name>.yaml\n"
          "  --target-file <p>  explicit path to a target file (overrides --target)\n"
          "  --out <path>       results JSON destination (default results.json)\n"
-         "  --inferences <n>   inferences to model per workload (default 1000)\n";
+         "  --inferences <n>   inferences to model per workload (default 1000)\n"
+         "  --workload <name>  amortize only: one of mm-fit, mm-spill-2x,\n"
+         "                     mm-spill-8x, mlp-3layer, bert-ffn (default mm-fit)\n"
+         "  --policy <p>       amortize only: belady, lru, or fifo (default belady)\n";
 }
 
 bool parseArgs(int argc, char **argv, Options &opts) {
@@ -67,9 +79,10 @@ bool parseArgs(int argc, char **argv, Options &opts) {
     printUsage();
     return false;
   }
-  if (opts.command != "run" && opts.command != "dump-target") {
+  if (opts.command != "run" && opts.command != "dump-target" &&
+      opts.command != "amortize") {
     std::cerr << "cim-bench: unknown command '" << opts.command
-              << "' (expected 'run' or 'dump-target')\n";
+              << "' (expected 'run', 'dump-target', or 'amortize')\n";
     return false;
   }
 
@@ -102,6 +115,14 @@ bool parseArgs(int argc, char **argv, Options &opts) {
         std::cerr << "cim-bench: --inferences must be at least 1\n";
         return false;
       }
+    } else if (arg == "--workload") {
+      const char *v = next("--workload");
+      if (!v) return false;
+      opts.workload = v;
+    } else if (arg == "--policy") {
+      const char *v = next("--policy");
+      if (!v) return false;
+      opts.policy = v;
     } else {
       std::cerr << "cim-bench: unrecognized option '" << arg << "'\n";
       return false;
@@ -247,6 +268,102 @@ int main(int argc, char **argv) {
                 spec.capabilities.partialSumInPlace ? "true" : "false");
     std::printf("capabilities.autonomous_control=%s\n",
                 spec.capabilities.autonomousControl ? "true" : "false");
+    return 0;
+  }
+
+  if (opts.command == "amortize") {
+    if (spec.provenance != Provenance::Measured) {
+      std::cerr << "cim-bench: WARNING: target '" << spec.name << "' declares "
+                << provenanceName(spec.provenance)
+                << " costs, not measured. Results below inherit that "
+                   "uncertainty and must be labelled as such in any plot.\n\n";
+    }
+
+    EvictionPolicy policy;
+    if (opts.policy == "belady") {
+      policy = EvictionPolicy::Belady;
+    } else if (opts.policy == "lru") {
+      policy = EvictionPolicy::LRU;
+    } else if (opts.policy == "fifo") {
+      policy = EvictionPolicy::FIFO;
+    } else {
+      std::cerr << "cim-bench: unknown policy '" << opts.policy
+                << "' (expected belady, lru, or fifo)\n";
+      return 1;
+    }
+
+    const std::vector<Workload> workloads = makeV01Workloads(
+        spec.tiles.count, spec.tiles.rows, spec.tiles.cols, opts.inferences);
+    const Workload *wl = nullptr;
+    for (const Workload &w : workloads)
+      if (w.name == opts.workload) {
+        wl = &w;
+        break;
+      }
+    if (!wl) {
+      std::cerr << "cim-bench: unknown workload '" << opts.workload
+                << "' (expected one of: mm-fit, mm-spill-2x, mm-spill-8x, "
+                   "mlp-3layer, bert-ffn)\n";
+      return 1;
+    }
+
+    PlacementResult result = computePlacement(wl->problem, policy);
+    std::string validationError;
+    if (!validatePlacement(wl->problem, result, &validationError)) {
+      std::cerr << "cim-bench: INVALID SCHEDULE for " << wl->name << "/"
+                << opts.policy << ": " << validationError << "\n";
+      return 1;
+    }
+    const CostReport report = computeCostReport(spec, result, wl->stepsPerInference);
+
+    // A fixed, wide log-spaced sweep, not one derived from --inferences:
+    // amortizedInstallEnergyPjPerInference is a closed-form function of the
+    // CostReport above (itself built from one representative run) and an
+    // arbitrary inference count, so one report answers the whole sweep --
+    // see the function's own header comment. Re-running placement per sweep
+    // point would not change a single number here and would not scale to
+    // the high end of this range regardless (mm-fit's use sequence alone
+    // would need 8 * 10^8 entries to actually simulate 10^8 inferences).
+    static const uint64_t kSweep[] = {1,      10,      100,       1000,
+                                      10000,  100000,  1000000,   10000000,
+                                      100000000, 1000000000};
+
+    std::ofstream out(opts.outPath);
+    if (!out) {
+      std::cerr << "cim-bench: failed to open '" << opts.outPath
+                << "' for writing\n";
+      return 1;
+    }
+
+    const std::string targetHash = hashFile(opts.targetFile);
+    out << "{\n";
+    out << "  \"target\": \"" << spec.name << "\",\n";
+    out << "  \"target_file\": \"" << opts.targetFile << "\",\n";
+    out << "  \"target_file_hash\": \"" << targetHash << "\",\n";
+    out << "  \"provenance\": \"" << provenanceName(spec.provenance) << "\",\n";
+    out << "  \"git_commit\": \"" << gitCommit() << "\",\n";
+    out << "  \"date\": \"" << utcTimestamp() << "\",\n";
+    out << "  \"workload\": \"" << wl->name << "\",\n";
+    out << "  \"policy\": \"" << toString(policy) << "\",\n";
+    out << "  \"persistent\": " << (spec.tiles.persistent ? "true" : "false") << ",\n";
+    out << "  \"standby_leakage_uw_per_tile\": "
+        << spec.costs.standbyLeakageUwPerTile << ",\n";
+    out << "  \"install_energy_pj\": " << report.installEnergyPj << ",\n";
+    out << "  \"points\": [\n";
+    const size_t numSweep = sizeof(kSweep) / sizeof(kSweep[0]);
+    for (size_t i = 0; i < numSweep; ++i) {
+      const uint64_t n = kSweep[i];
+      const double perInf = amortizedInstallEnergyPjPerInference(report, n);
+      out << "    {\"inferences\": " << n
+          << ", \"amortized_install_pj_per_inference\": " << perInf << "}"
+          << (i + 1 < numSweep ? "," : "") << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+
+    std::printf("wrote %s (target %s, workload %s, policy %s, hash %s)\n",
+                opts.outPath.c_str(), spec.name.c_str(), wl->name.c_str(),
+                opts.policy.c_str(), targetHash.c_str());
     return 0;
   }
 

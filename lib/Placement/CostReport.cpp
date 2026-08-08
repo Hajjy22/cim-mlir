@@ -65,6 +65,8 @@ CostReport computeCostReport(const TargetSpec &spec,
                               size_t stepsPerInference) {
   CostReport report;
   report.persistent = spec.tiles.persistent;
+  report.standbyLeakageUwPerTile = spec.costs.standbyLeakageUwPerTile;
+  report.numTiles = spec.tiles.count;
 
   report.programs = result.programs;
   report.reuses = result.reuses;
@@ -104,6 +106,13 @@ CostReport computeCostReport(const TargetSpec &spec,
   report.steadyStateEnergyPjPerInference = steady.energyPj;
   report.steadyStateLatencyNsPerInference = steady.latencyNs;
 
+  // Every step in the window is one mvm regardless of whether it also
+  // reprograms, so this is exact, not an estimate on top of an estimate.
+  const double mvmLatencyPerInferenceNs =
+      static_cast<double>(window) * spec.costs.mvm.latencyNs;
+  report.steadyStateElapsedNsPerInference =
+      steady.latencyNs + mvmLatencyPerInferenceNs;
+
   return report;
 }
 
@@ -111,7 +120,27 @@ double amortizedInstallEnergyPjPerInference(const CostReport &report,
                                              uint64_t inferences) {
   if (inferences == 0)
     return 0.0;
-  return report.installEnergyPj / static_cast<double>(inferences);
+  const double amortizedInstall =
+      report.installEnergyPj / static_cast<double>(inferences);
+  if (report.persistent)
+    return amortizedInstall;
+
+  // Volatile: the array must stay continuously powered for the whole run to
+  // retain the weights this pass just installed, and that draws
+  // standbyLeakageUwPerTile per tile the entire time -- whether the array
+  // is reprogramming, computing, or between the two -- not just while a
+  // program or mvm is actually executing, which is why this uses the
+  // window's total elapsed time rather than either cost alone. That power
+  // cost scales with how long the run takes, not with how many inferences
+  // share the one-time install event, so unlike amortizedInstall it does
+  // not shrink as `inferences` grows -- every inference pays its own slice
+  // of it. Energy unit note: 1 uW held for 1 ns is 1e-15 J = 1e-3 pJ,
+  // matching the uW-and-ns units the target schema and TargetSpec already
+  // use.
+  const double leakagePjPerInference =
+      static_cast<double>(report.numTiles) * report.standbyLeakageUwPerTile *
+      report.steadyStateElapsedNsPerInference * 1e-3;
+  return amortizedInstall + leakagePjPerInference;
 }
 
 std::string formatCostReport(const CostReport &report,
@@ -130,6 +159,14 @@ std::string formatCostReport(const CostReport &report,
      << formatTime(report.mvmLatencyNs) << "  "
      << formatEnergy(report.mvmEnergyPj) << "\n";
   os << "  reuses:    " << report.reuses << " (steps needing no reprogram)\n";
+
+  if (!report.persistent && report.standbyLeakageUwPerTile > 0.0) {
+    const double floor = static_cast<double>(report.numTiles) *
+                         report.standbyLeakageUwPerTile *
+                         report.steadyStateElapsedNsPerInference * 1e-3;
+    os << "  standby leakage floor: " << formatEnergy(floor)
+       << "/inference (this target never amortizes below it)\n";
+  }
 
   for (uint64_t n : {uint64_t(1), uint64_t(1000000), uint64_t(100000000)}) {
     const double perInf = amortizedInstallEnergyPjPerInference(report, n);
@@ -153,7 +190,21 @@ std::string toJson(const CostReport &report, const std::string &label) {
   os << "  \"steady_state_programs_per_inference\": "
      << report.steadyStateProgramsPerInference << ",\n";
   os << "  \"total_energy_pj\": " << report.totalEnergyPj << ",\n";
-  os << "  \"total_latency_ns\": " << report.totalLatencyNs << "\n";
+  os << "  \"total_latency_ns\": " << report.totalLatencyNs << ",\n";
+  os << "  \"standby_leakage_uw_per_tile\": " << report.standbyLeakageUwPerTile
+     << ",\n";
+  // The per-inference floor a volatile target's amortized install cost
+  // settles on and a non-volatile one does not -- see
+  // amortizedInstallEnergyPjPerInference's own comment. Zero on a
+  // non-volatile target, or on any target declaring zero leakage.
+  const double leakageFloorPj = report.persistent
+                                     ? 0.0
+                                     : static_cast<double>(report.numTiles) *
+                                           report.standbyLeakageUwPerTile *
+                                           report.steadyStateElapsedNsPerInference *
+                                           1e-3;
+  os << "  \"standby_leakage_pj_per_inference_floor\": " << leakageFloorPj
+     << "\n";
   os << "}\n";
   return os.str();
 }
