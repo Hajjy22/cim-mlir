@@ -46,6 +46,14 @@ struct IRCostCounts {
   /// cim.requantize has no equivalent of: it costs the same whichever
   /// iteration it fires on.
   uint64_t requantizes = 0;
+  /// Weighted count of chained adds a cim.reduce_partial site lowers to --
+  /// (numPartials - 1) per site, not one per site, matching
+  /// lowerReducePartial's own N-1-chained-calls design
+  /// (lib/Transforms/CIMLowerToTarget.cpp): an N-operand reduce_partial
+  /// costs N-1 cimrt_reduce_add calls, and a single-operand one (never
+  /// emitted by cim-partition, but not IR-invalid) costs zero, since it
+  /// lowers to a plain forward with no add at all.
+  uint64_t reduceAdds = 0;
   /// Static cim.program sites whose weight could not be determined because
   /// some enclosing loop's trip count is not a compile-time constant.
   uint64_t unknownProgramSites = 0;
@@ -53,12 +61,15 @@ struct IRCostCounts {
   uint64_t unknownMvmSites = 0;
   /// Same, for cim.requantize.
   uint64_t unknownRequantizeSites = 0;
+  /// Same, for cim.reduce_partial.
+  uint64_t unknownReduceSites = 0;
 
   /// True iff every site's weight was determined -- `programs`/`mvms`/
-  /// `requantizes` are then the exact whole-run totals, not a lower bound.
+  /// `requantizes`/`reduceAdds` are then the exact whole-run totals, not a
+  /// lower bound.
   bool complete() const {
     return unknownProgramSites == 0 && unknownMvmSites == 0 &&
-           unknownRequantizeSites == 0;
+           unknownRequantizeSites == 0 && unknownReduceSites == 0;
   }
 };
 

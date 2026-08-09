@@ -258,6 +258,10 @@ int main(int argc, char **argv) {
                 spec.costs.requantize.latencyNs);
     std::printf("costs.requantize.energy_pj=%.10g\n",
                 spec.costs.requantize.energyPj);
+    std::printf("costs.reduce_partial.latency_ns=%.10g\n",
+                spec.costs.reducePartial.latencyNs);
+    std::printf("costs.reduce_partial.energy_pj=%.10g\n",
+                spec.costs.reducePartial.energyPj);
     std::printf("costs.transfer.bandwidth_gbps=%.10g\n",
                 spec.costs.transfer.bandwidthGbps);
     std::printf("costs.transfer.energy_pj_per_byte=%.10g\n",
@@ -353,14 +357,28 @@ int main(int argc, char **argv) {
     out << "  \"standby_leakage_uw_per_tile\": "
         << spec.costs.standbyLeakageUwPerTile << ",\n";
     out << "  \"install_energy_pj\": " << report.installEnergyPj << ",\n";
+    // A PROJECTION, not a measurement of this run -- see CostReport.h's
+    // steadyStateElapsedNsPerInferenceIfOverlapped comment: what the
+    // amortized cost would be if a scheduler exploited this capability, a
+    // comparison point v0.1's own cim-schedule never realizes. Always
+    // present (fixed schema); when the target cannot double-buffer, the
+    // "if overlapped" figure is identical to the real one at every sweep
+    // point (amortizedInstallEnergyPjPerInferenceIfOverlapped's own
+    // fallback), which is the correct depiction -- there is no overlap
+    // benefit to show, not a missing one.
+    out << "  \"double_buffer_capable\": "
+        << (spec.capabilities.doubleBufferProgram ? "true" : "false") << ",\n";
     out << "  \"points\": [\n";
     const size_t numSweep = sizeof(kSweep) / sizeof(kSweep[0]);
     for (size_t i = 0; i < numSweep; ++i) {
       const uint64_t n = kSweep[i];
       const double perInf = amortizedInstallEnergyPjPerInference(report, n);
+      const double perInfOverlapped =
+          amortizedInstallEnergyPjPerInferenceIfOverlapped(report, n);
       out << "    {\"inferences\": " << n
-          << ", \"amortized_install_pj_per_inference\": " << perInf << "}"
-          << (i + 1 < numSweep ? "," : "") << "\n";
+          << ", \"amortized_install_pj_per_inference\": " << perInf
+          << ", \"amortized_install_pj_per_inference_if_overlapped\": "
+          << perInfOverlapped << "}" << (i + 1 < numSweep ? "," : "") << "\n";
     }
     out << "  ]\n";
     out << "}\n";

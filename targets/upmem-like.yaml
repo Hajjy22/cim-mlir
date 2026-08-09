@@ -32,6 +32,9 @@ costs:
   requantize:
     latency_ns: 60        # narrowing the i32 accumulator, lossless digital
     energy_pj: 200
+  reduce_partial:
+    latency_ns: 20        # summing two already-computed partials, not a MAC
+    energy_pj: 60
   transfer:
     bandwidth_gbps: 6.4  # DIMM-local bandwidth is the bottleneck resource
     energy_pj_per_byte: 6.8

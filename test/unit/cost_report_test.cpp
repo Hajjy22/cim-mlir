@@ -14,6 +14,7 @@
 #include "cim/Placement/Placement.h"
 #include "cim/Placement/Workloads.h"
 
+#include <algorithm>
 #include <string>
 
 using namespace cim;
@@ -47,6 +48,20 @@ CostReport fitReport(uint32_t inferences) {
   const PlacementResult r =
       computePlacement(wl.problem, EvictionPolicy::Belady);
   return computeCostReport(erbium8t(), r, wl.stepsPerInference);
+}
+
+/// 16 distinct blocks over 2 tiles: nothing stays resident across an
+/// inference's own sweep, so Belady reprograms on nearly every step in
+/// steady state -- unlike fitReport's mm-fit, this gives the overlap
+/// projection a genuinely nonzero program-vs-mvm mix to take a max() over.
+CostReport spillReport(uint32_t inferences, bool doubleBufferCapable) {
+  TargetSpec spec = erbium8t();
+  spec.tiles.count = 2;
+  spec.capabilities.doubleBufferProgram = doubleBufferCapable;
+  const Workload wl = makeMatmulWorkload("mm-spill", "", 16, 2, inferences);
+  const PlacementResult r =
+      computePlacement(wl.problem, EvictionPolicy::Belady);
+  return computeCostReport(spec, r, wl.stepsPerInference);
 }
 
 } // namespace
@@ -125,6 +140,110 @@ CIM_TEST(compute_cost_report_leaves_requantize_at_zero) {
   CIM_EXPECT_EQ(report.requantizes, uint64_t(0));
   CIM_EXPECT(report.requantizeEnergyPj == 0.0);
   CIM_EXPECT(report.requantizeLatencyNs == 0.0);
+}
+
+CIM_TEST(compute_cost_report_leaves_reduce_partial_at_zero) {
+  // Same boundary as requantize immediately above, for cim.reduce_partial's
+  // chained cimrt_reduce_add calls: this engine has no notion of a reduce
+  // step either, so cim-cost-report is what actually charges for it.
+  const CostReport report = fitReport(1000);
+  CIM_EXPECT_EQ(report.reducePartialAdds, uint64_t(0));
+  CIM_EXPECT(report.reducePartialEnergyPj == 0.0);
+  CIM_EXPECT(report.reducePartialLatencyNs == 0.0);
+}
+
+CIM_TEST(compute_cost_report_leaves_the_overlap_projection_at_zero_without_the_capability) {
+  // A target that never declares capabilities.double_buffer_program has no
+  // overlap projection to make -- left at zero rather than guessed, the
+  // same discipline requantize/reduce_partial follow above for an engine
+  // that does not model something. fitReport's erbium8t() fixture never
+  // sets the flag, so this also exercises the ordinary default.
+  const CostReport report = fitReport(1000);
+  CIM_EXPECT(!report.doubleBufferCapable);
+  CIM_EXPECT(report.steadyStateElapsedNsPerInferenceIfOverlapped == 0.0);
+  // ...and the amortization sibling must fall back to the honest,
+  // non-projected figure exactly, not merely something close to it.
+  CIM_EXPECT_EQ(amortizedInstallEnergyPjPerInferenceIfOverlapped(report, 1000),
+               amortizedInstallEnergyPjPerInference(report, 1000));
+}
+
+CIM_TEST(cost_report_overlap_projection_is_the_max_and_never_exceeds_the_serial_sum) {
+  // mm-spill over 2 tiles: steady state reprograms almost every step, so
+  // the window has a real, nonzero mix of program and mvm latency -- unlike
+  // fitReport's mm-fit, which has nothing to take a max() over. The claim
+  // being tested is exactly what the field's own comment promises: the
+  // projection is max(program, mvm), and max is never greater than sum for
+  // two non-negative numbers, so it must never exceed the real, serial
+  // figure -- overlap can only ever help or do nothing, never hurt.
+  const CostReport report = spillReport(1000, /*doubleBufferCapable=*/true);
+  CIM_EXPECT(report.doubleBufferCapable);
+  CIM_EXPECT(report.steadyStateLatencyNsPerInference > 0.0);
+
+  const double mvmLatencyPerInferenceNs =
+      report.steadyStateElapsedNsPerInference -
+      report.steadyStateLatencyNsPerInference;
+  const double expectedMax = std::max(report.steadyStateLatencyNsPerInference,
+                                      mvmLatencyPerInferenceNs);
+  CIM_EXPECT(report.steadyStateElapsedNsPerInferenceIfOverlapped == expectedMax);
+  CIM_EXPECT(report.steadyStateElapsedNsPerInferenceIfOverlapped <=
+             report.steadyStateElapsedNsPerInference);
+  // This workload's program cost dominates its mvm cost heavily enough
+  // (12000 ns vs. 640 ns, reprogramming on nearly every step) that the
+  // projection must be a REAL improvement, not a coincidental tie -- a
+  // bug that always returned the serial sum would pass the <= check above
+  // and still be wrong.
+  CIM_EXPECT(report.steadyStateElapsedNsPerInferenceIfOverlapped <
+             report.steadyStateElapsedNsPerInference);
+}
+
+CIM_TEST(amortization_if_overlapped_never_exceeds_the_serial_figure_on_a_volatile_target) {
+  // The amortization-level version of the same "overlap only ever helps"
+  // claim, on a volatile leaky target where the elapsed-time figure
+  // actually feeds a real number (the leakage floor) rather than being
+  // inert.
+  TargetSpec spec = erbium8t();
+  spec.tiles.count = 2;
+  spec.tiles.persistent = false;
+  spec.tiles.persistence = "volatile";
+  spec.costs.standbyLeakageUwPerTile = 4.5;
+  spec.capabilities.doubleBufferProgram = true;
+  const Workload wl = makeMatmulWorkload("mm-spill-volatile", "", 16, 2, 1000);
+  const PlacementResult r =
+      computePlacement(wl.problem, EvictionPolicy::Belady);
+  const CostReport report = computeCostReport(spec, r, wl.stepsPerInference);
+
+  const double serial = amortizedInstallEnergyPjPerInference(report, 1000000);
+  const double overlapped =
+      amortizedInstallEnergyPjPerInferenceIfOverlapped(report, 1000000);
+  CIM_EXPECT(overlapped <= serial);
+  CIM_EXPECT(overlapped < serial); // a real improvement, not a coincidence
+}
+
+CIM_TEST(cost_report_json_and_text_surface_the_overlap_projection_honestly) {
+  const CostReport capable = spillReport(1000, /*doubleBufferCapable=*/true);
+  const CostReport notCapable = spillReport(1000, /*doubleBufferCapable=*/false);
+
+  const std::string jsonCapable = toJson(capable, "spill-dbuf");
+  CIM_EXPECT_CONTAINS(jsonCapable, "\"double_buffer_capable\": true");
+  CIM_EXPECT_CONTAINS(jsonCapable,
+                      "\"steady_state_elapsed_ns_per_inference_if_overlapped\"");
+
+  const std::string jsonNotCapable = toJson(notCapable, "spill-nodbuf");
+  CIM_EXPECT_CONTAINS(jsonNotCapable, "\"double_buffer_capable\": false");
+  // The key is always present (fixed schema, matching requantizes/
+  // reduce_partial_adds above) even when the value is the zero default.
+  CIM_EXPECT_CONTAINS(
+      jsonNotCapable,
+      "\"steady_state_elapsed_ns_per_inference_if_overlapped\": 0");
+
+  // Text only shows the projection line for a target that could ever
+  // realize it -- showing it unconditionally would imply every target can
+  // double-buffer, which is exactly the "plausible but not achievable"
+  // number this project's discipline refuses to print.
+  CIM_EXPECT_CONTAINS(formatCostReport(capable, "spill-dbuf"),
+                      "if double-buffered");
+  CIM_EXPECT(formatCostReport(notCapable, "spill-nodbuf")
+                 .find("if double-buffered") == std::string::npos);
 }
 
 CIM_TEST(cost_report_energy_units_scale_sensibly) {

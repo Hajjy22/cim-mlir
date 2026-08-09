@@ -34,6 +34,7 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 | `mvm.latency_ns`, `mvm.energy_pj` | Cost of one `cim.mvm` against a resident tile. |
 | `transfer.bandwidth_gbps`, `transfer.energy_pj_per_byte` | Per-byte host↔near transfer cost, charged on `cim.copy`. |
 | `requantize.latency_ns`, `requantize.energy_pj` | Cost of one `cim.requantize` — an ADC readout on an analog target, a narrowing/rounding step on a digital one (spec Sec. 5.3). Required like `program`/`mvm`: leaving it unset would silently cost every `cim.requantize` at zero rather than say so. |
+| `reduce_partial.latency_ns`, `reduce_partial.energy_pj` | Cost of one chained add inside `cim.reduce_partial` — summing two already-computed partial accumulators (spec Sec. 5.4 rule 4), charged once per `cimrt_reduce_add` call an *N*-operand `cim.reduce_partial` lowers to (*N*-1 calls, not once per op site). Required like `requantize`, for the same reason. |
 | `standby_leakage_uw_per_tile` | Idle power draw; `0.0` for non-volatile targets (the non-volatile advantage). |
 
 ## `precision:`
@@ -54,12 +55,13 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 
 All energy fields are **picojoules** (`energy_pj`) and all latency fields
 are **nanoseconds** (`latency_ns`). `lib/Placement/CostReport.cpp` does its
-arithmetic in those units throughout. One field is deliberately outside
-that file's scope: `costs.requantize` is read and charged by
-`cim-cost-report` (`lib/Transforms/CIMCostReport.cpp`), which walks real
-compiled IR, not by `lib/Placement/CostReport.cpp`'s own engine, which
-models weight-programming amortization only and has no notion of a
-`cim.requantize` at all — see that file's own header comment.
+arithmetic in those units throughout. Two fields are deliberately outside
+that file's scope: `costs.requantize` and `costs.reduce_partial` are read
+and charged by `cim-cost-report` (`lib/Transforms/CIMCostReport.cpp`),
+which walks real compiled IR, not by `lib/Placement/CostReport.cpp`'s own
+engine, which models weight-programming amortization only and has no
+notion of a `cim.requantize` or a `cim.reduce_partial` at all — see that
+file's own header comment.
 
 Worth flagging before anyone builds a plot on it: the v0.1 spec's Section 17
 worked example is internally inconsistent by 1000x on program energy. With

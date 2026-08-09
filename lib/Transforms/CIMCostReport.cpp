@@ -61,10 +61,11 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     if (!counts.complete())
       module.emitWarning("cim-cost-report: ")
           << counts.unknownProgramSites << " cim.program site(s), "
-          << counts.unknownMvmSites << " cim.mvm site(s), and "
-          << counts.unknownRequantizeSites
-          << " cim.requantize site(s) sit under a loop whose trip count is "
-             "not a compile-time constant; they are excluded from the "
+          << counts.unknownMvmSites << " cim.mvm site(s), "
+          << counts.unknownRequantizeSites << " cim.requantize site(s), and "
+          << counts.unknownReduceSites
+          << " cim.reduce_partial site(s) sit under a loop whose trip count "
+             "is not a compile-time constant; they are excluded from the "
              "totals below rather than guessed, so the report is a lower "
              "bound, not the full picture";
 
@@ -95,10 +96,18 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.requantizeLatencyNs = static_cast<double>(counts.requantizes) *
                                   spec.costs.requantize.latencyNs;
 
-    report.totalEnergyPj =
-        report.programEnergyPj + report.mvmEnergyPj + report.requantizeEnergyPj;
-    report.totalLatencyNs =
-        report.programLatencyNs + report.mvmLatencyNs + report.requantizeLatencyNs;
+    report.reducePartialAdds = counts.reduceAdds;
+    report.reducePartialEnergyPj = static_cast<double>(counts.reduceAdds) *
+                                    spec.costs.reducePartial.energyPj;
+    report.reducePartialLatencyNs = static_cast<double>(counts.reduceAdds) *
+                                     spec.costs.reducePartial.latencyNs;
+
+    report.totalEnergyPj = report.programEnergyPj + report.mvmEnergyPj +
+                            report.requantizeEnergyPj +
+                            report.reducePartialEnergyPj;
+    report.totalLatencyNs = report.programLatencyNs + report.mvmLatencyNs +
+                             report.requantizeLatencyNs +
+                             report.reducePartialLatencyNs;
 
     report.installPrograms = counts.installPrograms;
     report.installEnergyPj = static_cast<double>(counts.installPrograms) *
@@ -128,6 +137,8 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
       out += std::to_string(counts.unknownMvmSites);
       out += ", unknown_requantize_sites=";
       out += std::to_string(counts.unknownRequantizeSites);
+      out += ", unknown_reduce_sites=";
+      out += std::to_string(counts.unknownReduceSites);
       out += ")";
     }
     out += "\n";

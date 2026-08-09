@@ -15,9 +15,12 @@ import json
 from conftest import run
 
 
-def amortize(cim_bench, target, tmp_path):
+def amortize(cim_bench, target, tmp_path, workload=None):
     out = tmp_path / f"{target}.json"
-    result = run([cim_bench, "amortize", "--target", target, "--out", str(out)])
+    cmd = [cim_bench, "amortize", "--target", target, "--out", str(out)]
+    if workload:
+        cmd += ["--workload", workload]
+    result = run(cmd)
     assert result.returncode == 0, result.stderr
     with open(out) as fh:
         return json.load(fh)
@@ -36,6 +39,41 @@ def test_nonvolatile_target_has_no_leakage_floor(cim_bench, tmp_path):
     # eating into it.
     ratio = values[-2] / values[-1]
     assert 9 < ratio < 11, f"expected ~10x, got {ratio}x ({values[-2:]})"
+
+
+def test_double_buffer_capable_target_projects_a_lower_or_equal_floor(
+    cim_bench, tmp_path
+):
+    """generic-digital-cim.yaml declares capabilities.double_buffer_program:
+    true -- the real fixture the "if overlapped" projection exists for, not
+    a synthetic one. This checks the property CostReport.h's own comment
+    promises on real cim-bench output, not just the unit-tested formula:
+    the projected curve, and the floor it settles on, can only ever be
+    lower than or equal to the real one, never higher (overlap only ever
+    helps or does nothing), and both curves are still present and
+    well-formed on a target this feature actually applies to.
+
+    mm-spill-8x, not the default mm-fit: a model that fits entirely
+    reprograms nothing in steady state, so there is nothing for the
+    projection to take a max() over and the two curves would be silently,
+    correctly identical -- proving nothing about whether a REAL divergence
+    ever renders correctly end to end.
+    """
+    data = amortize(cim_bench, "generic-digital-cim", tmp_path,
+                    workload="mm-spill-8x")
+    assert data["double_buffer_capable"] is True
+
+    real = [p["amortized_install_pj_per_inference"] for p in data["points"]]
+    overlapped = [
+        p["amortized_install_pj_per_inference_if_overlapped"]
+        for p in data["points"]
+    ]
+    assert all(o <= r for o, r in zip(overlapped, real)), (overlapped, real)
+    # A real target with a real program/mvm cost gap should show a REAL
+    # improvement somewhere in the sweep, not a coincidental tie everywhere
+    # -- otherwise this whole projection would be silently inert on the one
+    # shipped target that is supposed to exercise it.
+    assert any(o < r for o, r in zip(overlapped, real)), (overlapped, real)
 
 
 def test_volatile_target_hits_a_nonzero_floor(cim_bench, tmp_path):

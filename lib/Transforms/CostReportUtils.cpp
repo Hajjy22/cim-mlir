@@ -79,5 +79,21 @@ mlir::cim::IRCostCounts mlir::cim::countWeightedOps(ModuleOp module) {
     counts.requantizes += static_cast<uint64_t>(counted->first);
   });
 
+  module.walk([&](mlir::cim::ReducePartialOp op) {
+    FailureOr<std::pair<int64_t, int>> counted = weightedCount(op);
+    if (failed(counted)) {
+      ++counts.unknownReduceSites;
+      return;
+    }
+    // N operands lower to N-1 chained cimrt_reduce_add calls
+    // (lowerReducePartial, lib/Transforms/CIMLowerToTarget.cpp) -- weight
+    // the site by that many calls, not by one, or a reduce_partial summing
+    // four partials would be charged the same as one summing two.
+    const size_t numPartials = op.getPartials().size();
+    const uint64_t addsPerFiring =
+        numPartials > 0 ? static_cast<uint64_t>(numPartials - 1) : 0;
+    counts.reduceAdds += static_cast<uint64_t>(counted->first) * addsPerFiring;
+  });
+
   return counts;
 }

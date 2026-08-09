@@ -69,11 +69,16 @@ typedef struct cimrt_device_info {
  *   costs.program / costs.mvm in the target file says it is.
  *   requantizes_issued counts every cimrt_requantize call, charged at
  *   costs.requantize -- see that function's own doc comment for why this
- *   was the other half of a real gap, not always true. */
+ *   was the other half of a real gap, not always true.
+ *   reduce_adds_issued counts every cimrt_reduce_add CALL, charged at
+ *   costs.reduce_partial -- note "call", not "cim.reduce_partial op": an
+ *   N-operand reduce lowers to N-1 calls, and cim-cost-report weights its
+ *   own static side identically so the two can be compared directly. */
 typedef struct cimrt_profile {
   uint64_t programs_issued;
   uint64_t mvms_issued;
   uint64_t requantizes_issued;
+  uint64_t reduce_adds_issued;
   uint64_t bytes_transferred;
   double estimated_energy_pj;
   double estimated_latency_ns;
@@ -198,10 +203,17 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
  * to it, the same reason cimrt_requantize takes in_bits/out_bits rather
  * than assuming a width.
  *
- * Not yet counted by cimrt_profile_stop, and unlike cimrt_requantize (see
- * its own note above) this one has no compile-time accounting either: the
- * target schema has no reduce/accumulate cost entry at all yet (spec M4).
- */
+ * Counted by cimrt_profile_stop: each CALL is charged against
+ * costs.reduce_partial.latency_ns/energy_pj (spec target-format.md) into
+ * reduce_adds_issued/estimated_energy_pj/estimated_latency_ns. Per call,
+ * not per cim.reduce_partial op -- an N-operand reduce becomes N-1 calls
+ * here, and cim-cost-report (lib/Transforms/CostReportUtils.cpp) weights
+ * its static side by the same N-1 so the two sides of
+ * test/mlir/cost_report_e2e_test.cpp's differential count the same events.
+ * This closed the last of the three zero-cost-accounting gaps: cim.program
+ * and cim.mvm were always charged, cim.requantize was closed earlier (see
+ * its own note above), and this one was the remainder -- every op the
+ * runtime can execute is now charged against the target's cost table. */
 cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
                                const cimrt_buffer *a, const cimrt_buffer *b,
                                size_t count, uint32_t bits);

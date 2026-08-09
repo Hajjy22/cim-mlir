@@ -300,6 +300,10 @@ bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error) 
                   spec.costs.transfer.energyPjPerByte);
   r.requireDouble("costs.requantize.latency_ns", spec.costs.requantize.latencyNs);
   r.requireDouble("costs.requantize.energy_pj", spec.costs.requantize.energyPj);
+  r.requireDouble("costs.reduce_partial.latency_ns",
+                  spec.costs.reducePartial.latencyNs);
+  r.requireDouble("costs.reduce_partial.energy_pj",
+                  spec.costs.reducePartial.energyPj);
   r.optionalDouble("costs.standby_leakage_uw_per_tile",
                    spec.costs.standbyLeakageUwPerTile);
 
