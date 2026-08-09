@@ -357,10 +357,14 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
   for (size_t i = 0; i < count; ++i) {
     const int64_t value = signExtend(input->data.data() + i * inBytes, inBytes);
     // round-half-away-from-zero, the one mode that treats positive and
-    // negative accumulator values symmetrically -- matches
-    // Interpreter.cpp's runRequantize exactly, since this is the same
-    // arithmetic contract computed a second, independent way (device-side
-    // here, host-side there) and both must agree bit for bit.
+    // negative accumulator values symmetrically. This is the sole
+    // implementation of cim.requantize's arithmetic: Interpreter.cpp's
+    // runRequantize calls this function directly (mirroring how it already
+    // delegates cim.program/cim.mvm to cimrt_program/cimrt_mvm) rather than
+    // recomputing it host-side, so the cost accounting below and the
+    // arithmetic can never drift apart the way two independent copies
+    // could. test/mlir/legalize_precision_e2e_test.cpp's expectedRequantize
+    // is the independent third implementation that checks this one.
     const double scaled = static_cast<double>(value) / static_cast<double>(scale);
     int64_t quantized = static_cast<int64_t>(zero_point) +
                         static_cast<int64_t>(std::llround(scaled));
@@ -370,12 +374,7 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
     std::memcpy(output->data.data() + i * outBytes, &bits, outBytes);
   }
 
-  // Not accounted by cimrt_profile_stop yet -- see cimrt.h's own doc
-  // comment on this function: the target schema's costs.requantize entry
-  // exists now and cim-cost-report charges for it at compile time, but
-  // this runtime entry point does not yet feed a call here into
-  // cimrt_profile_stop's own counters (real M4 work, not a silent
-  // omission).
+  dev->cost.recordRequantize();
   return CIMRT_OK;
 }
 
@@ -442,6 +441,7 @@ cimrt_status cimrt_profile_stop(cimrt_device *dev, cimrt_profile *out) {
   const CostAccumulator::Snapshot now = dev->cost.snapshot();
   out->programs_issued = now.programsIssued - baseline.programsIssued;
   out->mvms_issued = now.mvmsIssued - baseline.mvmsIssued;
+  out->requantizes_issued = now.requantizesIssued - baseline.requantizesIssued;
   out->bytes_transferred = now.bytesTransferred - baseline.bytesTransferred;
   out->estimated_energy_pj = now.energyPj - baseline.energyPj;
   out->estimated_latency_ns = now.latencyNs - baseline.latencyNs;

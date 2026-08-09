@@ -38,6 +38,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 using namespace mlir;
@@ -65,6 +66,7 @@ std::string tinyTarget() {
 struct RuntimeCounts {
   uint64_t programs = 0;
   uint64_t mvms = 0;
+  uint64_t requantizes = 0;
   bool found = false;
 };
 
@@ -80,6 +82,10 @@ RuntimeCounts parseRuntimeCounts(const std::string &text) {
   const size_t mvmsPos = text.find("mvms=", pos);
   counts.mvms = static_cast<uint64_t>(
       std::strtoull(text.c_str() + mvmsPos + 5, nullptr, 10));
+  const size_t requantizesPos = text.find("requantizes=", pos);
+  counts.requantizes = static_cast<uint64_t>(std::strtoull(
+      text.c_str() + requantizesPos + std::strlen("requantizes="), nullptr,
+      10));
   return counts;
 }
 
@@ -93,7 +99,8 @@ struct Differential {
   std::string error;
 };
 
-Differential runDifferential(const std::string &source, bool withPlacement) {
+Differential runDifferential(const std::string &source, bool withPlacement,
+                             bool withLegalizePrecision = false) {
   Differential result;
 
   DialectRegistry registry;
@@ -124,6 +131,20 @@ Differential runDifferential(const std::string &source, bool withPlacement) {
       return result;
     }
     pm.addPass(std::move(placement));
+  }
+  if (withLegalizePrecision) {
+    // The one place this differential exercises cim.requantize: added
+    // directly after partition(+placement), the minimal pipeline that
+    // gets one into the IR, matching this file's existing minimal-pipeline
+    // style (no cim-schedule/cim-insert-transfers here either -- the
+    // interpreter needs neither to execute cim.requantize correctly, and
+    // this test is about the count, not about composition).
+    auto legalize = cim::createCIMLegalizePrecisionPass();
+    if (failed(legalize->initializeOptions("target-yaml=" + tinyTarget()))) {
+      result.error = "failed to set cim-legalize-precision options";
+      return result;
+    }
+    pm.addPass(std::move(legalize));
   }
   if (failed(pm.run(*module))) {
     result.error = "pass pipeline failed";
@@ -276,14 +297,22 @@ func.func @main() {
 )mlir";
 
 void expectDifferentialAgrees(const char *label, const std::string &source,
-                              bool withPlacement) {
-  Differential d = runDifferential(source, withPlacement);
+                              bool withPlacement,
+                              bool withLegalizePrecision = false) {
+  Differential d = runDifferential(source, withPlacement,
+                                   withLegalizePrecision);
   if (!d.error.empty()) {
     CIM_FAIL(std::string(label) + ": " + d.error);
     return;
   }
   CIM_EXPECT_EQ(d.predicted.programs, d.actual.programs);
   CIM_EXPECT_EQ(d.predicted.mvms, d.actual.mvms);
+  // Trivially 0 == 0 whenever withLegalizePrecision is false (no
+  // cim.requantize is ever emitted without it) -- asserted unconditionally
+  // anyway so every existing case here doubles as a "still zero" check,
+  // and cost_report_matches_runtime_on_a_requantized_module below is the
+  // one that makes it nonzero on both sides.
+  CIM_EXPECT_EQ(d.predicted.requantizes, d.actual.requantizes);
   CIM_EXPECT(d.predicted.complete());
 }
 
@@ -314,6 +343,23 @@ CIM_TEST(cost_report_matches_runtime_on_a_partially_hoisted_loop) {
                            /*withPlacement=*/true);
   expectDifferentialAgrees("loop-spill-unplaced", kLoopSpill,
                            /*withPlacement=*/false);
+}
+
+CIM_TEST(cost_report_matches_runtime_on_a_requantized_module) {
+  // Every case above runs detect+partition(+placement) only, so none of
+  // them ever emit a cim.requantize -- predicted.requantizes and
+  // actual.requantizes are both trivially 0 either way, which proves
+  // nothing about whether the two sides would actually agree on a REAL
+  // count. This is that proof: cim-legalize-precision inserts exactly one
+  // cim.requantize (a single 4x4 matmul, one terminal accumulator), and
+  // after this session's runtime-side fix (cimrt_requantize now calls
+  // CostAccumulator::recordRequantize, see runtime/src/simulator/
+  // cost_model.h) the interpreter's own cimrt_profile_stop counts it --
+  // so the static prediction and the actually-executed count have
+  // something nonzero to agree on for the first time.
+  expectDifferentialAgrees("requantized", kStraightLineFits,
+                           /*withPlacement=*/true,
+                           /*withLegalizePrecision=*/true);
 }
 
 CIM_TEST(cost_report_install_vs_steady_state_reflects_hoisting) {

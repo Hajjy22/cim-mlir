@@ -29,6 +29,7 @@ public:
   struct Snapshot {
     uint64_t programsIssued = 0;
     uint64_t mvmsIssued = 0;
+    uint64_t requantizesIssued = 0;
     uint64_t bytesTransferred = 0;
     double energyPj = 0.0;
     double latencyNs = 0.0;
@@ -37,8 +38,8 @@ public:
   explicit CostAccumulator(const TargetSpec &targetSpec) : spec(targetSpec) {}
 
   Snapshot snapshot() const {
-    return Snapshot{programsIssued, mvmsIssued, bytesTransferred, energyPj,
-                    latencyNs};
+    return Snapshot{programsIssued,   mvmsIssued, requantizesIssued,
+                    bytesTransferred, energyPj,   latencyNs};
   }
 
   void recordProgram() {
@@ -53,6 +54,12 @@ public:
     energyPj += spec.costs.mvm.energyPj;
   }
 
+  void recordRequantize() {
+    ++requantizesIssued;
+    latencyNs += spec.costs.requantize.latencyNs;
+    energyPj += spec.costs.requantize.energyPj;
+  }
+
   void recordTransfer(uint64_t bytes) {
     bytesTransferred += bytes;
     energyPj += static_cast<double>(bytes) * spec.costs.transfer.energyPjPerByte;
@@ -61,6 +68,7 @@ public:
 
   uint64_t getProgramsIssued() const { return programsIssued; }
   uint64_t getMvmsIssued() const { return mvmsIssued; }
+  uint64_t getRequantizesIssued() const { return requantizesIssued; }
   uint64_t getBytesTransferred() const { return bytesTransferred; }
   double getEstimatedEnergyPj() const { return energyPj; }
   double getEstimatedLatencyNs() const { return latencyNs; }
@@ -69,6 +77,7 @@ private:
   const TargetSpec &spec;
   uint64_t programsIssued = 0;
   uint64_t mvmsIssued = 0;
+  uint64_t requantizesIssued = 0;
   uint64_t bytesTransferred = 0;
   double energyPj = 0.0;
   double latencyNs = 0.0;

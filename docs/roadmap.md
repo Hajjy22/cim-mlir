@@ -901,16 +901,33 @@ out of scope for v0.1 across the board, not just here.
   PRECISION run is the existence proof, now with a `COST-JSON` check
   reading its cost-report output directly).
 
-  **Still open, the other half of the same gap**: `cimrt_profile_stop`
-  itself (`runtime/src/simulator/simulator.cpp`) does not count
-  `cimrt_requantize` calls, so `test/mlir/cost_report_e2e_test.cpp`'s
-  static-count-vs-runtime-counter differential has nothing on the runtime
-  side to check `cim.requantize`'s weighted count against yet, unlike
-  `programs`/`mvms`. `lib/Placement/CostReport.cpp` (the `cim-bench`
-  engine, which models weight-programming amortization from a
-  `PlacementResult` alone) is deliberately left out of this too -- see
-  that file's own header and `docs/target-format.md`'s units note for why
-  it has no notion of a requantize step at all.
+  **Closed, the other half of the same gap**: `cimrt_profile_stop`
+  (`runtime/src/simulator/simulator.cpp`) now counts `cimrt_requantize`
+  calls into a new `requantizes_issued` field of `cimrt_profile`
+  (`runtime/include/cimrt.h`), charged against `costs.requantize` the same
+  way `cimrt_program`/`cimrt_mvm` are charged against their own table
+  entries. Getting there surfaced a real second gap, not just a missing
+  counter: `Interpreter.cpp`'s `runRequantize` computed
+  `cim.requantize`'s round/clamp arithmetic entirely in host code and
+  never called `cimrt_requantize` at all, unlike `runProgram`/`runMvm`,
+  which always go through `cimrt_program`/`cimrt_mvm`. That meant every
+  interpreted `cim.requantize` executed for free -- adding the counter
+  alone left `test/mlir/cost_report_e2e_test.cpp`'s new differential test
+  failing (predicted 1, actual 0), which is what caught it. Fixed by
+  making `runRequantize` delegate to `cimrt_requantize` exactly like the
+  other two ops, which also collapses what used to be two independent
+  copies of the same rounding arithmetic (host-side in the interpreter,
+  device-side in the simulator) into one; a third, genuinely independent
+  reference implementation in `test/mlir/legalize_precision_e2e_test.cpp`
+  still checks it. New test:
+  `cost_report_matches_runtime_on_a_requantized_module`; mutation-tested
+  by disabling `CostAccumulator::recordRequantize`'s bookkeeping and
+  confirming both it and `cimrt_test.cpp`'s
+  `cimrt_profile_counts_a_known_trace` go red. `lib/Placement/CostReport.cpp`
+  (the `cim-bench` engine, which models weight-programming amortization
+  from a `PlacementResult` alone) is deliberately left out of this --
+  see that file's own header and `docs/target-format.md`'s units note for
+  why it has no notion of a requantize step at all.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

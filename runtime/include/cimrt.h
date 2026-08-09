@@ -66,10 +66,14 @@ typedef struct cimrt_device_info {
  *   bytes_transferred counts every byte moved across the runtime's buffer
  *   boundary by cimrt_copy, cimrt_write and cimrt_read. cimrt_program and
  *   cimrt_mvm do NOT record transfers -- their cost is whatever
- *   costs.program / costs.mvm in the target file says it is. */
+ *   costs.program / costs.mvm in the target file says it is.
+ *   requantizes_issued counts every cimrt_requantize call, charged at
+ *   costs.requantize -- see that function's own doc comment for why this
+ *   was the other half of a real gap, not always true. */
 typedef struct cimrt_profile {
   uint64_t programs_issued;
   uint64_t mvms_issued;
+  uint64_t requantizes_issued;
   uint64_t bytes_transferred;
   double estimated_energy_pj;
   double estimated_latency_ns;
@@ -161,16 +165,16 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
  * everywhere else in this project. `effective_bits` must be positive and
  * not exceed `out_bits`.
  *
- * Not yet counted by cimrt_profile_stop: the target schema's `costs:`
- * section DOES now have a requantize entry (`costs.requantize.latency_ns`/
- * `energy_pj`, spec target-format.md) -- `cim-cost-report`
- * (lib/Transforms/CIMCostReport.cpp) reads it and charges every compiled
- * cim.requantize site with it -- but this runtime entry point still does
- * not update programs_issued/mvms_issued/energy through
- * cimrt_profile_stop, so a call here still contributes nothing to a
- * PROFILED run's own counters. A known simplification (spec M4), not a
- * silent omission, and now the narrower of the two: the compile-time
- * number is real, only the runtime profiler's number is not yet. */
+ * Counted by cimrt_profile_stop: charged against costs.requantize.latency_ns/
+ * energy_pj (spec target-format.md) into requantizes_issued/
+ * estimated_energy_pj/estimated_latency_ns, the same way cimrt_program and
+ * cimrt_mvm are charged against their own cost table entries. This closes
+ * what used to be the runtime-profiler half of a real gap: cim-cost-report
+ * (lib/Transforms/CIMCostReport.cpp) already charged every COMPILED
+ * cim.requantize site at compile time; a call here now means the same
+ * event is counted on the executed side too, so
+ * test/mlir/cost_report_e2e_test.cpp's static-vs-runtime differential has
+ * something real to compare cim.requantize's weighted count against. */
 cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
                                cimrt_buffer *output, size_t count,
                                uint32_t in_bits, uint32_t out_bits,
