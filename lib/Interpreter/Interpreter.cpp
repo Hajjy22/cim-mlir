@@ -756,6 +756,20 @@ LogicalResult Interpreter::runReducePartial(ReducePartialOp op) {
         "against (its partials always come from cim.mvm, which requires "
         "one, so this indicates malformed IR)");
 
+  // capabilities.partial_sum_in_place, read via cimrt_query rather than a
+  // second, independent parse of the target YAML: the interpreter never
+  // parses TargetSpec itself (it only ever gets a path to hand cimrt_open),
+  // and dev->spec already has the answer sitting in memory the moment
+  // cimrt_open resolved it -- cimrt_query's own doc comment in cimrt.h
+  // anticipates exactly this ("callers... don't need to re-parse the
+  // target YAML at runtime"). Mirrors lowerReducePartial's identical
+  // decision (lib/Transforms/CIMLowerToTarget.cpp), made there directly
+  // from its own, separately (and necessarily) parsed compile-time spec.
+  cimrt_device_info info{};
+  if (cimrt_query(dev, &info) != CIMRT_OK)
+    return op.emitError("cim.reduce_partial: cimrt_query failed");
+  const bool inPlace = info.partial_sum_in_place;
+
   // Every partial staged into its own device buffer first, so the chained
   // adds below are pure device-side work. Freed on every exit path.
   llvm::SmallVector<cimrt_buffer *> staged;
@@ -797,40 +811,64 @@ LogicalResult Interpreter::runReducePartial(ReducePartialOp op) {
   // A single partial issues no call at all and forwards its value, exactly
   // as that lowering does -- there is nothing to add it to.
   cimrt_buffer *acc = staged.front();
-  llvm::SmallVector<cimrt_buffer *> intermediates;
-  auto releaseIntermediates = [&]() {
-    for (cimrt_buffer *buf : intermediates)
-      cimrt_free(buf);
-    intermediates.clear();
-  };
-  for (size_t i = 1; i < staged.size(); ++i) {
-    cimrt_buffer *sum = nullptr;
-    if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &sum) != CIMRT_OK) {
-      releaseIntermediates();
-      releaseStaged();
-      return op.emitError("failed to allocate a reduction accumulator");
-    }
-    intermediates.push_back(sum);
-    // out must not alias a or b (cimrt.h), which the fresh `sum` guarantees.
-    const cimrt_status status =
-        cimrt_reduce_add(dev, sum, acc, staged[i], static_cast<size_t>(count),
-                         elemType.getWidth());
-    if (status != CIMRT_OK) {
-      releaseIntermediates();
-      releaseStaged();
-      return op.emitError("cimrt_reduce_add failed: ")
-             << cimrt_status_string(status);
-    }
-    acc = sum;
-  }
-
   std::vector<uint8_t> outBytes(totalBytes);
-  const cimrt_status read = cimrt_read(acc, 0, outBytes.data(), totalBytes);
-  releaseIntermediates();
-  releaseStaged();
-  if (read != CIMRT_OK)
+  cimrt_status readStatus;
+  if (inPlace) {
+    // Unlike lowerReducePartial's compiled path, no cimrt_copy is needed
+    // to get here: every entry in `staged` -- including staged[0], about
+    // to become `acc` -- is ALREADY this call's own fresh, private buffer
+    // (allocated and written just above), never a live handle borrowed
+    // from somewhere else the way a compiled cim.mvm result can be. There
+    // is nothing else that could alias it, so folding directly into
+    // staged[0] is safe without the copy the compiled path needs for the
+    // same safety property.
+    for (size_t i = 1; i < staged.size(); ++i) {
+      const cimrt_status status = cimrt_reduce_add_inplace(
+          dev, acc, staged[i], static_cast<size_t>(count),
+          elemType.getWidth());
+      if (status != CIMRT_OK) {
+        releaseStaged();
+        return op.emitError("cimrt_reduce_add_inplace failed: ")
+               << cimrt_status_string(status);
+      }
+    }
+    readStatus = cimrt_read(acc, 0, outBytes.data(), totalBytes);
+    releaseStaged();
+  } else {
+    llvm::SmallVector<cimrt_buffer *> intermediates;
+    auto releaseIntermediates = [&]() {
+      for (cimrt_buffer *buf : intermediates)
+        cimrt_free(buf);
+      intermediates.clear();
+    };
+    for (size_t i = 1; i < staged.size(); ++i) {
+      cimrt_buffer *sum = nullptr;
+      if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &sum) != CIMRT_OK) {
+        releaseIntermediates();
+        releaseStaged();
+        return op.emitError("failed to allocate a reduction accumulator");
+      }
+      intermediates.push_back(sum);
+      // out must not alias a or b (cimrt.h), which the fresh `sum`
+      // guarantees.
+      const cimrt_status status = cimrt_reduce_add(
+          dev, sum, acc, staged[i], static_cast<size_t>(count),
+          elemType.getWidth());
+      if (status != CIMRT_OK) {
+        releaseIntermediates();
+        releaseStaged();
+        return op.emitError("cimrt_reduce_add failed: ")
+               << cimrt_status_string(status);
+      }
+      acc = sum;
+    }
+    readStatus = cimrt_read(acc, 0, outBytes.data(), totalBytes);
+    releaseIntermediates();
+    releaseStaged();
+  }
+  if (readStatus != CIMRT_OK)
     return op.emitError("failed to read the reduction result: ")
-           << cimrt_status_string(read);
+           << cimrt_status_string(readStatus);
 
   auto alloc = makeAllocation(resultType, totalBytes, dev);
   if (!alloc)

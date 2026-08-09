@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cim-frontend"
+version = "0.1.0"
+description = "cim-mlir's ONNX front end: reads an ONNX model, emits the MLIR the cim pipeline consumes."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+# numpy is a hard dependency: the front end's own activation loading
+# (--input/.npy, --input-random) uses it, independent of whether onnx
+# is installed. onnx/onnxruntime stay optional -- see the [project.optional-dependencies]
+# entry below and python/README.md's "Why Python, and why not in tools/"
+# for why this project keeps them out of the core build entirely.
+dependencies = [
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+# Mirrors test/python/requirements-onnx.txt. Split out for the same reason
+# that file is split from requirements.txt: `pip install cim-frontend` alone
+# gets you the CLI and its --help, but importing an actual model requires
+# opting into these.
+onnx = [
+    "onnx>=1.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/Hajjy22/cim-mlir"
+
+[project.scripts]
+# The entry point python/README.md's own usage example invokes today as
+# `python3 -m cim_frontend`. Both keep working: this just gives pip-installed
+# users a `cim-import-onnx` binary on PATH instead of requiring
+# PYTHONPATH=python and -m.
+cim-import-onnx = "cim_frontend.__main__:main"
+
+[tool.setuptools]
+packages = ["cim_frontend"]

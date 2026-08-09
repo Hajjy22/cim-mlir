@@ -616,11 +616,43 @@ private:
   /// A raw !llvm.ptr into `memrefValue`'s own storage. Only ever called on a
   /// value whose type is still a real MemRefType (see file header point 3);
   /// an already-staged device buffer has no raw pointer to extract.
+  ///
+  /// memref.extract_aligned_pointer_as_index deliberately returns ONLY the
+  /// underlying allocation's base pointer -- verified directly against real
+  /// --expand-strided-metadata/--finalize-memref-to-llvm output, which
+  /// lowers it to a bare `llvm.extractvalue` of the descriptor's aligned-
+  /// pointer field and NEVER adds the descriptor's separate offset field,
+  /// static or dynamic. Every subview this pass or cim-partition ever
+  /// builds is unit-stride (subView/subView1D/rowSubView all pass
+  /// stride 1), so extract_strided_metadata's `offset` result, in
+  /// elements, times the element width in bytes is exactly the missing
+  /// displacement -- added here by hand so this function's callers can
+  /// keep treating ANY host memref uniformly, offset or not.
+  ///
+  /// This closes a real, PRE-EXISTING gap: every caller of this function
+  /// got away with the missing offset before M > 1 batching, because
+  /// every activation subview reaching cim.copy had a literal, always-zero
+  /// offset (m == 1 only), and no real-target-e2e binary happened to give
+  /// cim.program's 2nd-or-later N/K-tile weightBlock (a genuinely nonzero
+  /// static offset already) numerically distinguishable data (every such
+  /// test's weight is uniform -- see e.g. check-multi-k-tile.mlir.in's
+  /// all-ones weight). A batched matmul with a real, distinguishable
+  /// per-row activation is what finally made a wrong address produce a
+  /// wrong, checkable number instead of a lucky match.
   Value hostPointer(OpBuilder &b, Location loc, Value memrefValue) {
-    Value idx =
-        b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, memrefValue);
-    Value asI64 = b.create<arith::IndexCastOp>(loc, i64Ty, idx);
-    return b.create<LLVM::IntToPtrOp>(loc, ptrTy, asI64);
+    auto memrefType = cast<MemRefType>(memrefValue.getType());
+    auto metadata =
+        b.create<memref::ExtractStridedMetadataOp>(loc, memrefValue);
+    Value baseIdx = b.create<memref::ExtractAlignedPointerAsIndexOp>(
+        loc, metadata.getBaseBuffer());
+    Value baseI64 = b.create<arith::IndexCastOp>(loc, i64Ty, baseIdx);
+    const int64_t elemBytes = memrefType.getElementTypeBitWidth() / 8;
+    Value elemBytesVal = b.create<arith::ConstantIndexOp>(loc, elemBytes);
+    Value offsetBytes =
+        b.create<arith::MulIOp>(loc, metadata.getOffset(), elemBytesVal);
+    Value offsetBytesI64 = b.create<arith::IndexCastOp>(loc, i64Ty, offsetBytes);
+    Value addr = b.create<arith::AddIOp>(loc, baseI64, offsetBytesI64);
+    return b.create<LLVM::IntToPtrOp>(loc, ptrTy, addr);
   }
 
   /// %status == CIMRT_OK, or trap with `what`. Every cimrt_* call's result
@@ -1279,11 +1311,56 @@ private:
       return finish(only, scratch);
     }
 
+    Value countVal = constI64(b, loc, count);
+    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
+
+    // capabilities.partial_sum_in_place (spec target-format.md): a target
+    // that can accumulate without a fresh destination buffer per step gets
+    // exactly ONE accumulator allocation for the whole chain instead of
+    // N-1 -- see cimrt_reduce_add_inplace's own doc comment in cimrt.h for
+    // why this is a separate ABI call rather than a relaxed
+    // cimrt_reduce_add, and why partials[0]'s own buffer is copied into a
+    // fresh one rather than mutated directly (it may have other uses this
+    // pass cannot see -- stageForRead can hand back an ALREADY-LIVE handle,
+    // not always a fresh one, whenever the operand is already device-space).
+    if (spec.capabilities.partialSumInPlace) {
+      OpBuilder accAllocB = creationBuilder(b);
+      Value acc = allocBuffer(accAllocB, loc, dev, *bytes, stageSpace);
+      noteHoisted(acc);
+
+      bool firstScratch = false;
+      Value first =
+          stageForRead(b, loc, dev, partials[0], stageSpace, firstScratch);
+      auto copyFn = getOrInsertFunc("cimrt_copy",
+                                    b.getFunctionType({ptrTy, ptrTy}, {i32Ty}));
+      Value copyStatus =
+          b.create<func::CallOp>(loc, copyFn, ValueRange{acc, first})
+              .getResult(0);
+      checkOk(b, loc, copyStatus, "cimrt_copy failed");
+      if (firstScratch)
+        freeBuffer(b, loc, first);
+
+      auto inplaceFn = getOrInsertFunc(
+          "cimrt_reduce_add_inplace",
+          b.getFunctionType({ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
+      for (size_t i = 1; i < partials.size(); ++i) {
+        bool rhsScratch = false;
+        Value rhs =
+            stageForRead(b, loc, dev, partials[i], stageSpace, rhsScratch);
+        Value status = b.create<func::CallOp>(
+                             loc, inplaceFn,
+                             ValueRange{dev, acc, rhs, countVal, bitsVal})
+                            .getResult(0);
+        checkOk(b, loc, status, "cimrt_reduce_add_inplace failed");
+        if (rhsScratch)
+          freeBuffer(b, loc, rhs);
+      }
+      return finish(acc, /*accIsOwnScratch=*/true);
+    }
+
     auto fn = getOrInsertFunc(
         "cimrt_reduce_add",
         b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
-    Value countVal = constI64(b, loc, count);
-    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
 
     bool accScratch = false;
     Value acc = stageForRead(b, loc, dev, partials[0], stageSpace, accScratch);

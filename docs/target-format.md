@@ -47,9 +47,9 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 
 | Field | Meaning |
 |---|---|
-| `double_buffer_program` | Can the target program tile *i+1* while computing on tile *i*? Used by `cim-schedule` to decide whether overlap is achievable. |
-| `partial_sum_in_place` | Can `cim.reduce_partial` accumulate without an extra buffer? |
-| `autonomous_control` | Host-less execution supported (spec Sec. 3.1 control-model axis)? |
+| `double_buffer_program` | Can the target program tile *i+1* while computing on tile *i*? `cim-schedule` itself does not reorder or overlap anything in v0.1 (its own file header says so); `lib/Placement/CostReport.cpp` reads this to report a clearly-labeled PROJECTION of what overlapping would save (`steady_state_elapsed_ns_per_inference_if_overlapped` in `cim-bench`'s output), never a claim about what the compiled schedule does. |
+| `partial_sum_in_place` | Can `cim.reduce_partial` accumulate without an extra buffer? Read by `cim-lower-to-target` (`lowerReducePartial`) and the interpreter alike: when true, an N-operand reduce allocates exactly ONE accumulator for the whole chain (`cimrt_reduce_add_inplace`, N-1 calls folded into it) instead of one fresh buffer per chained step (`cimrt_reduce_add`). |
+| `autonomous_control` | Host-less execution supported (spec Sec. 3.1 control-model axis)? Parsed and echoed by `cim-bench dump-target`; not read by any pass -- v0.1's execution model has nothing host-less to drive. |
 
 ## Units, and a discrepancy in the spec's worked example
 

@@ -663,12 +663,15 @@ wrong.
   restriction exists to avoid).
 
 ### Known limits of cim-partition
-Each of the remaining two is refused with a warning and the `linalg` op left
-intact, so the module stays correct and is simply not offloaded:
+The remaining one is refused with a warning and the `linalg` op left intact,
+so the module stays correct and is simply not offloaded:
 - Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
   output-major convention). A plain `linalg.matmul` needs a transpose first.
-- Only a single output row: `cim.mvm` is a matrix-vector primitive and the
-  v0.1 contract is matrix-vector.
+
+~~Only a single output row: `cim.mvm` is a matrix-vector primitive and the
+v0.1 contract is matrix-vector.~~ -- **closed, M4 below**: a matmul with
+M > 1 rows ("batching") is now tiled the same way a single row is, wrapped
+in a genuine `scf.for` this pass generates itself.
 
 A third limit is closed: N and K no longer need to be exact multiples of the
 tile geometry. Spec Sec. 6's zero-padding is implemented as the pad-and-copy
@@ -1073,12 +1076,191 @@ out of scope for v0.1 across the board, not just here.
   synchronously; nothing to wait on"), so a real overlap number there
   would have to either misrepresent what actually ran or require an
   honest-to-goodness async execution model -- exactly the v0.2 scheduling
-  work this capability is gated on, not a cost-model change. `partial_sum_
-  in_place` and `autonomous_control` remain fully unread; the former is
-  concretely actionable in `lowerReducePartial` (a target that can
-  accumulate in place needs no intermediate accumulator buffers) once
-  something is worth measuring the saving against, and the latter has
-  nothing in v0.1's execution model to drive at all.
+  work this capability is gated on, not a cost-model change.
+  `autonomous_control` remains fully unread -- v0.1's execution model has
+  nothing host-less to drive at all.
+
+- ~~`partial_sum_in_place` remains fully unread.~~ -- **closed**: read by
+  both `cim-lower-to-target` (`lowerReducePartial`) and the interpreter's
+  `runReducePartial`. When a target declares it, an N-operand
+  `cim.reduce_partial` allocates exactly ONE accumulator for the whole
+  chain -- copied from the first partial via a new `cimrt_copy` call (the
+  first partial's own buffer is never mutated directly: `stageForRead` can
+  hand back an already-live handle that may have other uses this pass
+  cannot see), then folded with the remaining N-1 partials via a new
+  `cimrt_reduce_add_inplace` ABI call -- instead of one fresh buffer per
+  chained step (`cimrt_reduce_add`). A new, separate ABI function rather
+  than a relaxed `cimrt_reduce_add`, matching how `cimrt_copy_range` was
+  added alongside `cimrt_copy` for a different new capability rather than
+  loosening an existing, already-tested contract; charged identically to
+  `cimrt_reduce_add` (same `costs.reduce_partial` entry, same
+  `reduce_adds_issued` counter) since it is the same hardware step
+  realized a different way. The interpreter learns the capability via a
+  new `partial_sum_in_place` field on `cimrt_query`'s `cimrt_device_info`
+  output (it never parses `TargetSpec` itself, unlike every compile-time
+  pass, which already does independently) rather than a second,
+  independent parse of the target YAML.
+
+  Verified: `test/targets/tiny-4x4-no-inplace.yaml` (new -- every other
+  tiny test target declares the capability true, so this is the one
+  fixture that exercises "cannot accumulate in place" at all), structural
+  FileCheck proof that a 3-operand reduce needs exactly one accumulator
+  allocation with the capability versus two without it
+  (`test/Transforms/cim-lower-to-target-reduce-partial-inplace.mlir`
+  alongside the existing, now-explicitly-no-inplace
+  `cim-lower-to-target.mlir`), direct `cimrt_reduce_add_inplace` unit
+  tests mirroring `cimrt_reduce_add`'s own (hand-computed values, overflow
+  wraps, invalid-argument rejection, identical cost accounting), and the
+  existing `real-target-e2e-reduce-partial-correct`/`-wrong` binaries now
+  genuinely exercise the in-place path end to end for free, since their
+  shared target file already declared the capability.
+
+  **A real, separate bug found along the way**: several existing
+  FileCheck lines matched the bare substring `call @cimrt_reduce_add`,
+  which is also a textual PREFIX of `call @cimrt_reduce_add_inplace` --
+  `test/Transforms/cim-pipeline-multi-k-tile.mlir`'s checks were silently
+  passing against the new function by accident once its target file
+  (already `partial_sum_in_place: true`) started actually emitting it,
+  rather than catching that the expected call had changed. Fixed by
+  requiring the disambiguating `(` on every such check
+  (`call @cimrt_reduce_add(`) and updating the expected call sequence to
+  what the target's own declared capability now actually produces.
+
+  **An honest limitation, found by mutation-testing**: forcing the
+  interpreter to ignore `partial_sum_in_place` entirely (hardcoding
+  either branch) breaks no test. Both branches compute the bit-identical
+  wrapping-add result and charge the identical cost by design (the whole
+  point of sharing `reduce_adds_issued`), so `cimrt_profile`'s counters
+  cannot distinguish "took the correct branch" from "took the other,
+  equally-valid one" from the outside -- unlike the COMPILED lowering's
+  choice, which the structural FileCheck tests above do catch, since the
+  two paths produce observably different IR. Mitigated, not solved: a
+  dedicated test
+  (`cost_report_matches_runtime_on_a_reduced_module_without_the_inplace_
+  capability`) at least makes sure the general branch is reachable and
+  correct through the interpreter at all -- before this session it had
+  zero interpreter-level coverage, since every existing test target
+  already declared the capability.
+- ~~No packaging: no `pyproject.toml`/`setup.py`; the ONNX front end
+  cannot be `pip install`ed despite being the project's front door~~ --
+  **closed**. `python/pyproject.toml` packages `cim_frontend` with a real
+  `cim-import-onnx` console-script entry point and an `onnx` extra
+  mirroring `test/python/requirements-onnx.txt`'s split (numpy is a hard
+  dependency; onnx/onnxruntime stay opt-in, matching why they were kept
+  out of the C++ build entirely -- see `python/README.md`'s "Why Python,
+  and why not in `tools/`"). `test/python`'s suites already import
+  `cim_frontend` via a `sys.path.insert` hack that keeps working
+  unchanged (source-tree imports still take priority), so packaging is
+  additive: it does not touch how any existing test finds the module.
+
+  Verified for real rather than just configured: a new `packaging` CI job
+  (`.github/workflows/ci.yml`) does a fresh `pip install ./python[onnx]`
+  in an environment with no MLIR toolchain and no source-tree
+  `PYTHONPATH`, runs the installed `cim-import-onnx` console script
+  (not `python3 -m cim_frontend`) against a model built with the
+  project's own `test/python/onnx_fixtures.py` helper, and greps the
+  emitted MLIR for the expected `linalg.matmul_transpose_b` shape --
+  proving the packaged entry point does real importer work, not merely
+  that `--help` exits zero. Confirmed locally in a scratch venv before
+  writing the CI job.
+- ~~The Section 17 units discrepancy is unresolved -- 1000x on program
+  energy, documented in `target-format.md`, and it is the crux of the
+  whole amortization argument~~ -- **not resolvable without hardware, but
+  now pinned rather than merely documented**. The choice this project
+  already made (implement `energy_pj`/`latency_ns` fields exactly as
+  named, not as `docs/target-format.md`'s prose reading of the spec's
+  internally-inconsistent Section 17 worked example) was previously
+  enforced by nothing except that prose: a future change to
+  `lib/Placement/CostReport.cpp`'s arithmetic could silently reintroduce
+  the spec's 1000x error with no test catching it, since the existing
+  `cost_report_energy_units_scale_sensibly` test only checks that the
+  formatter picks the right *unit suffix* (`uJ`), not the right
+  underlying number.
+
+  New test `install_energy_pins_the_pj_as_written_convention`
+  (`test/unit/cost_report_test.cpp`) asserts the exact numeric values on
+  both ends of `target-format.md`'s own worked example against
+  `erbium-8t`'s real `program.energy_pj: 480000`: 8 tiles' install energy
+  is exactly `3840000.0` pJ (3.84 uJ, not the spec prose's stated 3.84
+  mJ, which is 1000x larger), and amortized over 1e6 inferences that is
+  exactly `3.84` pJ/inference (negligible, not the spec's stated 3.84
+  nJ/inference, which would make install cost a material 13% of the
+  per-inference budget). Mutation-tested by injecting the spec's implied
+  1000x factor into `costOfWindow`'s energy arithmetic and confirming
+  both assertions go red before reverting.
+
+  This does not resolve which figure is actually correct on real
+  hardware -- that still needs measured data, per M5 below -- it only
+  makes sure this project's own documented interpretation cannot drift
+  by 1000x silently.
+- ~~`m != 1` hard-refused in `CIMPartition.cpp` -- v0.1 is matrix-**vector**:
+  there is no batching at all, not merely no *dynamic* batching~~ --
+  **closed on the compiler side**. A matmul with M > 1 output rows is now
+  tiled exactly like the m == 1 case -- weight programming, activation
+  staging, mvm, reduce_partial, write-back -- generated once and wrapped in
+  a genuine `scf.for` this pass builds itself over the M rows, rather than
+  refused. This is deliberately the SAME IR shape
+  `test/real-target/check-loop.mlir.in` already proved runs correctly as a
+  real binary (a HAND-written loop, from before this pass could generate
+  one itself); `cim-placement`'s existing loop hoisting and
+  `cim-lower-to-target`'s existing arbitrary-depth loop lowering needed no
+  changes to make this land -- both already generalize to whatever loop
+  shape reaches them, which is exactly what let PR #5's nested-loop work
+  and this land as two separate, independent PRs.
+
+  The one plain (non-`cim`) buffer this pass allocates directly -- the
+  K-padding scratch for a ragged activation -- is hoisted by hand once,
+  before the generated loop, the same way `cim-lower-to-target` hoists its
+  own scratch: a fresh allocation per row would leak M times at runtime
+  instead of once.
+
+  **A real, separate, PRE-EXISTING bug found along the way**: batching is
+  the first thing to ever feed a NONZERO-offset host memref into
+  `cim.copy`'s or `cim.program`'s lowering (every m == 1 activation
+  subview was offset 0; every real-target-e2e multi-tile test's weight
+  happened to be uniform, so a wrong address read the same value anyway).
+  `CIMLowerToTarget.cpp`'s `hostPointer` helper called
+  `memref.extract_aligned_pointer_as_index` directly on the source memref
+  -- verified against real `--expand-strided-metadata
+  --finalize-memref-to-llvm` output that this op returns ONLY the
+  underlying allocation's base pointer, lowered to a bare
+  `llvm.extractvalue` of the descriptor's aligned-pointer field, and never
+  adds the descriptor's separate offset field, static or dynamic. Any
+  caller ever handed a genuinely offset host memref got the WRONG address
+  silently. Fixed by computing the address as
+  `memref.extract_strided_metadata`'s base pointer plus
+  `offset * element_width_bytes` by hand. Caught by a new real-target-e2e
+  pair (`batch-correct`/`batch-wrong`, `test/real-target/check-batch.mlir.in`)
+  built from a genuine multi-row `linalg.matmul_transpose_b` -- not a
+  hand-written loop -- through the real `cim-detect`/`cim-partition`/
+  `cim-placement`/`cim-lower-to-target` chain: three rows with different
+  first elements, checksummed the same way `check-loop.mlir.in` already
+  does, so a wrong address reading row 0's bytes on every iteration is a
+  wrong, checkable number instead of a lucky match. Mutation-tested by
+  reverting the fix and confirming `batch-correct` goes from exit 0 to a
+  real `SIGABRT` on the checksum assert, then restoring it.
+
+  New FileCheck coverage: `test/Transforms/cim-partition.mlir`'s
+  `multi_row_is_batched_over_an_scf_for` replaces the old
+  `multi_row_is_left_alone` refusal test, pinning the generated `scf.for`,
+  the dynamic per-row activation/output subviews, and that
+  `cim-placement`'s hoisting still applies (verified separately against
+  real `cim-opt` output, not just asserted).
+
+  **Still open, and the natural next step**: the ONNX front end
+  (`python/cim_frontend/onnx_import.py`) still refuses any activation with
+  more than one row, and `emit.py`'s module-emission templates hardcode a
+  `memref<1x{k}xi8>` activation shape throughout (the exact IR shape
+  `test/python/test_numerical_differential.py`'s `build_module()` and
+  `test/mlir/pipeline_e2e_test.cpp`'s `buildModule()` are pinned against,
+  and which must stay byte-identical for the M == 1 case). Generalizing
+  the emitter to a real `[M, K]` activation, lifting `onnx_import.py`'s two
+  M != 1 refusal sites (single-layer and a chain's first layer), and a new
+  M > 1 differential against `onnx.reference`/`onnxruntime` is real,
+  separate work -- deliberately not rushed into the same change as the
+  compiler-side support above, so the numerical-fidelity front door gets
+  the same full verification (real oracle differential, not just a
+  structural check) every other front-end change in this project has had.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

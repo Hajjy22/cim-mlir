@@ -383,3 +383,50 @@ jobs:
             --inline-suppr --std=c++17 --quiet --check-level=exhaustive \
             -I include -I runtime/include \
             lib/Placement lib/Target runtime/src
+
+  # ---------------------------------------------------------------------
+  # Packaging: the ONNX front end as something `pip install` can reach
+  # ---------------------------------------------------------------------
+  #
+  # test/python's suites import cim_frontend via a sys.path.insert hack
+  # (see e.g. test_onnx_frontend.py) so they never actually prove the
+  # package in python/ is pip-installable -- that could bit-rot silently
+  # even with every other job green. This job is the whole point: it never
+  # touches the source-tree sys.path trick, only the real install.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the front end as a real package
+        run: pip install "./python[onnx]"
+
+      - name: The console-script entry point resolves and runs
+        run: cim-import-onnx --help
+
+      # A model built with the project's own fixture helper
+      # (test/python/onnx_fixtures.py), fed through the installed
+      # entry point rather than `python3 -m cim_frontend` -- proving the
+      # packaged console script does real work, not just --help.
+      - name: The installed entry point imports a real model
+        run: |
+          python3 - <<'EOF'
+          import sys
+          sys.path.insert(0, "test/python")
+          import numpy as np
+          from onnx_fixtures import matmul_integer_model
+
+          rng = np.random.default_rng(0)
+          weight = rng.integers(-128, 128, size=(4, 3), dtype=np.int64).astype(np.int8)
+          model = matmul_integer_model(weight)
+          with open("/tmp/pkg-smoke.onnx", "wb") as f:
+              f.write(model.SerializeToString())
+          EOF
+          cim-import-onnx /tmp/pkg-smoke.onnx --input-random 0 -o /tmp/pkg-smoke.mlir
+          # The importer's own output, pre-cim-opt: linalg, not yet the cim
+          # dialect (cim-detect/-partition/-placement are what produce that,
+          # and pulling in cim-opt here would make this job need MLIR just
+          # to test that `pip install` works). Matches python/README.md's
+          # own documented usage example.
+          grep -q 'func.func @main' /tmp/pkg-smoke.mlir
+          grep -q 'linalg.matmul_transpose_b' /tmp/pkg-smoke.mlir

@@ -40,6 +40,26 @@ const char *tinyTargetPath() {
   return path.c_str();
 }
 
+/// Same target, minus capabilities.partial_sum_in_place -- every other
+/// tiny test target declares it true, so this is the one fixture that
+/// exercises "this target cannot accumulate in place" at all.
+const char *tinyNoInplaceTargetPath() {
+  static std::string path = [] {
+    for (const char *candidate :
+         {"test/targets/tiny-4x4-no-inplace.yaml",
+          "../test/targets/tiny-4x4-no-inplace.yaml",
+          "../../test/targets/tiny-4x4-no-inplace.yaml"}) {
+      cimrt_device *probe = nullptr;
+      if (cimrt_open(candidate, &probe) == CIMRT_OK) {
+        cimrt_close(probe);
+        return std::string(candidate);
+      }
+    }
+    return std::string("test/targets/tiny-4x4-no-inplace.yaml");
+  }();
+  return path.c_str();
+}
+
 /// RAII device so a failed assertion cannot leak under ASan/valgrind.
 struct Device {
   cimrt_device *dev = nullptr;
@@ -535,6 +555,140 @@ CIM_TEST(cimrt_reduce_add_rejects_invalid_arguments) {
   // so count=2 at 32 bits fits but count=4 does not.
   CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, out.buf, a.buf, b.buf, 4, 32),
                 CIMRT_ERR_SHAPE_MISMATCH);
+}
+
+//===----------------------------------------------------------------------===//
+// reduce_add_inplace: the capabilities.partial_sum_in_place-gated sibling
+// of reduce_add above -- same arithmetic, folded into the first operand's
+// own storage instead of a third buffer.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(cimrt_reduce_add_inplace_matches_hand_computed_values) {
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+
+  const std::vector<int64_t> accInit = {1, -1, 100, 0};
+  const std::vector<int64_t> rhs = {2, -2, -50, 7};
+  Buffer acc, rhsBuf;
+  CIM_EXPECT_EQ(
+      cimrt_alloc(dev.dev, accInit.size() * 4, CIMRT_SPACE_NEAR, &acc.buf),
+      CIMRT_OK);
+  CIM_EXPECT_EQ(
+      cimrt_alloc(dev.dev, rhs.size() * 4, CIMRT_SPACE_NEAR, &rhsBuf.buf),
+      CIMRT_OK);
+  const std::vector<uint8_t> packedAcc = packSigned(accInit, 4);
+  const std::vector<uint8_t> packedRhs = packSigned(rhs, 4);
+  CIM_EXPECT_EQ(cimrt_write(acc.buf, 0, packedAcc.data(), packedAcc.size()),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(rhsBuf.buf, 0, packedRhs.data(), packedRhs.size()),
+                CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhsBuf.buf,
+                                        accInit.size(), /*bits=*/32),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(accInit.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(acc.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  for (size_t i = 0; i < accInit.size(); ++i)
+    CIM_EXPECT_EQ(got[i], accInit[i] + rhs[i]);
+}
+
+CIM_TEST(cimrt_reduce_add_inplace_wraps_on_overflow_rather_than_saturating) {
+  // Same wrap contract as cimrt_reduce_add's own overflow test -- the two
+  // functions must agree bit for bit, since a compiled binary and the
+  // interpreter each pick between them by target capability alone, never
+  // by expecting different arithmetic.
+  Device dev;
+  const std::vector<int64_t> accInit = {2147483647, -2147483648, -1};
+  const std::vector<int64_t> rhs = {1, -1, -2147483648};
+  Buffer acc, rhsBuf;
+  CIM_EXPECT_EQ(
+      cimrt_alloc(dev.dev, accInit.size() * 4, CIMRT_SPACE_NEAR, &acc.buf),
+      CIMRT_OK);
+  CIM_EXPECT_EQ(
+      cimrt_alloc(dev.dev, rhs.size() * 4, CIMRT_SPACE_NEAR, &rhsBuf.buf),
+      CIMRT_OK);
+  const std::vector<uint8_t> packedAcc = packSigned(accInit, 4);
+  const std::vector<uint8_t> packedRhs = packSigned(rhs, 4);
+  CIM_EXPECT_EQ(cimrt_write(acc.buf, 0, packedAcc.data(), packedAcc.size()),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(rhsBuf.buf, 0, packedRhs.data(), packedRhs.size()),
+                CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhsBuf.buf,
+                                        accInit.size(), /*bits=*/32),
+                CIMRT_OK);
+
+  std::vector<uint8_t> raw(accInit.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(acc.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  CIM_EXPECT_EQ(got[0], -2147483648LL);
+  CIM_EXPECT_EQ(got[1], 2147483647LL);
+  CIM_EXPECT_EQ(got[2], 2147483647LL);
+}
+
+CIM_TEST(cimrt_reduce_add_inplace_rejects_invalid_arguments) {
+  Device dev;
+  Buffer acc, rhs;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &acc.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &rhs.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(nullptr, acc.buf, rhs.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, nullptr, rhs.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, nullptr, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // acc must not alias rhs -- unlike reduce_add, there is no third buffer
+  // for this check to be about; it is purely "these must be two different
+  // partials", not an output-aliasing rule.
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, acc.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // Not a whole-byte width.
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhs.buf, 2, 5),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhs.buf, 2, 0),
+                CIMRT_ERR_INVALID_ARG);
+  // Buffer sizes must match count * bits/8: both buffers are 8 bytes, so
+  // count=2 at 32 bits fits but count=4 does not.
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhs.buf, 4, 32),
+                CIMRT_ERR_SHAPE_MISMATCH);
+}
+
+CIM_TEST(cimrt_reduce_add_inplace_is_counted_the_same_as_reduce_add) {
+  // Same hardware step, same cost-table entry, same counter -- see
+  // cimrt_reduce_add_inplace's own doc comment in cimrt.h.
+  Device dev;
+  CIM_EXPECT_EQ(cimrt_profile_start(dev.dev), CIMRT_OK);
+
+  Buffer acc, rhs;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &acc.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &rhs.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_reduce_add_inplace(dev.dev, acc.buf, rhs.buf, 1, 32),
+                CIMRT_OK);
+
+  cimrt_profile p{};
+  CIM_EXPECT_EQ(cimrt_profile_stop(dev.dev, &p), CIMRT_OK);
+  CIM_EXPECT_EQ(p.reduce_adds_issued, 1u);
+  // tiny-4x4.yaml charges 20 pJ / 2 ns per reduce_partial add, in-place or
+  // not.
+  CIM_EXPECT(p.estimated_energy_pj >= 20.0);
+  CIM_EXPECT(p.estimated_latency_ns >= 2.0);
+}
+
+CIM_TEST(cimrt_query_reports_partial_sum_in_place_honestly) {
+  Device capable; // tiny-4x4.yaml declares partial_sum_in_place: true
+  CIM_EXPECT_EQ(capable.status, CIMRT_OK);
+  cimrt_device_info info{};
+  CIM_EXPECT_EQ(cimrt_query(capable.dev, &info), CIMRT_OK);
+  CIM_EXPECT(info.partial_sum_in_place);
+
+  Device notCapable(tinyNoInplaceTargetPath());
+  CIM_EXPECT_EQ(notCapable.status, CIMRT_OK);
+  cimrt_device_info info2{};
+  CIM_EXPECT_EQ(cimrt_query(notCapable.dev, &info2), CIMRT_OK);
+  CIM_EXPECT(!info2.partial_sum_in_place);
 }
 
 //===----------------------------------------------------------------------===//

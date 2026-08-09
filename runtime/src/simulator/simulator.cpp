@@ -127,6 +127,7 @@ cimrt_status cimrt_query(cimrt_device *dev, cimrt_device_info *out) {
   out->tile_rows = dev->spec.tiles.rows;
   out->tile_cols = dev->spec.tiles.cols;
   out->persistent = dev->spec.tiles.persistent;
+  out->partial_sum_in_place = dev->spec.capabilities.partialSumInPlace;
   return CIMRT_OK;
 }
 
@@ -406,6 +407,34 @@ cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
     // way, not this widening.
     const uint64_t sum = lhs + rhs;
     std::memcpy(out->data.data() + i * bytes, &sum, bytes);
+  }
+
+  dev->cost.recordReduceAdd();
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_reduce_add_inplace(cimrt_device *dev, cimrt_buffer *acc,
+                                      const cimrt_buffer *rhs, size_t count,
+                                      uint32_t bits) {
+  if (!dev || !acc || !rhs)
+    return CIMRT_ERR_INVALID_ARG;
+  if (acc == rhs)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: not a shape cim.reduce_partial
+                                  // ever produces.
+  const uint32_t bytes = bitsToBytes(bits);
+  if (bytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (acc->data.size() != count * bytes || rhs->data.size() != count * bytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t lhs = 0, r = 0;
+    std::memcpy(&lhs, acc->data.data() + i * bytes, bytes);
+    std::memcpy(&r, rhs->data.data() + i * bytes, bytes);
+    // Same wrapping-add contract as cimrt_reduce_add above, just folded
+    // into the first operand's own storage instead of a third buffer.
+    const uint64_t sum = lhs + r;
+    std::memcpy(acc->data.data() + i * bytes, &sum, bytes);
   }
 
   dev->cost.recordReduceAdd();

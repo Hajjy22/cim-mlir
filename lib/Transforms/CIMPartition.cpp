@@ -19,7 +19,6 @@
 // leaves the linalg op intact, so the module stays correct and simply is
 // not offloaded):
 //   - buffer (memref) semantics
-//   - a single output row: the v0.1 contract is matrix-vector
 //
 // N and K need not be exact multiples of the tile geometry: spec Sec. 6
 // calls for zero-padding the ragged edge, and that is what happens here.
@@ -41,6 +40,28 @@
 // either -- buffer lifetime management is out of scope for v0.1 across
 // the board, not just here.
 //
+// M > 1 (batching): a matmul with more than one output row is tiled
+// EXACTLY like the m == 1 case -- weight programming, activation staging,
+// mvm, reduce_partial, write-back -- except the whole per-row sequence is
+// generated once, inside a genuine `scf.for` over the M rows, instead of
+// once, straight-line. This is deliberately the SAME IR SHAPE
+// test/real-target/check-loop.mlir.in already proves runs correctly as a
+// real binary: a hand-written scf.for whose body does one row's
+// linalg.matmul_transpose_b, which cim-partition already rewrote into cim
+// ops on each (textual) pass through that loop body, before this pass
+// could generate such a loop itself. cim-placement's existing loop
+// hoisting then lifts the loop-INVARIANT weight programming entirely
+// above the generated scf.for (the same weight tiles are reprogrammed on
+// every row otherwise, needlessly), and cim-lower-to-target's existing
+// arbitrary-depth loop lowering hoists the per-row buffers THIS pass and
+// cim-lower-to-target itself allocate while lowering ops that stay inside
+// the loop body, reusing one buffer across all M iterations instead of
+// leaking one per row -- none of that machinery needed to change for
+// this. The one exception is the K-padding scratch buffer immediately
+// below `emitRow`: a plain memref.alloc this pass writes directly rather
+// than a cim op, so it is hoisted by hand here, once, before the loop,
+// the same way cim-lower-to-target hoists its own.
+//
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
@@ -51,6 +72,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/Support/Debug.h"
@@ -139,12 +161,6 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     const int64_t k = actType.getShape()[1];
     const int64_t n = weightType.getShape()[0];
 
-    if (m != 1) {
-      op->emitWarning("cim-partition implements the v0.1 matrix-vector "
-                      "contract (a single output row); this matmul has ")
-          << m << " rows and is left unoffloaded";
-      return;
-    }
     if (weightType.getShape()[1] != k || outType.getShape()[1] != n) {
       op->emitWarning("cim-partition: inconsistent matmul shapes; leaving this "
                       "candidate unoffloaded");
@@ -212,28 +228,23 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
       workK = paddedK;
     }
 
-    // Activations: collapse the 1 x K input to a K-vector. If K itself is
-    // ragged, zero-pad that vector the same way before staging it, since
-    // every tile-block slice below reads workK-wide columns; if only N is
-    // ragged, workK == k and the real row is staged as-is. Either way it
-    // is staged in near memory once -- spec Sec. 3.4 requires the transfer
-    // to be explicit, and hoisting it out of the tile loop is the whole
-    // point of making it visible.
-    Value actRow = rankReducedSubView(builder, loc, act, {0, 0}, {1, k}, {k});
-    Value actSource = actRow;
+    // K-padding scratch for the activation row, hoisted once regardless of
+    // M: a plain memref (not a cim op), so cim-lower-to-target's automatic
+    // per-loop buffer hoisting -- which only applies to buffers it and
+    // cim ops allocate while lowering -- does not reach it. Allocating and
+    // zero-filling it once, here, before any row's real data is copied
+    // into its [0, k) prefix below, is what keeps M > 1 from leaking one
+    // such buffer per row: the zero-padded tail [k, workK) never changes
+    // across rows, so it only needs to be written once, ever.
+    Value actPadded;
     if (workK != k) {
       Value actZero = builder.create<arith::ConstantOp>(
           loc, actElem, builder.getIntegerAttr(actElem, 0));
       auto paddedActType = MemRefType::get({workK}, actElem);
-      Value paddedAct = builder.create<memref::AllocOp>(loc, paddedActType);
+      actPadded = builder.create<memref::AllocOp>(loc, paddedActType);
       builder.create<linalg::FillOp>(loc, ValueRange{actZero},
-                                     ValueRange{paddedAct});
-      Value actDst = subView1D(builder, loc, paddedAct, 0, k);
-      builder.create<memref::CopyOp>(loc, actRow, actDst);
-      actSource = paddedAct;
+                                     ValueRange{actPadded});
     }
-    auto actNearType = nearMemRef(ctx, {workK}, actElem, SpaceKind::near);
-    Value actNear = builder.create<CopyOp>(loc, actNearType, actSource);
 
     const int64_t tilesN = workN / tileRows;
     const int64_t tilesK = workK / tileCols;
@@ -243,84 +254,119 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     auto residentType = ResidentType::get(ctx, {tileRows, tileCols}, actElem);
     auto partialType = nearMemRef(ctx, {tileRows}, outElem, SpaceKind::near);
 
-    for (int64_t nb = 0; nb < tilesN; ++nb) {
-      const int64_t n0 = nb * tileRows;
-      SmallVector<Value> partials;
-
-      for (int64_t kb = 0; kb < tilesK; ++kb) {
-        const int64_t k0 = kb * tileCols;
-
-        // The weight sub-matrix for this tile: W[n0:n0+rows, k0:k0+cols],
-        // read from the padded stand-in when one was built above.
-        Value weightBlock = subView(builder, loc, workWeights, {n0, k0},
-                                    {tileRows, tileCols});
-
-        // Tile ids must stay within the target's declared tile count (spec
-        // Sec. 5.4 rule 5). Handing out one id per block emits IR that asks
-        // for tile 2 on a 2-tile device -- structurally valid, and rejected
-        // by the runtime the moment it actually runs.
-        //
-        // Round-robin is safe *given this emission order*: each
-        // cim.program is immediately followed by the cim.mvm that consumes
-        // its resident, so a tile is never reprogrammed while a live
-        // resident still refers to it. It is deliberately naive -- it
-        // reprograms on every block even when the weights would still be
-        // there. Choosing which weights stay resident is cim-placement's
-        // job, and replacing this line is what wiring that pass up means.
-        const int64_t tileId =
-            spec.tiles.count > 0 ? blockId % spec.tiles.count : 0;
-        Value tile = builder.create<TileAllocOp>(loc, tileType, device,
-                                                  builder.getI64IntegerAttr(tileId));
-
-        // cim.program carries its own cost so later passes can reason about
-        // reprogramming without a target lookup (spec Sec. 5.3).
-        Value resident = builder.create<ProgramOp>(
-            loc, residentType, tile, weightBlock,
-            builder.getI64IntegerAttr(
-                static_cast<int64_t>(spec.costs.program.latencyNs)),
-            builder.getI64IntegerAttr(
-                static_cast<int64_t>(spec.costs.program.energyPj)),
-            builder.getBoolAttr(spec.tiles.persistent));
-
-        Value actBlock = subView1D(builder, loc, actNear, k0, tileCols);
-
-        Value partial = builder.create<MvmOp>(loc, partialType, resident,
-                                               actBlock, builder.getBoolAttr(false));
-        partials.push_back(partial);
-        ++blockId;
+    // Everything from here down is one row's worth of tiled matmul: stage
+    // that row's activation, run the (compile-time-unrolled) N/K tile
+    // blocks against it, write the row's result back. `rowOffset` is a
+    // static zero for the m == 1 case -- textually identical IR to before
+    // M > 1 support existed -- or the scf.for induction variable below.
+    // cim.* ops here are emitted exactly once in program TEXT regardless
+    // of M: for m == 1 this closure runs once, straight-line; for m > 1 it
+    // runs once too, but its body sits inside a real runtime loop, so the
+    // SAME emitted ops execute once per row (device buffer reuse across
+    // those executions is cim-lower-to-target's job -- see the file
+    // header).
+    auto emitRow = [&](OpBuilder &b, OpFoldResult rowOffset) {
+      Value actRow = rowSubView(b, loc, act, rowOffset, /*colOffset=*/0, k, {k});
+      Value actSource = actRow;
+      if (workK != k) {
+        Value actDst = subView1D(b, loc, actPadded, 0, k);
+        b.create<memref::CopyOp>(loc, actRow, actDst);
+        actSource = actPadded;
       }
+      auto actNearType = nearMemRef(ctx, {workK}, actElem, SpaceKind::near);
+      Value actNear = b.create<CopyOp>(loc, actNearType, actSource);
 
-      // Partial sums across the contraction dimension. With a single tile in
-      // K there is nothing to reduce, and emitting a one-operand reduction
-      // would just be noise for cim-placement to walk past.
-      Value sum = partials.front();
-      if (partials.size() > 1)
-        sum = builder.create<ReducePartialOp>(loc, partialType, partials);
+      for (int64_t nb = 0; nb < tilesN; ++nb) {
+        const int64_t n0 = nb * tileRows;
+        SmallVector<Value> partials;
 
-      // Bring the result back to host memory and write it into the output
-      // buffer. Requantization is deliberately not done here -- it is
-      // cim-legalize-precision's job (spec Sec. 6, Pass 6).
-      //
-      // A block always produces tileRows results, but the *real* output
-      // only has n rows -- when N was padded, the last block's tail rows
-      // are the padding rows manufactured above, computed from an
-      // all-zero weight sub-matrix and therefore always zero, but with no
-      // home in `out` to be written to. validRows is tileRows for every
-      // block except (at most) this last one, so this is a no-op change
-      // in the exact-multiple case.
-      const int64_t validRows = std::min(tileRows, n - n0);
-      auto hostOutType = MemRefType::get({tileRows}, outElem);
-      Value hostOut = builder.create<CopyOp>(loc, hostOutType, sum);
-      Value hostOutValid = validRows == tileRows
-                                ? hostOut
-                                : subView1D(builder, loc, hostOut, 0, validRows);
-      Value outSlice = rankReducedSubView(builder, loc, out, {0, n0},
-                                          {1, validRows}, {validRows});
-      builder.create<memref::CopyOp>(loc, hostOutValid, outSlice);
+        for (int64_t kb = 0; kb < tilesK; ++kb) {
+          const int64_t k0 = kb * tileCols;
+
+          // The weight sub-matrix for this tile: W[n0:n0+rows, k0:k0+cols],
+          // read from the padded stand-in when one was built above.
+          Value weightBlock = subView(b, loc, workWeights, {n0, k0},
+                                      {tileRows, tileCols});
+
+          // Tile ids must stay within the target's declared tile count (spec
+          // Sec. 5.4 rule 5). Handing out one id per block emits IR that asks
+          // for tile 2 on a 2-tile device -- structurally valid, and rejected
+          // by the runtime the moment it actually runs.
+          //
+          // Round-robin is safe *given this emission order*: each
+          // cim.program is immediately followed by the cim.mvm that consumes
+          // its resident, so a tile is never reprogrammed while a live
+          // resident still refers to it. It is deliberately naive -- it
+          // reprograms on every block even when the weights would still be
+          // there. Choosing which weights stay resident is cim-placement's
+          // job, and replacing this line is what wiring that pass up means.
+          const int64_t tileId =
+              spec.tiles.count > 0 ? blockId % spec.tiles.count : 0;
+          Value tile = b.create<TileAllocOp>(loc, tileType, device,
+                                              b.getI64IntegerAttr(tileId));
+
+          // cim.program carries its own cost so later passes can reason about
+          // reprogramming without a target lookup (spec Sec. 5.3).
+          Value resident = b.create<ProgramOp>(
+              loc, residentType, tile, weightBlock,
+              b.getI64IntegerAttr(
+                  static_cast<int64_t>(spec.costs.program.latencyNs)),
+              b.getI64IntegerAttr(
+                  static_cast<int64_t>(spec.costs.program.energyPj)),
+              b.getBoolAttr(spec.tiles.persistent));
+
+          Value actBlock = subView1D(b, loc, actNear, k0, tileCols);
+
+          Value partial = b.create<MvmOp>(loc, partialType, resident,
+                                          actBlock, b.getBoolAttr(false));
+          partials.push_back(partial);
+          ++blockId;
+        }
+
+        // Partial sums across the contraction dimension. With a single tile
+        // in K there is nothing to reduce, and emitting a one-operand
+        // reduction would just be noise for cim-placement to walk past.
+        Value sum = partials.front();
+        if (partials.size() > 1)
+          sum = b.create<ReducePartialOp>(loc, partialType, partials);
+
+        // Bring the result back to host memory and write it into the output
+        // buffer. Requantization is deliberately not done here -- it is
+        // cim-legalize-precision's job (spec Sec. 6, Pass 6).
+        //
+        // A block always produces tileRows results, but the *real* output
+        // only has n rows -- when N was padded, the last block's tail rows
+        // are the padding rows manufactured above, computed from an
+        // all-zero weight sub-matrix and therefore always zero, but with no
+        // home in `out` to be written to. validRows is tileRows for every
+        // block except (at most) this last one, so this is a no-op change
+        // in the exact-multiple case.
+        const int64_t validRows = std::min(tileRows, n - n0);
+        auto hostOutType = MemRefType::get({tileRows}, outElem);
+        Value hostOut = b.create<CopyOp>(loc, hostOutType, sum);
+        Value hostOutValid = validRows == tileRows
+                                  ? hostOut
+                                  : subView1D(b, loc, hostOut, 0, validRows);
+        Value outSlice =
+            rowSubView(b, loc, out, rowOffset, n0, validRows, {validRows});
+        b.create<memref::CopyOp>(loc, hostOutValid, outSlice);
+      }
+    };
+
+    if (m == 1) {
+      emitRow(builder, builder.getI64IntegerAttr(0));
+    } else {
+      Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+      Value cm = builder.create<arith::ConstantIndexOp>(loc, m);
+      Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+      auto forOp = builder.create<scf::ForOp>(loc, c0, cm, c1);
+      OpBuilder bodyBuilder = OpBuilder::atBlockBegin(forOp.getBody());
+      emitRow(bodyBuilder, forOp.getInductionVar());
     }
 
-    LLVM_DEBUG(llvm::dbgs() << "cim-partition: lowered a " << n << "x" << k
-                            << " matmul into " << blockId << " tile block(s)\n");
+    LLVM_DEBUG(llvm::dbgs() << "cim-partition: lowered a " << m << "x" << n
+                            << "x" << k << " matmul into " << blockId
+                            << " tile block(s) per row\n");
     op->erase();
   }
 
@@ -336,18 +382,27 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
         toOpFold(builder, sizes), toOpFold(builder, strides));
   }
 
-  /// memref.subview that also drops unit dimensions.
-  Value rankReducedSubView(OpBuilder &builder, Location loc, Value source,
-                           ArrayRef<int64_t> offsets, ArrayRef<int64_t> sizes,
-                           ArrayRef<int64_t> resultShape) {
+  /// A rank-reduced 1D view of row `rowOffset` from a 2D memref, starting at
+  /// column `colOffset` and `size` columns wide. `rowOffset` is an
+  /// OpFoldResult rather than a plain int64_t specifically so a caller can
+  /// pass a static zero (m == 1 -- identical IR to the pre-batching shape)
+  /// or a dynamic scf.for induction variable (m > 1) through the same
+  /// subview-construction logic.
+  Value rowSubView(OpBuilder &builder, Location loc, Value source,
+                   OpFoldResult rowOffset, int64_t colOffset, int64_t size,
+                   ArrayRef<int64_t> resultShape) {
     auto sourceType = llvm::cast<MemRefType>(source.getType());
-    SmallVector<int64_t> strides(sizes.size(), 1);
+    SmallVector<OpFoldResult> offsets{rowOffset,
+                                      builder.getI64IntegerAttr(colOffset)};
+    SmallVector<OpFoldResult> sizes{builder.getI64IntegerAttr(1),
+                                    builder.getI64IntegerAttr(size)};
+    SmallVector<OpFoldResult> strides{builder.getI64IntegerAttr(1),
+                                      builder.getI64IntegerAttr(1)};
     auto resultType = llvm::cast<MemRefType>(
         memref::SubViewOp::inferRankReducedResultType(resultShape, sourceType,
                                                        offsets, sizes, strides));
-    return builder.create<memref::SubViewOp>(
-        loc, resultType, source, toOpFold(builder, offsets),
-        toOpFold(builder, sizes), toOpFold(builder, strides));
+    return builder.create<memref::SubViewOp>(loc, resultType, source, offsets,
+                                             sizes, strides);
   }
 
   Value subView1D(OpBuilder &builder, Location loc, Value source,

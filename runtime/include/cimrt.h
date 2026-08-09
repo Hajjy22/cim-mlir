@@ -55,6 +55,15 @@ typedef struct cimrt_device_info {
   uint32_t tile_rows;
   uint32_t tile_cols;
   bool persistent; /* true on non-volatile targets, spec Sec. 3.1 */
+  /* capabilities.partial_sum_in_place (target-format.md): can this
+   * hardware accumulate a cim.reduce_partial chain without a fresh
+   * destination buffer per step? Runtime consumers with no target file of
+   * their own to re-parse (the interpreter, lib/Interpreter/Interpreter.cpp)
+   * read this to pick between cimrt_reduce_add and cimrt_reduce_add_inplace
+   * the same way cim-lower-to-target picks at compile time from its own,
+   * separately-parsed TargetSpec -- this is the runtime-side route to the
+   * identical decision, not a second, independent parse of the YAML. */
+  bool partial_sum_in_place;
 } cimrt_device_info;
 
 /* Populated by cimrt_profile_stop. Spec Sec. 8: profiling is mandatory,
@@ -217,6 +226,39 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
 cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
                                const cimrt_buffer *a, const cimrt_buffer *b,
                                size_t count, uint32_t bits);
+
+/* In-place elementwise wrapping addition, for a target whose hardware can
+ * accumulate a partial sum without a separate destination buffer (spec
+ * target-format.md capabilities.partial_sum_in_place, cimrt_device_info
+ * above): acc[i] = acc[i] + rhs[i] (mod 2^bits).
+ *
+ * cimrt_reduce_add above forbids `out` aliasing either operand precisely
+ * so its own contract stays simple and unconditional; this is a SEPARATE
+ * function for the case that refusal exists to rule out, not a relaxed
+ * version of the same one. cim.reduce_partial's lowering
+ * (lowerReducePartial, lib/Transforms/CIMLowerToTarget.cpp) and the
+ * interpreter's runReducePartial each pick whichever of the two matches
+ * what the target declares: with the capability, one fresh accumulator is
+ * allocated ONCE (holding a copy of the first partial, via cimrt_copy --
+ * never the first partial's own buffer, which may have other uses this
+ * pass cannot see) and every subsequent partial is folded into it in
+ * place; without it, a fresh buffer is allocated per step, matching
+ * cimrt_reduce_add's own N-1-chained-calls shape.
+ *
+ * `acc` and `rhs` must be different buffers -- self-accumulation
+ * (`acc == rhs`) is not a shape cim.reduce_partial ever produces (every
+ * partial is an independent K-tile's own cim.mvm result) and almost
+ * certainly indicates a caller bug, not an intended use. `bits` must be a
+ * positive multiple of 8, matching cimrt_reduce_add.
+ *
+ * Counted identically to cimrt_reduce_add, into the same
+ * reduce_adds_issued counter, charged against the same
+ * costs.reduce_partial entry: this is the same hardware step -- summing
+ * two partials into one -- realized a different way, not a different
+ * cost the target schema has any separate entry for. */
+cimrt_status cimrt_reduce_add_inplace(cimrt_device *dev, cimrt_buffer *acc,
+                                       const cimrt_buffer *rhs, size_t count,
+                                       uint32_t bits);
 
 /* --- sync --- */
 cimrt_status cimrt_barrier(cimrt_device *dev);

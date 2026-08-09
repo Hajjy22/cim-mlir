@@ -37,11 +37,13 @@ def CIMPartition : Pass<"cim-partition", "ModuleOp"> {
     simple beats fast and a bug farm, per spec).
   }];
   let constructor = "mlir::cim::createCIMPartitionPass()";
-  // This pass creates cim and memref ops in modules that may contain
-  // neither, so both dialects must be loaded before it runs.
+  // This pass creates cim, memref, and (for an M > 1 batched candidate)
+  // scf ops in modules that may contain none of them, so all three
+  // dialects must be loaded before it runs.
   let dependentDialects = [
     "mlir::cim::CIMDialect",
-    "mlir::memref::MemRefDialect"
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect"
   ];
   let options = [
     Option<"targetYAML", "target-yaml", "std::string", "\"\"",

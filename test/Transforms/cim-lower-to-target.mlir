@@ -1,7 +1,14 @@
-// RUN: cim-opt %s --cim-lower-to-target=target-yaml=%S/../targets/tiny-4x4.yaml \
+// RUN: cim-opt %s --cim-lower-to-target=target-yaml=%S/../targets/tiny-4x4-no-inplace.yaml \
 // RUN:   --split-input-file --verify-diagnostics | FileCheck %s
 // RUN: not cim-opt %s --cim-lower-to-target --split-input-file 2>&1 \
 // RUN:   | FileCheck --check-prefix=NO-TARGET %s
+
+// Every reduce_partial test in this file specifically wants the general,
+// no-partial-sum-in-place chained-cimrt_reduce_add shape -- tiny-4x4-no-
+// inplace.yaml is otherwise byte-for-byte identical to tiny-4x4.yaml (same
+// geometry, same costs), so this is safe for every OTHER test here too.
+// See cim-lower-to-target-reduce-partial-inplace.mlir for the
+// partial_sum_in_place: true path this deliberately does not exercise.
 
 // Pass 7 (spec Sec. 6), v0.1 scope: straight-line, single-tile code only.
 // See lib/Transforms/CIMLowerToTarget.cpp's file header for the full design
