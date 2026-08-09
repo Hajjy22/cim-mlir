@@ -170,6 +170,16 @@ add_real_target_object(multi-k-tile-wrong check-multi-k-tile.mlir.in 999)
 # correct per-row result.
 add_real_target_object(loop-correct check-loop.mlir.in 951)
 add_real_target_object(loop-wrong check-loop.mlir.in 999)
+# A doubly-nested, hand-written PLAIN scf.for (no iter_args at either
+# level) -- cim-lower-to-target's newest lowering capability, one level
+# deeper than check-loop.mlir.in's single-level, cim-placement-produced
+# loop (cim-placement itself never nests two levels, so this is hand-
+# written the way check.mlir.in is, not rewritten from a real matmul) --
+# see check-nested-loop.mlir.in's own header for why 654321 is the
+# checksum that proves all six (outer, inner) iterations, across both
+# loop levels, independently computed and kept their own correct result.
+add_real_target_object(nested-loop-correct check-nested-loop.mlir.in 654321)
+add_real_target_object(nested-loop-wrong check-nested-loop.mlir.in 999)
 # Same template and expected value as correct/wrong above (identity
 # weight, out[0] == act[0] == 7 by construction) -- the only thing this
 # pair changes is the target file, to a volatile one. If cim-partition,
@@ -186,6 +196,7 @@ foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
                 multi-k-tile-correct multi-k-tile-wrong
                 loop-correct loop-wrong
+                nested-loop-correct nested-loop-wrong
                 digital-cim-volatile-correct digital-cim-volatile-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
@@ -223,6 +234,11 @@ add_test(NAME real-target-e2e-multi-k-tile-correct-value-passes
 add_test(NAME real-target-e2e-loop-correct-value-passes
          COMMAND real-target-e2e-loop-correct
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+# check-nested-loop.mlir.in hand-writes cim.device_open with the absolute
+# path substituted in directly (see check.mlir.in's own correct/wrong
+# above), so this needs no WORKING_DIRECTORY either.
+add_test(NAME real-target-e2e-nested-loop-correct-value-passes
+         COMMAND real-target-e2e-nested-loop-correct)
 # check.mlir.in hand-writes cim.device_open with the absolute path
 # substituted in directly (see correct/wrong above), so this needs no
 # WORKING_DIRECTORY -- same reasoning as correct-value-passes itself.
@@ -251,5 +267,7 @@ add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
 add_test(NAME real-target-e2e-loop-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-loop-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME real-target-e2e-nested-loop-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-nested-loop-wrong>")
 add_test(NAME real-target-e2e-digital-cim-volatile-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-digital-cim-volatile-wrong>")

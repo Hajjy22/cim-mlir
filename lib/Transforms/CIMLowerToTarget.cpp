@@ -13,39 +13,53 @@
 //
 // v0.1 SCOPE -- READ BEFORE EXTENDING THIS PASS:
 //
-// 1. Straight-line code, plus at most ONE level of scf.for nesting. Every
-//    cim op must sit directly in its function's entry block, or directly
-//    in the body of a single, plain (no iter_args) scf.for that itself
-//    sits in that entry block -- exactly the shape cim-placement's own
-//    loop hoisting produces once a matmul does not fit entirely resident
-//    (spec Sec. 6): the resident-programming ops it can hoist stay
-//    straight-line before the loop, and the per-row activation-stage/mvm/
-//    readback ops that cannot are left in the loop body. Anything nested
-//    even one level deeper than that (a second scf.for, an scf.if, ...)
-//    is still refused with a diagnostic, exactly as every case was before
-//    this loop support existed: a buffer this pass allocated INSIDE such
-//    a region, at the position the un-lowered op used to sit, would
-//    either leak on every iteration but the last (this pass frees a
-//    device buffer only on an explicit memref.dealloc -- point 4 below --
-//    and real pipeline output rarely has one for an mvm/copy/requantize
-//    result) or need a hoisting analysis to avoid that, which a doubly-
-//    nested region does not have here.
+// 1. Straight-line code, plus arbitrarily many levels of PLAIN scf.for
+//    nesting. Every cim op must sit directly in its function's entry
+//    block, or directly in the body of a plain (no iter_args) scf.for
+//    that itself sits in that entry block or in the body of another such
+//    loop, recursively -- exactly the shape cim-placement's own loop
+//    hoisting produces at its one supported level once a matmul does not
+//    fit entirely resident (spec Sec. 6): the resident-programming ops it
+//    can hoist stay straight-line before the loop, and the per-row
+//    activation-stage/mvm/readback ops that cannot are left in the loop
+//    body. cim-placement itself never emits a SECOND level of nesting
+//    (v0.1 handles one, docs/roadmap.md M3) -- the loop support below one
+//    level deep exists for IR this pass can still be handed directly
+//    (hand-written, or from a future placement pass that does nest), the
+//    same way cim.reduce_partial's and a genuine memref.subview's lowering
+//    (points 2 below) exist for shapes cim-partition already emits today
+//    even though earlier revisions of this pass refused them too. Only ONE
+//    kind of nesting has a lowering here: a plain scf.for inside another
+//    plain scf.for, arbitrarily deep. Anything else nested inside a
+//    recognized loop -- an scf.if, or a loop with iter_args, at ANY depth
+//    -- is still refused with a diagnostic: a loop-carried device value
+//    would need to survive as part of that loop's own iter_args type list,
+//    which this pass' rewriting (and cimrt's own buffer-handle model) says
+//    nothing about, and conditional control flow has no notion here of
+//    which branch a hoisted buffer's single allocation should apply to.
 //
-//    The hoisting analysis a single level of scf.for DOES have: every
-//    buffer this pass allocates while lowering a recognized loop's body
-//    (loopHoistBefore, below) is created ONCE, immediately before the
+//    The hoisting analysis this pass has generalizes to any depth by
+//    hoisting to just before the OUTERMOST recognized loop in the nest,
+//    not merely the nearest enclosing one: every buffer this pass
+//    allocates while lowering a recognized loop nest's body
+//    (loopHoistBefore, below, which -- once set on entering the
+//    OUTERMOST loop -- is left unchanged while recursing into any loop
+//    nested inside it) is created ONCE, immediately before that outermost
 //    loop, instead of at the un-lowered op's own position inside it --
-//    the loop body keeps only the write/compute/read calls that use the
-//    result, which is an ordinary SSA value the loop body can reference
-//    with no special capture (scf.for's region has no capture-list
-//    concept to begin with). This is what keeps a real, multi-row matmul
-//    from leaking one buffer's worth of device memory per row: the SAME
-//    handle is reused (overwritten) every iteration, matching how actual
-//    scratchpad hardware would behave, rather than a fresh one being
-//    handed out and then abandoned. A buffer's matching free (either this
-//    pass' own cimrt_free for a device handle, or a real memref.dealloc
-//    for a host one) is, symmetrically, deferred to just after the loop
-//    if -- and only if -- that specific buffer's own allocation was
+//    every loop body in the nest keeps only the write/compute/read calls
+//    that use the result, which is an ordinary SSA value any body in the
+//    nest can reference with no special capture (scf.for's region has no
+//    capture-list concept to begin with, and a value defined before the
+//    outermost loop dominates every level nested inside it). This is what
+//    keeps a real, multi-row (or multi-row-and-column) matmul from leaking
+//    one buffer's worth of device memory per innermost iteration: the SAME
+//    handle is reused (overwritten) on every iteration of every nesting
+//    level, matching how actual scratchpad hardware would behave, rather
+//    than a fresh one being handed out and then abandoned. A buffer's
+//    matching free (either this pass' own cimrt_free for a device handle,
+//    or a real memref.dealloc for a host one) is, symmetrically, deferred
+//    to just after the OUTERMOST loop, the same as its allocation, if --
+//    and only if -- that specific buffer's own allocation was
 //    itself hoisted (hoistedThisLoop, below): freeing the one shared,
 //    reused buffer on whichever iteration the original free happened to
 //    sit on would make every later iteration's use of it a use-after-
@@ -198,6 +212,72 @@ bool isCimDialectOp(Operation *op) {
   return dialect && dialect->getNamespace() == CIMDialect::getDialectNamespace();
 }
 
+/// True iff a cim op sits anywhere inside `op`'s own nested regions (not
+/// counting `op` itself) -- what distinguishes "this op is itself a cim op,
+/// nothing to check" from "this op is some OTHER construct that has a cim
+/// op buried inside it", the two cases collectRecognizedLoopBodies (below)
+/// must tell apart.
+bool containsCimOpStrictly(Operation *op) {
+  bool found = false;
+  op->walk([&](Operation *nested) {
+    if (nested != op && isCimDialectOp(nested))
+      found = true;
+  });
+  return found;
+}
+
+/// Recursively validates, and collects into `loopBodies`, every "recognized"
+/// scf.for loop body reachable from `block` -- a plain loop (no iter_args)
+/// containing at least one cim op somewhere inside it, at any depth of
+/// nesting inside other such loops. This is file header point 1's
+/// straight-line-plus-arbitrarily-many-levels-of-plain-scf.for shape, and
+/// the two ways it can fail are exactly the two call sites below: an
+/// scf.for with iter_args whose body contains a cim op (no lowering exists
+/// for a loop-carried device value), or any OTHER kind of region -- most
+/// obviously an scf.if -- that contains a cim op at any depth (no lowering
+/// exists for a cim op inside conditional control flow at all). Both
+/// return `failure` with a diagnostic already emitted on the offending op;
+/// the caller (FunctionLowering::run) should stop rather than continue
+/// once this returns failure.
+///
+/// An op in `block` that is itself a cim op is skipped (it has no regions
+/// to recurse into, and is none of this function's concern -- lowerOp
+/// dispatches it directly). An op that is neither a cim op nor CONTAINS one
+/// anywhere inside it (an unrelated scf.if, an unrelated scf.for with
+/// nothing cim-related in its body, a plain arith op, ...) is also none of
+/// this function's concern and is left alone, exactly as before this
+/// function existed.
+LogicalResult
+collectRecognizedLoopBodies(Block &block,
+                            llvm::DenseSet<Block *> &loopBodies) {
+  for (Operation &opRef : block) {
+    if (isCimDialectOp(&opRef))
+      continue;
+    if (!containsCimOpStrictly(&opRef))
+      continue;
+    auto forOp = dyn_cast<scf::ForOp>(&opRef);
+    if (!forOp) {
+      opRef.emitError(
+          "cim-lower-to-target: a cim op nested inside a construct other "
+          "than a plain scf.for (e.g. an scf.if) has no lowering in this "
+          "v0.1 slice");
+      return failure();
+    }
+    if (!forOp.getInitArgs().empty()) {
+      forOp.emitError(
+          "cim-lower-to-target: an scf.for with loop-carried values "
+          "(iter_args) whose body contains a cim op has no lowering in "
+          "this v0.1 slice -- only a plain counting loop with no carried "
+          "state is supported");
+      return failure();
+    }
+    loopBodies.insert(forOp.getBody());
+    if (failed(collectRecognizedLoopBodies(*forOp.getBody(), loopBodies)))
+      return failure();
+  }
+  return success();
+}
+
 /// Whole bytes for one element of `type`, or failure for anything not a
 /// positive multiple of 8 bits -- this pass is exactly as byte-addressed as
 /// the interpreter it mirrors (see Interpreter.cpp's elementByteWidth) and
@@ -323,66 +403,24 @@ public:
           "supported in this v0.1 slice");
     Block &body = func.getBody().front();
 
-    // Recognize, and validate, at most one level of scf.for nesting
-    // around a cim op -- see file header point 1 for why. A for-loop
-    // with no cim op anywhere inside it is not this pass' concern either
-    // way; the generic nesting-check walk just below still accepts it
-    // exactly like any other non-cim region (an scf.if, ...).
+    // Recognize, and validate, every level of plain scf.for nesting around
+    // a cim op, at any depth -- see file header point 1 for why, and
+    // collectRecognizedLoopBodies's own comment for exactly what it
+    // accepts and refuses. `loopBodies` ends up containing every
+    // recognized loop's body block, at every nesting level, not just the
+    // top ones directly in `body`.
     llvm::DenseSet<Block *> loopBodies;
-    LogicalResult loopScan = success();
-    for (Operation &opRef : body) {
-      auto forOp = dyn_cast<scf::ForOp>(&opRef);
-      if (!forOp)
-        continue;
-      bool hasCimOp = false;
-      forOp->walk([&](Operation *nested) {
-        if (isCimDialectOp(nested))
-          hasCimOp = true;
-      });
-      if (!hasCimOp)
-        continue;
-      if (!forOp.getInitArgs().empty()) {
-        forOp.emitError(
-            "cim-lower-to-target: an scf.for with loop-carried values "
-            "(iter_args) whose body contains a cim op has no lowering in "
-            "this v0.1 slice -- only a plain counting loop with no "
-            "carried state is supported");
-        loopScan = failure();
-        continue;
-      }
-      // Refuse a cim op nested even deeper than this one level (a second
-      // scf.for, or an scf.if, within this loop's own body) -- "one
-      // level" is the whole of what loopHoistBefore's hoisting handles.
-      bool tooDeep = false;
-      for (Operation &inner : forOp.getBody()->getOperations()) {
-        inner.walk([&](Operation *nested) {
-          if (nested != &inner && isCimDialectOp(nested))
-            tooDeep = true;
-        });
-      }
-      if (tooDeep) {
-        forOp.emitError(
-            "cim-lower-to-target: a cim op nested more than one level "
-            "deep (inside a further region within this scf.for's own "
-            "body, e.g. a second scf.for or an scf.if) has no lowering "
-            "in this v0.1 slice -- only one level of loop nesting is "
-            "supported");
-        loopScan = failure();
-        continue;
-      }
-      loopBodies.insert(forOp.getBody());
-    }
-    if (failed(loopScan))
+    if (failed(collectRecognizedLoopBodies(body, loopBodies)))
       return failure();
 
     // Validate before rewriting anything: every cim op must sit directly
     // in this block, or in the body of one of the recognized loops
-    // above. A cim op anywhere else (checked via a full walk, so it is
-    // caught regardless of how deeply nested) gets a clear diagnostic
-    // instead of being silently skipped by the dispatch loop below and
-    // left as a dangling, stale-typed op for the verifier to report
-    // confusingly once this pass has already rewritten everything around
-    // it.
+    // above (at any depth -- loopBodies already contains every level). A
+    // cim op anywhere else (checked via a full walk, so it is caught
+    // regardless of how deeply nested) gets a clear diagnostic instead of
+    // being silently skipped by the dispatch loop below and left as a
+    // dangling, stale-typed op for the verifier to report confusingly
+    // once this pass has already rewritten everything around it.
     LogicalResult nestingCheck = success();
     func.walk([&](Operation *op) {
       if (!isCimDialectOp(op))
@@ -392,9 +430,10 @@ public:
       op->emitError(
           "cim-lower-to-target: this v0.1 slice only lowers straight-line "
           "code directly in a function's entry block, or in the body of "
-          "a single, plain scf.for loop directly in that block; this op "
-          "is nested more deeply than that (e.g. a second level of loop "
-          "nesting, or an scf.if), which has no lowering yet");
+          "a plain scf.for loop nested (at any depth) in that block; this "
+          "op is inside some OTHER construct not covered by that shape "
+          "(e.g. an scf.if, or a loop with iter_args), which has no "
+          "lowering yet");
       nestingCheck = failure();
     });
     if (failed(nestingCheck))
@@ -406,7 +445,7 @@ public:
     for (Operation &opRef : llvm::make_early_inc_range(body)) {
       if (auto forOp = dyn_cast<scf::ForOp>(&opRef);
           forOp && loopBodies.contains(forOp.getBody())) {
-        if (failed(lowerLoopBody(forOp)))
+        if (failed(lowerLoopBody(forOp, loopBodies)))
           return failure();
         continue;
       }
@@ -424,22 +463,43 @@ private:
   /// left in the IR untouched (it is not a cim op; lowerOp's dispatch has
   /// no case for it and nothing here erases it) -- only its body's ops
   /// are rewritten, exactly like the entry block's own ops are.
-  LogicalResult lowerLoopBody(scf::ForOp forOp) {
-    assert(!loopHoistBefore &&
-           "v0.1 supports only one level of loop nesting -- the caller's "
-           "own tooDeep check is what is supposed to prevent reaching "
-           "this while already lowering an outer loop's body");
-    loopHoistBefore = forOp;
-    hoistedThisLoop.clear();
+  ///
+  /// Recurses into a nested scf.for that collectRecognizedLoopBodies
+  /// already proved recognized (present in `loopBodies`) -- exactly the
+  /// same membership test the top-level dispatch loop in run() uses for
+  /// the outermost loop, so a nested for-loop that is NOT in loopBodies
+  /// (one with no cim op anywhere inside it -- collectRecognizedLoopBodies
+  /// never adds such a loop) is left to lowerOp's default case instead,
+  /// i.e. untouched, exactly as it would be if it sat at the top level.
+  /// `loopHoistBefore` is set once, on entering the OUTERMOST loop in the
+  /// nest, and left unchanged for the rest of the recursion -- see file
+  /// header point 1 for why every level shares the same hoist point.
+  LogicalResult lowerLoopBody(scf::ForOp forOp,
+                              const llvm::DenseSet<Block *> &loopBodies) {
+    const bool isOutermost = loopHoistBefore == nullptr;
+    if (isOutermost) {
+      loopHoistBefore = forOp;
+      hoistedThisLoop.clear();
+    }
     LogicalResult result = success();
     for (Operation &opRef : llvm::make_early_inc_range(*forOp.getBody())) {
+      if (auto innerFor = dyn_cast<scf::ForOp>(&opRef);
+          innerFor && loopBodies.contains(innerFor.getBody())) {
+        if (failed(lowerLoopBody(innerFor, loopBodies))) {
+          result = failure();
+          break;
+        }
+        continue;
+      }
       if (failed(lowerOp(&opRef))) {
         result = failure();
         break;
       }
     }
-    loopHoistBefore = nullptr;
-    hoistedThisLoop.clear();
+    if (isOutermost) {
+      loopHoistBefore = nullptr;
+      hoistedThisLoop.clear();
+    }
     return result;
   }
 
@@ -485,20 +545,24 @@ private:
   /// straight through to its source handle with no new buffer, exactly as
   /// it did before this map existed.
   llvm::DenseMap<Operation *, ByteRange> materializedSliceRange;
-  /// Non-null exactly while lowering the body of a one-level scf.for this
-  /// pass recognized (run()/lowerLoopBody), set to that scf.for itself --
-  /// see file header point 1 for why a loop needs this at all.
-  /// creationBuilder() is what actually redirects a buffer-creation call
-  /// site to build immediately before this op instead of at its own
-  /// (in-loop) position; freeBuffer and lowerDealloc consult
-  /// hoistedThisLoop (below) to decide whether a given buffer's free must
-  /// move too.
+  /// Non-null exactly while lowering the body of a recognized scf.for
+  /// nest this pass is processing (run()/lowerLoopBody), set to the
+  /// OUTERMOST scf.for in that nest -- and left pointing there for the
+  /// whole recursion into any loop nested inside it, however many levels
+  /// deep -- see file header point 1 for why a loop needs this at all,
+  /// and why every level shares the same one. creationBuilder() is what
+  /// actually redirects a buffer-creation call site to build immediately
+  /// before this op instead of at its own (in-loop) position; freeBuffer
+  /// and lowerDealloc consult hoistedThisLoop (below) to decide whether a
+  /// given buffer's free must move too.
   Operation *loopHoistBefore = nullptr;
   /// Every buffer (a device !llvm.ptr from allocBuffer, or a host memref
   /// from memref::AllocOp) this pass has itself created via
-  /// creationBuilder()/noteHoisted() while lowering the CURRENT loop
-  /// body. Cleared on entry to, and exit from, lowerLoopBody -- see
-  /// loopHoistBefore's own comment for why this exists.
+  /// creationBuilder()/noteHoisted() while lowering the CURRENT loop nest
+  /// (every level of it, not just whichever level is being visited right
+  /// now). Cleared on entry to, and exit from, the OUTERMOST
+  /// lowerLoopBody call -- see loopHoistBefore's own comment for why this
+  /// exists.
   llvm::DenseSet<Value> hoistedThisLoop;
 
   //===--------------------------------------------------------------===//
