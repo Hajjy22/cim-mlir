@@ -837,13 +837,16 @@ CIM_TEST(cimrt_profile_counts_a_known_trace) {
   Device dev;
   CIM_EXPECT_EQ(cimrt_profile_start(dev.dev), CIMRT_OK);
 
-  Buffer wb, ab, ob, qb;
+  Buffer wb, ab, ob, qb, rb;
   CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 16, CIMRT_SPACE_INSITU, &wb.buf), CIMRT_OK);
   CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &ab.buf), CIMRT_OK);
   CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4 * sizeof(int32_t), CIMRT_SPACE_NEAR,
                             &ob.buf),
                 CIMRT_OK);
   CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4, CIMRT_SPACE_NEAR, &qb.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 4 * sizeof(int32_t), CIMRT_SPACE_NEAR,
+                            &rb.buf),
+                CIMRT_OK);
 
   const std::vector<int8_t> w(16, 1);
   const std::vector<int8_t> act(4, 1);
@@ -856,6 +859,11 @@ CIM_TEST(cimrt_profile_counts_a_known_trace) {
   CIM_EXPECT_EQ(cimrt_requantize(dev.dev, ob.buf, qb.buf, 4, 32, 8, 1.0f, 0,
                                  8),
                 CIMRT_OK);
+  // `a` and `b` may be the same buffer -- only `out` must differ (cimrt.h)
+  // -- so this reduces ob with itself, keeping the trace minimal while
+  // still issuing one real cimrt_reduce_add.
+  CIM_EXPECT_EQ(cimrt_reduce_add(dev.dev, rb.buf, ob.buf, ob.buf, 4, 32),
+                CIMRT_OK);
   CIM_EXPECT_EQ(cimrt_barrier(dev.dev), CIMRT_OK);
 
   cimrt_profile p{};
@@ -865,6 +873,7 @@ CIM_TEST(cimrt_profile_counts_a_known_trace) {
   CIM_EXPECT_EQ(p.programs_issued, 1u);
   CIM_EXPECT_EQ(p.mvms_issued, 2u);
   CIM_EXPECT_EQ(p.requantizes_issued, 1u);
+  CIM_EXPECT_EQ(p.reduce_adds_issued, 1u);
 
   // bytes_transferred was permanently zero until cimrt_buffer gained a
   // device back-pointer -- recordTransfer had no way to be called. Assert a
@@ -874,10 +883,12 @@ CIM_TEST(cimrt_profile_counts_a_known_trace) {
   CIM_EXPECT_GE(p.bytes_transferred, w.size() + act.size());
 
   // tiny-4x4 charges 10000 pJ per program, 100 pJ per mvm, 50 pJ per
-  // requantize (docs/roadmap.md's M4 "cimrt_requantize accounted" entry --
-  // this is the runtime-profiler half of that gap, closed).
-  CIM_EXPECT(p.estimated_energy_pj >= 10000.0 + 2 * 100.0 + 50.0);
-  CIM_EXPECT(p.estimated_latency_ns >= 1000.0 + 2 * 10.0 + 5.0);
+  // requantize, 20 pJ per reduce_add (docs/roadmap.md's M4 cost-accounting
+  // entries). With this last one every op the runtime can execute is
+  // charged against the target's cost table -- there is no longer any
+  // executable op that runs for free.
+  CIM_EXPECT(p.estimated_energy_pj >= 10000.0 + 2 * 100.0 + 50.0 + 20.0);
+  CIM_EXPECT(p.estimated_latency_ns >= 1000.0 + 2 * 10.0 + 5.0 + 2.0);
 }
 
 CIM_TEST(cimrt_status_string_covers_every_code) {

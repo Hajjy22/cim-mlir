@@ -36,6 +36,12 @@ costs:
   requantize:
     latency_ns: 50
     energy_pj: 150
+  # Summing two already-computed partial accumulators (spec Sec. 5.4
+  # rule 4) -- cheaper than the requantize's ADC-style readout above, since
+  # it is a plain integer add, not a conversion step.
+  reduce_partial:
+    latency_ns: 15
+    energy_pj: 40
   # Per-byte host <-> near transfer
   transfer:
     bandwidth_gbps: 12.8

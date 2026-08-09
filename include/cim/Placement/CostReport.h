@@ -43,6 +43,14 @@ struct CostReport {
   double requantizeEnergyPj = 0.0;
   double requantizeLatencyNs = 0.0;
 
+  /// Same story as requantizes immediately above, for cim.reduce_partial's
+  /// chained cimrt_reduce_add calls: charged only by cim-cost-report, left
+  /// at zero here for the same reason (a PlacementResult alone has no
+  /// notion of a reduce step either).
+  uint64_t reducePartialAdds = 0;
+  double reducePartialEnergyPj = 0.0;
+  double reducePartialLatencyNs = 0.0;
+
   double totalEnergyPj = 0.0;
   double totalLatencyNs = 0.0;
 

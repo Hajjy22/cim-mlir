@@ -30,6 +30,7 @@ public:
     uint64_t programsIssued = 0;
     uint64_t mvmsIssued = 0;
     uint64_t requantizesIssued = 0;
+    uint64_t reduceAddsIssued = 0;
     uint64_t bytesTransferred = 0;
     double energyPj = 0.0;
     double latencyNs = 0.0;
@@ -39,7 +40,8 @@ public:
 
   Snapshot snapshot() const {
     return Snapshot{programsIssued,   mvmsIssued, requantizesIssued,
-                    bytesTransferred, energyPj,   latencyNs};
+                    reduceAddsIssued, bytesTransferred, energyPj,
+                    latencyNs};
   }
 
   void recordProgram() {
@@ -60,6 +62,17 @@ public:
     energyPj += spec.costs.requantize.energyPj;
   }
 
+  /// One cimrt_reduce_add call -- NOT one cim.reduce_partial op. An
+  /// N-operand cim.reduce_partial lowers to N-1 of these (lowerReducePartial,
+  /// lib/Transforms/CIMLowerToTarget.cpp), and cim-cost-report weights its
+  /// static side the same way (CostReportUtils.cpp), so the two sides of
+  /// test/mlir/cost_report_e2e_test.cpp's differential count the same events.
+  void recordReduceAdd() {
+    ++reduceAddsIssued;
+    latencyNs += spec.costs.reducePartial.latencyNs;
+    energyPj += spec.costs.reducePartial.energyPj;
+  }
+
   void recordTransfer(uint64_t bytes) {
     bytesTransferred += bytes;
     energyPj += static_cast<double>(bytes) * spec.costs.transfer.energyPjPerByte;
@@ -69,6 +82,7 @@ public:
   uint64_t getProgramsIssued() const { return programsIssued; }
   uint64_t getMvmsIssued() const { return mvmsIssued; }
   uint64_t getRequantizesIssued() const { return requantizesIssued; }
+  uint64_t getReduceAddsIssued() const { return reduceAddsIssued; }
   uint64_t getBytesTransferred() const { return bytesTransferred; }
   double getEstimatedEnergyPj() const { return energyPj; }
   double getEstimatedLatencyNs() const { return latencyNs; }
@@ -78,6 +92,7 @@ private:
   uint64_t programsIssued = 0;
   uint64_t mvmsIssued = 0;
   uint64_t requantizesIssued = 0;
+  uint64_t reduceAddsIssued = 0;
   uint64_t bytesTransferred = 0;
   double energyPj = 0.0;
   double latencyNs = 0.0;

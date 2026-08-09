@@ -408,9 +408,7 @@ cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
     std::memcpy(out->data.data() + i * bytes, &sum, bytes);
   }
 
-  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
-  // on this function for why (no reduce/accumulate entry in the target
-  // schema's costs: section; real M4 work, not a silent omission).
+  dev->cost.recordReduceAdd();
   return CIMRT_OK;
 }
 
@@ -442,6 +440,7 @@ cimrt_status cimrt_profile_stop(cimrt_device *dev, cimrt_profile *out) {
   out->programs_issued = now.programsIssued - baseline.programsIssued;
   out->mvms_issued = now.mvmsIssued - baseline.mvmsIssued;
   out->requantizes_issued = now.requantizesIssued - baseline.requantizesIssued;
+  out->reduce_adds_issued = now.reduceAddsIssued - baseline.reduceAddsIssued;
   out->bytes_transferred = now.bytesTransferred - baseline.bytesTransferred;
   out->estimated_energy_pj = now.energyPj - baseline.energyPj;
   out->estimated_latency_ns = now.latencyNs - baseline.latencyNs;

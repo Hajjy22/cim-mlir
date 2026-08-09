@@ -55,11 +55,23 @@ struct RequantizeCost {
   double energyPj = 0.0;
 };
 
+// One cim.reduce_partial chained add's cost -- same fixed-per-call shape as
+// requantize, charged once per cimrt_reduce_add call an N-operand
+// cim.reduce_partial lowers to (N-1 calls, not one per op site; see
+// CostReportUtils.cpp). Modeled separately from mvm because it is a
+// distinct step -- summing two already-computed partial accumulators, not
+// part of the multiply-accumulate that produced either of them.
+struct ReducePartialCost {
+  double latencyNs = 0.0;
+  double energyPj = 0.0;
+};
+
 struct CostModel {
   ProgramCost program;
   MvmCost mvm;
   TransferCost transfer;
   RequantizeCost requantize;
+  ReducePartialCost reducePartial;
   double standbyLeakageUwPerTile = 0.0;
 };
 

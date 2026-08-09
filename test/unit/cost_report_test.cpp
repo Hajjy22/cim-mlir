@@ -127,6 +127,16 @@ CIM_TEST(compute_cost_report_leaves_requantize_at_zero) {
   CIM_EXPECT(report.requantizeLatencyNs == 0.0);
 }
 
+CIM_TEST(compute_cost_report_leaves_reduce_partial_at_zero) {
+  // Same boundary as requantize immediately above, for cim.reduce_partial's
+  // chained cimrt_reduce_add calls: this engine has no notion of a reduce
+  // step either, so cim-cost-report is what actually charges for it.
+  const CostReport report = fitReport(1000);
+  CIM_EXPECT_EQ(report.reducePartialAdds, uint64_t(0));
+  CIM_EXPECT(report.reducePartialEnergyPj == 0.0);
+  CIM_EXPECT(report.reducePartialLatencyNs == 0.0);
+}
+
 CIM_TEST(cost_report_energy_units_scale_sensibly) {
   // The formatter picks a unit by magnitude. Getting this wrong is how a
   // plot ends up off by a factor of a thousand -- exactly the discrepancy

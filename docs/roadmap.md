@@ -986,6 +986,39 @@ out of scope for v0.1 across the board, not just here.
   from a `PlacementResult` alone) is deliberately left out of this --
   see that file's own header and `docs/target-format.md`'s units note for
   why it has no notion of a requantize step at all.
+- ~~`cim.reduce_partial` / `cimrt_reduce_add` is charged nowhere at all --
+  no schema entry, no compile-time cost, no runtime cost.~~ -- **closed**,
+  and with it the last of the three zero-cost-accounting holes: `cim.program`
+  and `cim.mvm` were always charged, `cim.requantize` was closed by the two
+  entries above, and this was the remainder. **Every op the runtime can
+  execute is now charged against the target's cost table.**
+
+  New required schema field `costs.reduce_partial.latency_ns`/`energy_pj`
+  (`docs/target-format.md`, all 8 target files, the independent PyYAML
+  oracle in `test/python/schema.py`, and `cim-bench dump-target`), required
+  the same way `costs.requantize` is: an old file without it is rejected
+  rather than silently charged zero.
+
+  **The unit of charge is one `cimrt_reduce_add` CALL, not one
+  `cim.reduce_partial` op** -- an N-operand reduce lowers to N-1 chained
+  calls (`lowerReducePartial`), so `CostReportUtils.cpp` weights each site
+  by `trip_count * (N-1)` and `CostAccumulator::recordReduceAdd` fires once
+  per call. A reduce summing four partials therefore costs three times one
+  summing two, which a naive per-site count would have flattened.
+
+  As with requantize, the counter alone was not enough, and for the exact
+  same reason: `Interpreter.cpp`'s `runReducePartial` recomputed the
+  wrapping sum host-side in a `std::vector<int32_t>` loop and never called
+  `cimrt_reduce_add`, so every interpreted reduce executed for free. Having
+  been burned once, the differential test was written first and was red
+  (predicted 1, actual 0) until `runReducePartial` was rewritten to stage
+  its partials into device buffers and issue the same N-1 chained calls the
+  compiled path does. That also collapses a second duplicated copy of the
+  wrapping-add contract into one implementation. New test:
+  `cost_report_matches_runtime_on_a_reduced_module` (a 4x8 weight over 4x4
+  tiles -- two K-tiles, one two-operand reduce, exactly 1 call);
+  mutation-tested by disabling `recordReduceAdd`'s bookkeeping and
+  confirming both it and `cimrt_profile_counts_a_known_trace` go red.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

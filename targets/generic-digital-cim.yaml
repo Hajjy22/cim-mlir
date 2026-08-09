@@ -34,6 +34,9 @@ costs:
   requantize:
     latency_ns: 20        # narrowing the i32 accumulator, lossless digital
     energy_pj: 80
+  reduce_partial:
+    latency_ns: 8         # summing two already-computed partials, not a MAC
+    energy_pj: 30
   transfer:
     bandwidth_gbps: 25.6
     energy_pj_per_byte: 2.1

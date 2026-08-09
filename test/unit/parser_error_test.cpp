@@ -49,6 +49,9 @@ costs:
   requantize:
     latency_ns: 5
     energy_pj: 10
+  reduce_partial:
+    latency_ns: 3
+    energy_pj: 6
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5
@@ -121,6 +124,8 @@ CIM_TEST(parser_rejects_every_malformed_document) {
        "costs.mvm.energy_pj"},
       {"missing requantize latency", removed("    latency_ns: 5\n"),
        "costs.requantize.latency_ns"},
+      {"missing reduce_partial energy", removed("    energy_pj: 6\n"),
+       "costs.reduce_partial.energy_pj"},
       {"missing effective bits", removed("  output_effective_bits: 8\n"),
        "precision.output_effective_bits"},
 

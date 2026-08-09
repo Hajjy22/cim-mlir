@@ -72,6 +72,9 @@ costs:
   requantize:
     latency_ns: 5
     energy_pj: 10
+  reduce_partial:
+    latency_ns: 3
+    energy_pj: 6
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5
@@ -231,6 +234,21 @@ CIM_TEST(missing_requantize_cost_is_rejected) {
   std::string error;
   CIM_EXPECT(!parseText(doc, spec, &error));
   CIM_EXPECT(error.find("costs.requantize") != std::string::npos);
+}
+
+CIM_TEST(missing_reduce_partial_cost_is_rejected) {
+  // costs.reduce_partial is required, the same as requantize: an N-operand
+  // cim.reduce_partial lowers to N-1 real cimrt_reduce_add calls
+  // (lowerReducePartial, lib/Transforms/CIMLowerToTarget.cpp), so leaving
+  // this unset would silently cost every one of those calls at zero.
+  std::string doc = validDocument();
+  const std::string from =
+      "  reduce_partial:\n    latency_ns: 3\n    energy_pj: 6\n";
+  doc.erase(doc.find(from), from.size());
+  TargetSpec spec;
+  std::string error;
+  CIM_EXPECT(!parseText(doc, spec, &error));
+  CIM_EXPECT(error.find("costs.reduce_partial") != std::string::npos);
 }
 
 CIM_TEST(unknown_target_class_is_rejected) {

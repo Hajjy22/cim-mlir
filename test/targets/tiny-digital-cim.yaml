@@ -47,6 +47,9 @@ costs:
   requantize:
     latency_ns: 20
     energy_pj: 80
+  reduce_partial:
+    latency_ns: 8
+    energy_pj: 30
   transfer:
     bandwidth_gbps: 1.0
     energy_pj_per_byte: 1.0

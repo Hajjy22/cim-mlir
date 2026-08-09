@@ -67,6 +67,7 @@ struct RuntimeCounts {
   uint64_t programs = 0;
   uint64_t mvms = 0;
   uint64_t requantizes = 0;
+  uint64_t reduceAdds = 0;
   bool found = false;
 };
 
@@ -85,6 +86,10 @@ RuntimeCounts parseRuntimeCounts(const std::string &text) {
   const size_t requantizesPos = text.find("requantizes=", pos);
   counts.requantizes = static_cast<uint64_t>(std::strtoull(
       text.c_str() + requantizesPos + std::strlen("requantizes="), nullptr,
+      10));
+  const size_t reduceAddsPos = text.find("reduce_adds=", pos);
+  counts.reduceAdds = static_cast<uint64_t>(std::strtoull(
+      text.c_str() + reduceAddsPos + std::strlen("reduce_adds="), nullptr,
       10));
   return counts;
 }
@@ -217,6 +222,29 @@ func.func @main() {
 }
 )mlir";
 
+/// Two K-tiles: 4x8 weights over 4x4 tiles splits K into two blocks, so
+/// cim-partition emits two cim.mvm partial sums and ONE cim.reduce_partial
+/// with two operands -- which lowers to exactly 1 cimrt_reduce_add call
+/// (N-1 for N=2). The only module here that makes reduceAdds nonzero on
+/// either side of the differential; every other case is a 0 == 0 check.
+const char *kTwoKTiles = R"mlir(
+memref.global "private" constant @w : memref<4x8xi8> = dense<1>
+memref.global "private" constant @a : memref<1x8xi8> = dense<2>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {
+  %w = memref.get_global @w : memref<4x8xi8>
+  %aInit = memref.get_global @a : memref<1x8xi8>
+  %a = memref.alloc() : memref<1x8xi8>
+  memref.copy %aInit, %a : memref<1x8xi8> to memref<1x8xi8>
+  %out = memref.alloc() : memref<1x4xi32>
+  linalg.matmul_transpose_b ins(%a, %w : memref<1x8xi8>, memref<4x8xi8>)
+    outs(%out : memref<1x4xi32>)
+  %u = memref.cast %out : memref<1x4xi32> to memref<*xi32>
+  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+  return
+}
+)mlir";
+
 /// One weight block, loop-invariant across 3 iterations. Without placement
 /// the single textual cim.program still fires on every runtime iteration
 /// (weight 3); with placement it is hoisted above the loop (weight 1). This
@@ -313,6 +341,12 @@ void expectDifferentialAgrees(const char *label, const std::string &source,
   // and cost_report_matches_runtime_on_a_requantized_module below is the
   // one that makes it nonzero on both sides.
   CIM_EXPECT_EQ(d.predicted.requantizes, d.actual.requantizes);
+  // Same story one op over: nonzero only when the module actually spans
+  // more than one K-tile, which
+  // cost_report_matches_runtime_on_a_reduced_module below is what supplies.
+  // Note both sides count cimrt_reduce_add CALLS (N-1 per N-operand
+  // cim.reduce_partial), not op sites -- see CostReportUtils.cpp.
+  CIM_EXPECT_EQ(d.predicted.reduceAdds, d.actual.reduceAdds);
   CIM_EXPECT(d.predicted.complete());
 }
 
@@ -360,6 +394,26 @@ CIM_TEST(cost_report_matches_runtime_on_a_requantized_module) {
   expectDifferentialAgrees("requantized", kStraightLineFits,
                            /*withPlacement=*/true,
                            /*withLegalizePrecision=*/true);
+}
+
+CIM_TEST(cost_report_matches_runtime_on_a_reduced_module) {
+  // The reduce_partial equivalent of the requantize test above, and the
+  // last of the three op kinds to get one: every other case in this file
+  // spans a single K-tile, so cim-partition emits no cim.reduce_partial at
+  // all and both sides of the differential are trivially 0. kTwoKTiles
+  // splits K across two tiles, giving one two-operand cim.reduce_partial =
+  // exactly 1 cimrt_reduce_add call.
+  //
+  // This is also the test that catches the gap the requantize work taught
+  // us to look for: it stayed red until Interpreter.cpp's runReducePartial
+  // stopped recomputing the wrapping sum host-side and started calling
+  // cimrt_reduce_add, because only that call reaches
+  // CostAccumulator::recordReduceAdd. A static count of 1 against an
+  // executed count of 0 is exactly what "the interpreter executes this op
+  // for free" looks like from the outside.
+  expectDifferentialAgrees("two-k-tiles", kTwoKTiles, /*withPlacement=*/true);
+  expectDifferentialAgrees("two-k-tiles-unplaced", kTwoKTiles,
+                           /*withPlacement=*/false);
 }
 
 CIM_TEST(cost_report_install_vs_steady_state_reflects_hoisting) {

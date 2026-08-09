@@ -42,6 +42,7 @@ func.func @straight_line() {
 // JSON: "programs": 1,
 // JSON: "mvms": 1,
 // JSON: "requantizes": 0,
+// JSON: "reduce_partial_adds": 0,
 // JSON: "reuses": 0,
 // JSON: "install_programs": 1,
 // JSON: "install_energy_pj":
@@ -79,8 +80,8 @@ func.func @dynamic_bound(%n: index) {
   return
 }
 
-// JSON: trip-count-complete: false (unknown_program_sites=1, unknown_mvm_sites=1, unknown_requantize_sites=0)
+// JSON: trip-count-complete: false (unknown_program_sites=1, unknown_mvm_sites=1, unknown_requantize_sites=0, unknown_reduce_sites=0)
 // JSON: "programs": 0,
 // JSON: "mvms": 0,
 
-// DIAG: cim-cost-report: 1 cim.program site(s), 1 cim.mvm site(s), and 0 cim.requantize site(s) sit under a loop whose trip count is not a compile-time constant
+// DIAG: cim-cost-report: 1 cim.program site(s), 1 cim.mvm site(s), 0 cim.requantize site(s), and 0 cim.reduce_partial site(s) sit under a loop whose trip count is not a compile-time constant

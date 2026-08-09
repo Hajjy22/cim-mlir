@@ -100,6 +100,7 @@ memref.global "private" constant @weights_4x4 : memref<4x4xi8> = dense<1>
 // tiny-4x4.yaml's declared cost, not left at the zero a missing
 // costs.requantize entry would silently produce.
 // COST-JSON: "requantizes": 1,
+// COST-JSON: "reduce_partial_adds": 0,
 // COST-JSON: "total_energy_pj": 10150,
 // COST-JSON: "total_latency_ns": 1015,
 

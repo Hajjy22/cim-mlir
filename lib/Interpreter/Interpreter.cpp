@@ -715,27 +715,28 @@ LogicalResult Interpreter::runReducePartial(ReducePartialOp op) {
   auto resultType = llvm::cast<MemRefType>(op.getResult().getType());
   const int64_t count = resultType.getNumElements();
 
-  std::vector<int32_t> sum(static_cast<size_t>(count), 0);
-  for (Value partial : op.getPartials()) {
-    auto it = memrefs.find(partial);
-    if (it == memrefs.end())
-      return op.emitError("cim.reduce_partial on an unknown buffer");
-    std::vector<uint8_t> bytes;
-    if (failed(gather(it->second, bytes)))
-      return op.emitError("failed to read a partial sum");
-    if (bytes.size() != static_cast<size_t>(count) * 4)
-      return op.emitError("partial sum has the wrong size");
-    for (int64_t i = 0; i < count; ++i) {
-      int32_t value = 0;
-      std::memcpy(&value, bytes.data() + i * 4, 4);
-      // Wrapping addition, matching the accumulator semantics documented
-      // in cimrt: a fixed-width accumulator wraps, it does not saturate.
-      sum[static_cast<size_t>(i)] = static_cast<int32_t>(
-          static_cast<uint32_t>(sum[static_cast<size_t>(i)]) +
-          static_cast<uint32_t>(value));
-    }
-  }
+  auto elemType = llvm::dyn_cast<IntegerType>(resultType.getElementType());
+  if (!elemType)
+    return op.emitError(
+        "cim.reduce_partial's element type must be an integer accumulator; "
+        "the interpreter has no other accumulator representation");
+  FailureOr<unsigned> elemBytesOr = elementByteWidth(elemType);
+  if (failed(elemBytesOr))
+    return op.emitError(
+        "cim.reduce_partial's element type is narrower than a byte (e.g. "
+        "i1/i4); the interpreter is byte-addressed and cannot represent it");
+  const unsigned elemBytes = *elemBytesOr;
+  const size_t totalBytes = static_cast<size_t>(count) * elemBytes;
 
+  // Route through cimrt_reduce_add -- the same device-side call
+  // cim.program/cim.mvm/cim.requantize already go through -- rather than
+  // recomputing the wrapping sum here in host code. Two reasons, identical
+  // to runRequantize's: (1) cim.reduce_partial's cost (costs.reduce_partial)
+  // is only ever charged inside cimrt_reduce_add's own accounting
+  // (dev->cost.recordReduceAdd()), so a host-side reimplementation would
+  // silently execute every reduce for free; and (2) it keeps ONE
+  // implementation of the wrapping-add contract instead of a second copy
+  // that has to be kept bit-for-bit in sync with simulator.cpp's by hand.
   cimrt_device *dev = nullptr;
   if (!op.getPartials().empty()) {
     if (auto mvm = op.getPartials().front().getDefiningOp<MvmOp>()) {
@@ -747,18 +748,97 @@ LogicalResult Interpreter::runReducePartial(ReducePartialOp op) {
         }
     }
   }
+  if (!dev)
+    dev = devices.empty() ? nullptr : devices.begin()->second;
+  if (!dev)
+    return op.emitError(
+        "cim.reduce_partial has no open device to run cimrt_reduce_add "
+        "against (its partials always come from cim.mvm, which requires "
+        "one, so this indicates malformed IR)");
 
-  auto alloc =
-      makeAllocation(resultType, static_cast<size_t>(count) * 4, dev);
+  // Every partial staged into its own device buffer first, so the chained
+  // adds below are pure device-side work. Freed on every exit path.
+  llvm::SmallVector<cimrt_buffer *> staged;
+  auto releaseStaged = [&]() {
+    for (cimrt_buffer *buf : staged)
+      cimrt_free(buf);
+    staged.clear();
+  };
+  for (Value partial : op.getPartials()) {
+    auto it = memrefs.find(partial);
+    if (it == memrefs.end()) {
+      releaseStaged();
+      return op.emitError("cim.reduce_partial on an unknown buffer");
+    }
+    std::vector<uint8_t> bytes;
+    if (failed(gather(it->second, bytes))) {
+      releaseStaged();
+      return op.emitError("failed to read a partial sum");
+    }
+    if (bytes.size() != totalBytes) {
+      releaseStaged();
+      return op.emitError("partial sum has the wrong size");
+    }
+    cimrt_buffer *buf = nullptr;
+    if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &buf) != CIMRT_OK) {
+      releaseStaged();
+      return op.emitError("failed to allocate a staging buffer for a partial");
+    }
+    staged.push_back(buf);
+    if (cimrt_write(buf, 0, bytes.data(), bytes.size()) != CIMRT_OK) {
+      releaseStaged();
+      return op.emitError("failed to stage a partial sum");
+    }
+  }
+
+  // N operands -> N-1 chained calls, left-to-right, matching
+  // lowerReducePartial's own fold (lib/Transforms/CIMLowerToTarget.cpp) so
+  // the compiled and interpreted paths issue the identical call sequence.
+  // A single partial issues no call at all and forwards its value, exactly
+  // as that lowering does -- there is nothing to add it to.
+  cimrt_buffer *acc = staged.front();
+  llvm::SmallVector<cimrt_buffer *> intermediates;
+  auto releaseIntermediates = [&]() {
+    for (cimrt_buffer *buf : intermediates)
+      cimrt_free(buf);
+    intermediates.clear();
+  };
+  for (size_t i = 1; i < staged.size(); ++i) {
+    cimrt_buffer *sum = nullptr;
+    if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &sum) != CIMRT_OK) {
+      releaseIntermediates();
+      releaseStaged();
+      return op.emitError("failed to allocate a reduction accumulator");
+    }
+    intermediates.push_back(sum);
+    // out must not alias a or b (cimrt.h), which the fresh `sum` guarantees.
+    const cimrt_status status =
+        cimrt_reduce_add(dev, sum, acc, staged[i], static_cast<size_t>(count),
+                         elemType.getWidth());
+    if (status != CIMRT_OK) {
+      releaseIntermediates();
+      releaseStaged();
+      return op.emitError("cimrt_reduce_add failed: ")
+             << cimrt_status_string(status);
+    }
+    acc = sum;
+  }
+
+  std::vector<uint8_t> outBytes(totalBytes);
+  const cimrt_status read = cimrt_read(acc, 0, outBytes.data(), totalBytes);
+  releaseIntermediates();
+  releaseStaged();
+  if (read != CIMRT_OK)
+    return op.emitError("failed to read the reduction result: ")
+           << cimrt_status_string(read);
+
+  auto alloc = makeAllocation(resultType, totalBytes, dev);
   if (!alloc)
     return op.emitError("failed to allocate the reduction result");
   auto view = viewFromType(resultType, alloc);
   if (failed(view))
     return op.emitError("unsupported layout on the reduction result");
-
-  std::vector<uint8_t> bytes(static_cast<size_t>(count) * 4);
-  std::memcpy(bytes.data(), sum.data(), bytes.size());
-  if (failed(scatter(*view, bytes)))
+  if (failed(scatter(*view, outBytes)))
     return op.emitError("failed to write the reduction result");
 
   memrefs[op.getResult()] = *view;
@@ -1047,6 +1127,7 @@ LogicalResult Interpreter::run(ModuleOp mod, StringRef entryName) {
       out << "cimrt_profile programs=" << profile.programs_issued
           << " mvms=" << profile.mvms_issued
           << " requantizes=" << profile.requantizes_issued
+          << " reduce_adds=" << profile.reduce_adds_issued
           << " bytes=" << profile.bytes_transferred << "\n";
     }
   }
