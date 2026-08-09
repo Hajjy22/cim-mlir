@@ -622,7 +622,7 @@
         <li>
           <div>
             <div class="pname">cim-cost-report</div>
-            <p class="pbody">Walks the final IR and emits a JSON cost report, weighting each op by the product of its enclosing loops' trip counts — a hoisted program runs once no matter where it sits textually, one left inside a loop runs trip-count times. It reuses the same cost model the benchmark tool uses, rather than a second one that could drift.</p>
+            <p class="pbody">Walks the final IR and emits a JSON cost report, weighting each op by the product of its enclosing loops' trip counts — a hoisted program runs once no matter where it sits textually, one left inside a loop runs trip-count times. Charges <code>cim.program</code>, <code>cim.mvm</code>, and <code>cim.requantize</code> alike, each against its own entry in the target file's cost table — a real narrowing or ADC-readout step, not a free byproduct of the multiply-accumulate. It reuses the same cost model the benchmark tool uses, rather than a second one that could drift.</p>
             <p class="prefuse"><b>Refuses</b> to guess: an op under a loop whose trip count is not a compile-time constant is excluded from the totals and flagged in the JSON header, not assumed to fire once.</p>
           </div>
         </li>

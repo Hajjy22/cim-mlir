@@ -37,6 +37,9 @@ costs:
   mvm:
     latency_ns: 10
     energy_pj: 100
+  requantize:
+    latency_ns: 5
+    energy_pj: 50
   transfer:
     bandwidth_gbps: 1.0
     energy_pj_per_byte: 1.0

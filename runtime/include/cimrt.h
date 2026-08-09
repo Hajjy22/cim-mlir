@@ -162,9 +162,15 @@ cimrt_status cimrt_mvm(cimrt_device *dev, cimrt_tile_id tile,
  * not exceed `out_bits`.
  *
  * Not yet counted by cimrt_profile_stop: the target schema's `costs:`
- * section has no requantize/readout entry (spec target-format.md), so this
- * call currently contributes nothing to programs_issued/mvms_issued/
- * energy -- a known simplification (spec M4), not a silent omission. */
+ * section DOES now have a requantize entry (`costs.requantize.latency_ns`/
+ * `energy_pj`, spec target-format.md) -- `cim-cost-report`
+ * (lib/Transforms/CIMCostReport.cpp) reads it and charges every compiled
+ * cim.requantize site with it -- but this runtime entry point still does
+ * not update programs_issued/mvms_issued/energy through
+ * cimrt_profile_stop, so a call here still contributes nothing to a
+ * PROFILED run's own counters. A known simplification (spec M4), not a
+ * silent omission, and now the narrower of the two: the compile-time
+ * number is real, only the runtime profiler's number is not yet. */
 cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
                                cimrt_buffer *output, size_t count,
                                uint32_t in_bits, uint32_t out_bits,
@@ -188,8 +194,9 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
  * to it, the same reason cimrt_requantize takes in_bits/out_bits rather
  * than assuming a width.
  *
- * Not yet counted by cimrt_profile_stop, matching cimrt_requantize's own
- * note: the target schema has no reduce/accumulate cost entry (spec M4).
+ * Not yet counted by cimrt_profile_stop, and unlike cimrt_requantize (see
+ * its own note above) this one has no compile-time accounting either: the
+ * target schema has no reduce/accumulate cost entry at all yet (spec M4).
  */
 cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
                                const cimrt_buffer *a, const cimrt_buffer *b,

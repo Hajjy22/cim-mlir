@@ -254,6 +254,10 @@ int main(int argc, char **argv) {
     std::printf("costs.program.energy_pj=%.10g\n", spec.costs.program.energyPj);
     std::printf("costs.mvm.latency_ns=%.10g\n", spec.costs.mvm.latencyNs);
     std::printf("costs.mvm.energy_pj=%.10g\n", spec.costs.mvm.energyPj);
+    std::printf("costs.requantize.latency_ns=%.10g\n",
+                spec.costs.requantize.latencyNs);
+    std::printf("costs.requantize.energy_pj=%.10g\n",
+                spec.costs.requantize.energyPj);
     std::printf("costs.transfer.bandwidth_gbps=%.10g\n",
                 spec.costs.transfer.bandwidthGbps);
     std::printf("costs.transfer.energy_pj_per_byte=%.10g\n",

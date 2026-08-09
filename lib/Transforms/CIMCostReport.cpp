@@ -60,12 +60,13 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
 
     if (!counts.complete())
       module.emitWarning("cim-cost-report: ")
-          << counts.unknownProgramSites << " cim.program site(s) and "
-          << counts.unknownMvmSites
-          << " cim.mvm site(s) sit under a loop whose trip count is not a "
-             "compile-time constant; they are excluded from the totals "
-             "below rather than guessed, so the report is a lower bound, "
-             "not the full picture";
+          << counts.unknownProgramSites << " cim.program site(s), "
+          << counts.unknownMvmSites << " cim.mvm site(s), and "
+          << counts.unknownRequantizeSites
+          << " cim.requantize site(s) sit under a loop whose trip count is "
+             "not a compile-time constant; they are excluded from the "
+             "totals below rather than guessed, so the report is a lower "
+             "bound, not the full picture";
 
     ::cim::CostReport report;
     report.persistent = spec.tiles.persistent;
@@ -87,8 +88,17 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
         static_cast<double>(counts.mvms) * spec.costs.mvm.energyPj;
     report.mvmLatencyNs =
         static_cast<double>(counts.mvms) * spec.costs.mvm.latencyNs;
-    report.totalEnergyPj = report.programEnergyPj + report.mvmEnergyPj;
-    report.totalLatencyNs = report.programLatencyNs + report.mvmLatencyNs;
+
+    report.requantizes = counts.requantizes;
+    report.requantizeEnergyPj = static_cast<double>(counts.requantizes) *
+                                 spec.costs.requantize.energyPj;
+    report.requantizeLatencyNs = static_cast<double>(counts.requantizes) *
+                                  spec.costs.requantize.latencyNs;
+
+    report.totalEnergyPj =
+        report.programEnergyPj + report.mvmEnergyPj + report.requantizeEnergyPj;
+    report.totalLatencyNs =
+        report.programLatencyNs + report.mvmLatencyNs + report.requantizeLatencyNs;
 
     report.installPrograms = counts.installPrograms;
     report.installEnergyPj = static_cast<double>(counts.installPrograms) *
@@ -116,6 +126,8 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
       out += std::to_string(counts.unknownProgramSites);
       out += ", unknown_mvm_sites=";
       out += std::to_string(counts.unknownMvmSites);
+      out += ", unknown_requantize_sites=";
+      out += std::to_string(counts.unknownRequantizeSites);
       out += ")";
     }
     out += "\n";

@@ -40,16 +40,25 @@ struct IRCostCounts {
   uint64_t steadyStatePrograms = 0;
   /// Same weighting as `programs`, for cim.mvm.
   uint64_t mvms = 0;
+  /// Same weighting as `programs`, for cim.requantize. No install/steady-
+  /// state split here -- that split exists specifically for cim.program's
+  /// asymmetric one-time-vs-recurring cost story (spec Sec. 17), which
+  /// cim.requantize has no equivalent of: it costs the same whichever
+  /// iteration it fires on.
+  uint64_t requantizes = 0;
   /// Static cim.program sites whose weight could not be determined because
   /// some enclosing loop's trip count is not a compile-time constant.
   uint64_t unknownProgramSites = 0;
   /// Same, for cim.mvm.
   uint64_t unknownMvmSites = 0;
+  /// Same, for cim.requantize.
+  uint64_t unknownRequantizeSites = 0;
 
-  /// True iff every site's weight was determined -- `programs`/`mvms` are
-  /// then the exact whole-run totals, not a lower bound.
+  /// True iff every site's weight was determined -- `programs`/`mvms`/
+  /// `requantizes` are then the exact whole-run totals, not a lower bound.
   bool complete() const {
-    return unknownProgramSites == 0 && unknownMvmSites == 0;
+    return unknownProgramSites == 0 && unknownMvmSites == 0 &&
+           unknownRequantizeSites == 0;
   }
 };
 

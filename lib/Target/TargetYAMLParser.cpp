@@ -298,6 +298,8 @@ bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error) 
   r.requireDouble("costs.transfer.bandwidth_gbps", spec.costs.transfer.bandwidthGbps);
   r.requireDouble("costs.transfer.energy_pj_per_byte",
                   spec.costs.transfer.energyPjPerByte);
+  r.requireDouble("costs.requantize.latency_ns", spec.costs.requantize.latencyNs);
+  r.requireDouble("costs.requantize.energy_pj", spec.costs.requantize.energyPj);
   r.optionalDouble("costs.standby_leakage_uw_per_tile",
                    spec.costs.standbyLeakageUwPerTile);
 

@@ -31,6 +31,9 @@ costs:
   mvm:
     latency_ns: 120
     energy_pj: 900
+  requantize:
+    latency_ns: 20        # narrowing the i32 accumulator, lossless digital
+    energy_pj: 80
   transfer:
     bandwidth_gbps: 25.6
     energy_pj_per_byte: 2.1

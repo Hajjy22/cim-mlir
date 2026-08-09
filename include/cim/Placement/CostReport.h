@@ -32,6 +32,17 @@ struct CostReport {
   double programLatencyNs = 0.0;
   double mvmEnergyPj = 0.0;
   double mvmLatencyNs = 0.0;
+
+  /// cim.requantize is charged here, by cim-cost-report
+  /// (lib/Transforms/CIMCostReport.cpp), which walks real compiled IR.
+  /// This engine's own computeCostReport() below leaves these at their
+  /// zero defaults: it models weight-programming amortization from a
+  /// PlacementResult alone, which has no notion of a requantize step, so
+  /// there is nothing for it to count here.
+  uint64_t requantizes = 0;
+  double requantizeEnergyPj = 0.0;
+  double requantizeLatencyNs = 0.0;
+
   double totalEnergyPj = 0.0;
   double totalLatencyNs = 0.0;
 

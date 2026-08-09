@@ -33,6 +33,7 @@
 // RUN:   "--cim-cost-report=target-yaml=%S/../targets/tiny-4x4.yaml output=%t-full.json" \
 // RUN:   --cim-lower-to-target=target-yaml=%S/../targets/tiny-4x4.yaml \
 // RUN:   | FileCheck --check-prefix=FULL %s
+// RUN: FileCheck --check-prefix=COST-JSON --input-file=%t-precision.json %s
 //
 // Three RUN lines, not because a literal all-eight chain was ever
 // impossible, but because each proves something the others don't
@@ -63,6 +64,12 @@
 //     8-pass run is finally possible: cim.requantize is now lowered
 //     (lib/Transforms/CIMLowerToTarget.cpp's lowerRequantize), so Pass 6
 //     feeding directly into Pass 7 is no longer refused.
+//   - the fourth (COST-JSON) reads the first run's own JSON output file --
+//     this is the live case docs/target-format.md's costs.requantize
+//     entry exists for: the PRECISION run above puts a real cim.requantize
+//     in front of cim-cost-report, and before costs.requantize existed
+//     that op was completely uncounted in the published numbers, silently
+//     rather than by any documented omission.
 //
 // A single-tile matmul (activation width == tile width, tiny-4x4.yaml's
 // tiles are 4x4): the K dimension needs no partial-sum reduction and the
@@ -88,6 +95,13 @@ memref.global "private" constant @weights_4x4 : memref<4x4xi8> = dense<1>
 // PRECISION: cim.requantize
 // PRECISION-SAME: memref<4xi32, #cim.space<near>> -> memref<4xi32, #cim.space<near>>
 // PRECISION-NOT: error
+
+// The one real cim.requantize the module above compiles to is counted, at
+// tiny-4x4.yaml's declared cost, not left at the zero a missing
+// costs.requantize entry would silently produce.
+// COST-JSON: "requantizes": 1,
+// COST-JSON: "total_energy_pj": 10150,
+// COST-JSON: "total_latency_ns": 1015,
 
 // TARGET-LABEL: func.func @single_tile_matmul
 // Every cim op became a real cimrt_* call; none survive. Ordinary

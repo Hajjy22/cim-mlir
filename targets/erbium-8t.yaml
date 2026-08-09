@@ -29,6 +29,13 @@ costs:
   mvm:
     latency_ns: 640
     energy_pj: 3100
+  # Narrowing the i32 accumulator to this target's 8-bit output
+  # (output_effective_bits below) -- cheap relative to the mvm itself,
+  # since output_effective_bits: 8 means this is a lossless digital narrow
+  # rather than an analog ADC readout.
+  requantize:
+    latency_ns: 50
+    energy_pj: 150
   # Per-byte host <-> near transfer
   transfer:
     bandwidth_gbps: 12.8

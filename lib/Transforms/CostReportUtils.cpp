@@ -70,5 +70,14 @@ mlir::cim::IRCostCounts mlir::cim::countWeightedOps(ModuleOp module) {
     counts.mvms += static_cast<uint64_t>(counted->first);
   });
 
+  module.walk([&](mlir::cim::RequantizeOp op) {
+    FailureOr<std::pair<int64_t, int>> counted = weightedCount(op);
+    if (failed(counted)) {
+      ++counts.unknownRequantizeSites;
+      return;
+    }
+    counts.requantizes += static_cast<uint64_t>(counted->first);
+  });
+
   return counts;
 }

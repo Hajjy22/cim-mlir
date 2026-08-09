@@ -45,10 +45,21 @@ struct TransferCost {
   double energyPjPerByte = 0.0;
 };
 
+// A cim.requantize's cost, same fixed-per-op shape as program/mvm (unlike
+// transfer, which scales with payload size). Modeled separately from mvm
+// because it is a distinct hardware step -- an ADC readout on an analog
+// target, a narrowing/rounding step on a digital one (spec Sec. 5.3) --
+// not a free byproduct of the multiply-accumulate itself.
+struct RequantizeCost {
+  double latencyNs = 0.0;
+  double energyPj = 0.0;
+};
+
 struct CostModel {
   ProgramCost program;
   MvmCost mvm;
   TransferCost transfer;
+  RequantizeCost requantize;
   double standbyLeakageUwPerTile = 0.0;
 };
 

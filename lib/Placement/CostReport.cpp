@@ -158,6 +158,10 @@ std::string formatCostReport(const CostReport &report,
   os << "  mvm total: " << report.mvms << " mvms  "
      << formatTime(report.mvmLatencyNs) << "  "
      << formatEnergy(report.mvmEnergyPj) << "\n";
+  if (report.requantizes > 0)
+    os << "  requantize total: " << report.requantizes << " requantizes  "
+       << formatTime(report.requantizeLatencyNs) << "  "
+       << formatEnergy(report.requantizeEnergyPj) << "\n";
   os << "  reuses:    " << report.reuses << " (steps needing no reprogram)\n";
 
   if (!report.persistent && report.standbyLeakageUwPerTile > 0.0) {
@@ -183,6 +187,7 @@ std::string toJson(const CostReport &report, const std::string &label) {
   os << "  \"persistent\": " << (report.persistent ? "true" : "false") << ",\n";
   os << "  \"programs\": " << report.programs << ",\n";
   os << "  \"mvms\": " << report.mvms << ",\n";
+  os << "  \"requantizes\": " << report.requantizes << ",\n";
   os << "  \"reuses\": " << report.reuses << ",\n";
   os << "  \"install_programs\": " << report.installPrograms << ",\n";
   os << "  \"install_energy_pj\": " << report.installEnergyPj << ",\n";
