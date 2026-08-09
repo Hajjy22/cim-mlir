@@ -93,20 +93,33 @@ cross-layer eviction, the `mlp-3layer` benchmark shape, needs more than
 one weight matrix competing for the tile budget. A graph of two or more
 `MatMulInteger` nodes is imported as a chain, provided consecutive layers
 are bridged by exactly one pattern: `Cast(to=float32) ->
-QuantizeLinear(scale=1.0, zero_point=0, int8 output)`. Anything else
-between layers — a different scale, a missing zero point, any other op —
-is refused.
+QuantizeLinear(scale, zero_point=0, int8 output)`. Anything else between
+layers — a non-positive scale, a missing zero point, any other op — is
+refused.
 
-That specific bridge, and no other, is what keeps the compiled chain
-matching an *unquantized* ONNX oracle exactly rather than only
-approximately. It lowers to a real `cim.requantize(scale=1.0, zero_point=0,
-effective_bits=8)` between the two compiled matmuls. `cim.requantize`
-rounds half-away-from-zero; ONNX's `QuantizeLinear` rounds half-to-even —
-two modes that diverge only at a tie, a value ending in exactly `.5`.
-`scale=1.0` makes both sides compute `round(v / 1.0)` on a `v` that is
-already an integer (an accumulator), so there is never a fractional part
-and therefore never a tie either side could round differently. Both then
-saturate to the same `[-128, 127]`. This was checked against a real
+That specific bridge, and no other, is what keeps the numerical claim
+checkable. Each bridge's scale becomes the `scale` operand of a real
+`cim.requantize(scale=<scale>, zero_point=0, effective_bits=8)` between the
+two compiled matmuls — `cim.requantize` and its runtime implementation are
+fully scale-generic, so any positive scale is accepted, not just `1.0`.
+
+What differs is which oracle a real scale can be checked against.
+`cim.requantize` rounds half-away-from-zero; ONNX's `QuantizeLinear` rounds
+half-to-even — two modes that diverge only at a tie, a value ending in
+exactly `.5`. At `scale=1.0`, both sides compute `round(v / 1.0)` on a `v`
+that is already an integer (an accumulator), so there is never a
+fractional part and therefore never a tie either side could round
+differently — the compiled chain matches an *unquantized* ONNX oracle
+exactly. At a real (non-1.0) scale, ties are possible in general, but an
+**odd integer scale makes one mathematically impossible**: `v / s` lands on
+a half-integer only if `s / 2` is itself an integer, which an odd `s`
+never is. So an odd-scale chain still matches exactly, checked against
+`onnx.reference`'s own *quantized* evaluation instead of an unquantized
+one (see `test_a_real_calibrated_scale_matches_the_quantized_reference`).
+An even scale can hit a genuine tie, where the two rounding modes really do
+disagree by construction, not by bug — `test_a_real_scale_at_an_exact_
+rounding_tie_documents_the_known_divergence` pins that divergence
+explicitly rather than hiding it. This was checked against a real
 `cim-opt`/`cim-run` round trip by hand before the graph-walking code that
 finds this pattern was written — see `onnx_import.py`'s own module
 docstring for the exact numbers.
@@ -145,7 +158,7 @@ is worse than a refusal.
 | `uint8` operands | `cim.mvm` and the simulator are signed; reading a `uint8` 200 as `int8` computes with −56 |
 | non-zero zero points | needs a per-output bias term the dialect cannot express |
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
-| a chain bridge with scale ≠ 1.0 | reintroduces the rounding-mode divergence described below |
+| a chain bridge with a non-positive scale | `cim.requantize` requires a positive scale; a real positive scale is accepted (see above) |
 | a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
 | a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
 
@@ -196,8 +209,11 @@ any accumulator leaves `[-128, 127]`.
 - `test/python/test_onnx_frontend_chain.py` — the multi-layer counterpart:
   a 3-layer differential (the `mlp-3layer` shape), a batched 3-layer
   differential, a case that actually saturates the bridge's clamp,
-  placement invariance across layers, and the chain-specific refusals (bad
-  scale, bad zero point, fan-out).
+  placement invariance across layers, the chain-specific refusals (bad
+  scale, bad zero point, fan-out), a real (odd, non-1.0) calibrated scale
+  matched against `onnx.reference`'s quantized evaluation, and a hand-built
+  exact-tie case documenting the known rounding-mode divergence at an even
+  scale.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 

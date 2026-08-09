@@ -133,31 +133,55 @@ func.func @main() {{
 
 
 def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
-                      header=""):
+                      header="", scales=None):
     """A chain of matmuls, each layer's accumulator bridged into the next
     via a real `cim.requantize` -- int8 in, int32 accumulator out, narrowed
     back to int8 before it becomes the next layer's activation.
 
-    Why this is safe to compare against an UNQUANTIZED ONNX oracle,
-    despite requantize normally being the thing that introduces modeled
-    precision loss (see onnx_import.py's module docstring and
-    test_onnx_frontend.py's header on why the differential otherwise
-    avoids cim-legalize-precision entirely): with `scale=1.0` there is
-    nothing to round -- the accumulator is already an integer, so
+    `scales`, if given, is a list of `len(weights) - 1` positive floats,
+    one per bridge, in the same order as `weights` -- a real, calibrated
+    per-layer requantization scale, exactly the shape a real post-training-
+    quantized multi-layer INT8 model uses. Defaults to 1.0 for every
+    bridge, which is why passing nothing is safe and unchanged from
+    before this parameter existed.
+
+    Why `scale=1.0` (the default) is safe to compare against an
+    UNQUANTIZED ONNX oracle, despite requantize normally being the thing
+    that introduces modeled precision loss (see onnx_import.py's module
+    docstring and test_onnx_frontend.py's header on why the differential
+    otherwise avoids cim-legalize-precision entirely): with `scale=1.0`
+    there is nothing to round -- the accumulator is already an integer, so
     round(v / 1.0) == v exactly, and round-half-to-even (ONNX
     QuantizeLinear) cannot diverge from round-half-away-from-zero
     (cim.requantize) when there is never a tie to break. Both sides then
     saturate to the same [-128, 127]. So `cim.requantize(scale=1.0,
     zero_point=0, effective_bits=8)` computes bit-for-bit the same
     function as ONNX's `Cast(to=float32) -> QuantizeLinear(scale=1.0,
-    zero_point=0)` pair, which is the only inter-layer pattern
-    onnx_import.py accepts.
+    zero_point=0)` pair.
+
+    A REAL (non-1.0) scale does NOT get the same guarantee: `v / scale`
+    can land exactly on a tie (a value ending in .5), and at that exact
+    point cim.requantize's round-half-away-from-zero and QuantizeLinear's
+    round-half-to-even genuinely, correctly disagree by 1 -- a real
+    hardware-fidelity fact (cim.requantize's rounding mode models a real
+    digital requantizer/ADC readout path; it is not a testing
+    convenience, and changing it to match ONNX would model the wrong
+    thing), not a bug. onnx_import.py's `_validate_bridge` accepts any
+    positive scale for exactly this reason: the earlier "scale must be
+    1.0" refusal existed only to keep the differential trivially exact,
+    not because a real scale was unsupported -- cim.requantize's own
+    parameters were already scale/zero_point/effective_bits-generic (see
+    test/mlir/legalize_precision_e2e_test.cpp). test_onnx_frontend_chain.py
+    checks a real-scale chain against onnx.reference's OWN full
+    (quantized) evaluation instead of an unquantized one, and separately,
+    explicitly documents the exact-tie divergence rather than letting it
+    surface as a mysterious near-miss.
 
     This was verified by hand against a real cim-opt/cim-run round trip
     (--cim-detect --cim-partition --cim-placement, no
     cim-legalize-precision) before this function was written: a 2-layer
     chain's compiled output matched `np.clip(layer0_output, -128,
-    127).astype(np.int8)` fed into layer 1, exactly.
+    127).astype(np.int8)` fed into layer 1, exactly, at scale=1.0.
 
     `weights` is a list of already-transposed [N_i, K_i] int8 arrays, with
     K_i == N_(i-1) for i > 0. `activation` is a length-K_0 int8 vector
@@ -178,6 +202,15 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
         weight_syms = [f"w{i}" for i in range(len(weights))]
     if len(weight_syms) != len(weights):
         raise ValueError("weight_syms must have one entry per layer")
+    if scales is None:
+        scales = [1.0] * (len(weights) - 1)
+    if len(scales) != len(weights) - 1:
+        raise ValueError(
+            f"scales must have one entry per bridge (len(weights) - 1 = "
+            f"{len(weights) - 1}), got {len(scales)}")
+    for i, s in enumerate(scales):
+        if not (s > 0.0):
+            raise ValueError(f"bridge {i}'s scale must be positive, got {s}")
 
     for i, w in enumerate(weights):
         if w.ndim != 2:
@@ -233,7 +266,8 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
         if i < len(weights) - 1:
             act_val = f"%act{i + 1}"
             lines.append(
-                f"  {act_val} = cim.requantize {out_val} {{scale = 1.0 : f32, "
+                f"  {act_val} = cim.requantize {out_val} {{scale = "
+                f"{float(scales[i])!r} : f32, "
                 f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
             lines.append(f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}xi8>")
 

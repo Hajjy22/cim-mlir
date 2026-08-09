@@ -149,9 +149,10 @@ that pin it).
   ONNX's own reference implementation (`onnx.reference`, not PyTorch —
   see that file's header for why). **Chained layers are also imported now**
   (`test/python/test_onnx_frontend_chain.py`) — a graph of `MatMulInteger`
-  nodes bridged by `Cast(to=float32) -> QuantizeLinear(scale=1.0,
-  zero_point=0)`, which is exactly the `mlp-3layer` shape: multiple weight
-  matrices competing for one tile budget. Still generated rather than
+  nodes bridged by `Cast(to=float32) -> QuantizeLinear(scale, zero_point=0)`
+  (any positive scale, not just 1.0 — see `python/README.md`'s "Chained
+  layers" section), which is exactly the `mlp-3layer` shape: multiple
+  weight matrices competing for one tile budget. Still generated rather than
   sourced from a checked-in file here: a `.onnx` reproducing this table's
   `mlp-3layer` shape verbatim would make that row directly checkable
   against a real model file rather than only against the front end's own
