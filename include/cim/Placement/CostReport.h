@@ -77,7 +77,37 @@ struct CostReport {
   /// powered during an inference, whether it is reprogramming or computing,
   /// not just the reprogramming slice steadyStateLatencyNsPerInference
   /// tracks on its own.
+  ///
+  /// This is a SUM of the window's program and mvm latencies -- strictly
+  /// sequential, reprogram-then-compute, with no overlap between the two --
+  /// which is the honest number for what this compiler actually emits
+  /// today: `cim-schedule`'s own header states plainly that "nothing is
+  /// reordered or overlapped" (v0.1 scope). It stays the sum on EVERY
+  /// target, including one that declares `capabilities.double_buffer_
+  /// program`, because that capability describes what the HARDWARE could
+  /// do, not what the CURRENT compiled schedule does with it.
   double steadyStateElapsedNsPerInference = 0.0;
+
+  /// Copied from the target file (`capabilities.double_buffer_program`):
+  /// can this hardware reprogram tile i+1 while computing on tile i? A
+  /// hardware capability, not something v0.1 exploits -- see
+  /// steadyStateElapsedNsPerInference's own comment.
+  bool doubleBufferCapable = false;
+
+  /// A PROJECTION, not a measurement of anything this compiler emits: what
+  /// steadyStateElapsedNsPerInference WOULD be if a scheduler exploited
+  /// doubleBufferCapable to pipeline reprogramming against compute across
+  /// tiles -- max(this window's program latency, this window's mvm
+  /// latency) instead of their sum, the idealized assumption that whichever
+  /// is smaller is fully hidden behind the larger. Carries the same status
+  /// as `cim.n_inference_optimum`'s emitted-vs-optimal comparison (spec
+  /// docs/roadmap.md M3): a number to compare against, not a replacement
+  /// for the real one. Left at 0.0 when doubleBufferCapable is false --
+  /// a target that cannot double-buffer has no such projection to make,
+  /// the same "leave it at zero rather than guess" discipline
+  /// requantizes/reducePartialAdds already follow above for an engine that
+  /// does not model something.
+  double steadyStateElapsedNsPerInferenceIfOverlapped = 0.0;
 
   /// True when the target keeps weights across power cycles, so
   /// `installEnergyPj` is genuinely a one-time cost rather than a
@@ -114,6 +144,18 @@ CostReport computeCostReport(const TargetSpec &spec,
 /// section, `bench/plots/plot_amortization.py`).
 double amortizedInstallEnergyPjPerInference(const CostReport &report,
                                              uint64_t inferences);
+
+/// Same computation as amortizedInstallEnergyPjPerInference, but using
+/// steadyStateElapsedNsPerInferenceIfOverlapped for the volatile leakage
+/// term instead of steadyStateElapsedNsPerInference -- "what would the
+/// amortized cost be if this target's double_buffer_program capability
+/// were actually exploited". Identical to
+/// amortizedInstallEnergyPjPerInference when `!report.doubleBufferCapable`
+/// (there is then no overlapped elapsed time to differ), so it is always
+/// safe to call and never reports a number a target without the capability
+/// could not, in principle, reach.
+double amortizedInstallEnergyPjPerInferenceIfOverlapped(
+    const CostReport &report, uint64_t inferences);
 
 /// Render the report as the table from spec Sec. 17.
 std::string formatCostReport(const CostReport &report, const std::string &label);

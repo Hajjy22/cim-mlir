@@ -48,7 +48,7 @@ def check_provenance(data):
     return provenance
 
 
-def leakage_floor_pj(data):
+def leakage_floor_pj(data, key="amortized_install_pj_per_inference"):
     """The per-inference floor a volatile target's curve settles on.
 
     Recomputed from the same fields CostReport::toJson exposes rather than
@@ -56,6 +56,10 @@ def leakage_floor_pj(data):
     cim-bench.cpp still gets the right floor instead of a stale point value.
     Zero for a persistent (non-volatile) target -- there is no floor to
     plot, only the curve itself trending to zero.
+
+    `key` selects which of the two curves (real or double-buffer-
+    overlapped) to read the floor from -- both are monotone decreasing for
+    the same reason, just settling at different floors.
     """
     if data.get("persistent", True):
         return 0.0
@@ -66,7 +70,7 @@ def leakage_floor_pj(data):
     # inference count -- amortizedInstallEnergyPjPerInference is monotone
     # decreasing, so the last point is the tightest one available without
     # recomputing the formula from scratch here.
-    return points[-1]["amortized_install_pj_per_inference"]
+    return points[-1][key]
 
 
 def table(label, data):
@@ -110,6 +114,35 @@ def plot(nonvolatile, volatile_, out_path):
             linewidth=1,
             label=f"{volatile_.get('target')} standby-leakage floor",
         )
+
+    # A PROJECTION, not a second measurement: what the volatile curve WOULD
+    # be if a scheduler exploited capabilities.double_buffer_program to
+    # pipeline reprogramming against compute (CostReport.h's
+    # steadyStateElapsedNsPerInferenceIfOverlapped). v0.1's own cim-schedule
+    # never does this, so this line is a comparison point, not a claim
+    # about the numbers plotted above it -- only drawn at all when the
+    # volatile target actually declares the capability, and only for the
+    # volatile side, since a persistent target's amortized cost has no
+    # leakage term for overlap to shrink in the first place
+    # (amortizedInstallEnergyPjPerInferenceIfOverlapped returns the
+    # identical, real figure there).
+    if volatile_.get("double_buffer_capable"):
+        overlap_key = "amortized_install_pj_per_inference_if_overlapped"
+        xs = [p["inferences"] for p in volatile_["points"]]
+        ys = [p[overlap_key] for p in volatile_["points"]]
+        ax.plot(
+            xs, ys, ":^", color="tab:orange",
+            label=f"{volatile_.get('target')} (volatile, IF double-buffered)",
+        )
+        overlap_floor = leakage_floor_pj(volatile_, key=overlap_key)
+        if overlap_floor > 0 and overlap_floor < floor:
+            ax.axhline(
+                overlap_floor,
+                color="tab:orange",
+                linestyle=":",
+                linewidth=1,
+                label=f"{volatile_.get('target')} IF-double-buffered floor",
+            )
 
     ax.set_xscale("log")
     ax.set_yscale("log")

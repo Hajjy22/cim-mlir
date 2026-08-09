@@ -113,11 +113,25 @@ CostReport computeCostReport(const TargetSpec &spec,
   report.steadyStateElapsedNsPerInference =
       steady.latencyNs + mvmLatencyPerInferenceNs;
 
+  // See steadyStateElapsedNsPerInferenceIfOverlapped's own comment: a
+  // projection, computed only when the target declares it could ever be
+  // realized, never substituted for the honest sum above.
+  report.doubleBufferCapable = spec.capabilities.doubleBufferProgram;
+  if (report.doubleBufferCapable)
+    report.steadyStateElapsedNsPerInferenceIfOverlapped =
+        std::max(steady.latencyNs, mvmLatencyPerInferenceNs);
+
   return report;
 }
 
-double amortizedInstallEnergyPjPerInference(const CostReport &report,
-                                             uint64_t inferences) {
+namespace {
+
+/// Shared by amortizedInstallEnergyPjPerInference and its
+/// ...IfOverlapped sibling below -- identical logic, differing only in
+/// which elapsed-time figure charges the volatile leakage term.
+double amortizedInstallEnergyPjPerInferenceUsing(const CostReport &report,
+                                                 uint64_t inferences,
+                                                 double elapsedNsPerInference) {
   if (inferences == 0)
     return 0.0;
   const double amortizedInstall =
@@ -139,8 +153,27 @@ double amortizedInstallEnergyPjPerInference(const CostReport &report,
   // use.
   const double leakagePjPerInference =
       static_cast<double>(report.numTiles) * report.standbyLeakageUwPerTile *
-      report.steadyStateElapsedNsPerInference * 1e-3;
+      elapsedNsPerInference * 1e-3;
   return amortizedInstall + leakagePjPerInference;
+}
+
+} // namespace
+
+double amortizedInstallEnergyPjPerInference(const CostReport &report,
+                                             uint64_t inferences) {
+  return amortizedInstallEnergyPjPerInferenceUsing(
+      report, inferences, report.steadyStateElapsedNsPerInference);
+}
+
+double amortizedInstallEnergyPjPerInferenceIfOverlapped(
+    const CostReport &report, uint64_t inferences) {
+  // No overlapped elapsed time to differ on a target that cannot
+  // double-buffer -- report the same, honest number rather than a
+  // projection this hardware could never realize.
+  if (!report.doubleBufferCapable)
+    return amortizedInstallEnergyPjPerInference(report, inferences);
+  return amortizedInstallEnergyPjPerInferenceUsing(
+      report, inferences, report.steadyStateElapsedNsPerInferenceIfOverlapped);
 }
 
 std::string formatCostReport(const CostReport &report,
@@ -176,6 +209,15 @@ std::string formatCostReport(const CostReport &report,
        << "/inference (this target never amortizes below it)\n";
   }
 
+  // A PROJECTION this compiler does not emit today -- see
+  // steadyStateElapsedNsPerInferenceIfOverlapped's own comment -- shown
+  // only when the target could ever realize it, and always beside the
+  // real, unoverlapped figure, never instead of it.
+  if (report.doubleBufferCapable)
+    os << "  if double-buffered: " << formatTime(report.steadyStateElapsedNsPerInference)
+       << " -> " << formatTime(report.steadyStateElapsedNsPerInferenceIfOverlapped)
+       << "/inference (v0.1's cim-schedule does not exploit this yet)\n";
+
   for (uint64_t n : {uint64_t(1), uint64_t(1000000), uint64_t(100000000)}) {
     const double perInf = amortizedInstallEnergyPjPerInference(report, n);
     os << "  install amortized over " << n << " inferences: "
@@ -203,6 +245,15 @@ std::string toJson(const CostReport &report, const std::string &label) {
   os << "  \"total_latency_ns\": " << report.totalLatencyNs << ",\n";
   os << "  \"standby_leakage_uw_per_tile\": " << report.standbyLeakageUwPerTile
      << ",\n";
+  os << "  \"double_buffer_capable\": "
+     << (report.doubleBufferCapable ? "true" : "false") << ",\n";
+  // A projection, not a measurement -- see
+  // steadyStateElapsedNsPerInferenceIfOverlapped's own comment. Present
+  // (as 0.0) even when double_buffer_capable is false, matching the fixed-
+  // schema convention requantizes/reduce_partial_adds already use above,
+  // rather than an absent key a naive consumer would have to special-case.
+  os << "  \"steady_state_elapsed_ns_per_inference_if_overlapped\": "
+     << report.steadyStateElapsedNsPerInferenceIfOverlapped << ",\n";
   // The per-inference floor a volatile target's amortized install cost
   // settles on and a non-volatile one does not -- see
   // amortizedInstallEnergyPjPerInference's own comment. Zero on a

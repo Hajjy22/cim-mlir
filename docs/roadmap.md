@@ -1019,6 +1019,66 @@ out of scope for v0.1 across the board, not just here.
   tiles -- two K-tiles, one two-operand reduce, exactly 1 call);
   mutation-tested by disabling `recordReduceAdd`'s bookkeeping and
   confirming both it and `cimrt_profile_counts_a_known_trace` go red.
+- **A gap this project's own audit found, not on the original list**:
+  `capabilities.double_buffer_program` (and `partial_sum_in_place`,
+  `autonomous_control`) were parsed and echoed by `cim-bench dump-target`
+  but read by zero compiler passes -- the exact class of defect PR #3
+  already found and fixed once for the `class:` enum. `cim-schedule`'s own
+  header is honest about why: "nothing is reordered or overlapped... that
+  is v0.2's double-buffering work" (spec Sec. 6 Pass 4) -- v0.1 never
+  actually exploits the capability, so there was nothing for a pass to
+  read.
+
+  **Partially closed**: `lib/Placement/CostReport.cpp` (the `cim-bench`
+  engine) now computes a PROJECTION -- `steadyStateElapsedNsPerInference
+  IfOverlapped` (`CostReport.h`) -- of what the steady-state elapsed time
+  per inference would be if a scheduler exploited
+  `double_buffer_program`: `max(program latency, mvm latency)` for the
+  window instead of their sum, the idealized assumption that whichever is
+  smaller is fully hidden behind the larger. This is a comparison number,
+  the same status `cim.n_inference_optimum`'s emitted-vs-optimal gap
+  already has (M3 above) -- reported BESIDE the real, honest,
+  never-overlapped figure in `formatCostReport`/`toJson`
+  (`double_buffer_capable`, `steady_state_elapsed_ns_per_inference_if_
+  overlapped`) and in `cim-bench amortize`'s JSON sweep
+  (`amortized_install_pj_per_inference_if_overlapped`), never replacing
+  it: the real number is still a strict, sequential reprogram-then-compute
+  sum on every target, because that is genuinely what this compiler emits
+  today regardless of what the hardware could do.
+
+  Left at `0.0` (or, for the amortized figure, falls back to the honest
+  serial value) on any target that does not declare the capability --
+  same "leave it at zero rather than guess" discipline `requantizes`/
+  `reduce_partial_adds` already follow in the same struct. Verified on the
+  one shipped target that actually exercises it end to end:
+  `generic-digital-cim.yaml` declares `double_buffer_program: true`, and
+  `test/python/test_amortization_curve.py`'s new test runs the real
+  `cim-bench` binary against it on the `mm-spill-8x` workload (mm-fit, the
+  suite's default, reprograms nothing in steady state and would make the
+  two curves trivially, correctly identical -- proving nothing about
+  whether a real divergence renders end to end) and asserts the projected
+  floor is strictly lower. `bench/plots/plot_amortization.py` draws it as
+  a third, clearly-labeled dotted curve, only when the volatile input
+  declares the capability. Unit-tested as a property (the projection is
+  never greater than the serial sum, `cost_report_test.cpp`) and
+  mutation-tested (swapping the `max` for a `+` was caught by both the
+  property test and the amortization test, restored).
+
+  **Still open**: this is the analytical engine only
+  (`lib/Placement/CostReport.cpp`/`cim-bench`), deliberately not the
+  runtime `CostAccumulator` (`runtime/src/simulator/cost_model.h`) or
+  `cim-cost-report`'s IR-walking engine -- the functional simulator
+  genuinely executes every `cimrt_*` call synchronously, one at a time
+  (`cimrt_barrier` is a documented no-op: "Functional simulator executes
+  synchronously; nothing to wait on"), so a real overlap number there
+  would have to either misrepresent what actually ran or require an
+  honest-to-goodness async execution model -- exactly the v0.2 scheduling
+  work this capability is gated on, not a cost-model change. `partial_sum_
+  in_place` and `autonomous_control` remain fully unread; the former is
+  concretely actionable in `lowerReducePartial` (a target that can
+  accumulate in place needs no intermediate accumulator buffers) once
+  something is worth measuring the saving against, and the latter has
+  nothing in v0.1's execution model to drive at all.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
