@@ -5,6 +5,26 @@ is the front door the rest of the project was written behind: everything
 else here starts from MLIR that this repository wrote, either by hand in
 the FileCheck tests or from a string builder in the differential tests.
 
+## Install
+
+```sh
+pip install ./python           # cim-import-onnx CLI only
+pip install './python[onnx]'   # + the onnx package the CLI actually needs at runtime
+```
+
+This installs a `cim-import-onnx` console script, so the pipe below no
+longer needs `PYTHONPATH`:
+
+```sh
+cim-import-onnx model.onnx --input act.npy \
+  | cim-opt - --cim-detect \
+      --cim-partition=target-yaml=targets/erbium-8t.yaml \
+      --cim-placement=target-yaml=targets/erbium-8t.yaml \
+  | cim-run --target-yaml=targets/erbium-8t.yaml --profile -
+```
+
+Without installing, the equivalent is:
+
 ```sh
 PYTHONPATH=python python3 -m cim_frontend model.onnx --input act.npy \
   | cim-opt - --cim-detect \
@@ -12,6 +32,14 @@ PYTHONPATH=python python3 -m cim_frontend model.onnx --input act.npy \
       --cim-placement=target-yaml=targets/erbium-8t.yaml \
   | cim-run --target-yaml=targets/erbium-8t.yaml --profile -
 ```
+
+`python/pyproject.toml` packages only this directory (`cim_frontend`);
+it deliberately does not depend on anything under `lib/`, `runtime/`, or
+`tools/`, since those need an LLVM/MLIR toolchain this package has no
+reason to require. The `.github/workflows/ci.yml` `packaging` job installs
+it fresh with `pip` and runs the console script for real (not
+`python3 -m`, and not through the `test/python` suites' `sys.path` hack)
+so this stays true rather than merely documented.
 
 ## Why Python, and why not in `tools/`
 

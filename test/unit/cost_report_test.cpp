@@ -255,6 +255,37 @@ CIM_TEST(cost_report_energy_units_scale_sensibly) {
   CIM_EXPECT_CONTAINS(text, "uJ");
 }
 
+CIM_TEST(install_energy_pins_the_pj_as_written_convention) {
+  // docs/target-format.md documents that the v0.1 spec's own Section 17
+  // worked example is internally inconsistent by exactly 1000x on program
+  // energy: with erbium-8t's program.energy_pj: 480000, 8 programs is
+  // 3.84e6 pJ = 3.84 uJ of install energy, but Section 17's prose states
+  // "x 480 nJ = 3.84 mJ" -- 1000x larger. This project deliberately
+  // implements every energy_pj/latency_ns field as written (picojoules,
+  // nanoseconds), not as the spec prose's inconsistent worked example.
+  //
+  // That choice is exactly the kind of thing a future "fix" could flip
+  // silently -- someone "correcting" this arithmetic to match Section 17's
+  // prose instead of its own field names would move every published
+  // amortization number by 1000x with no compiler error to catch it, and
+  // it is the crux of the whole install-cost-vs-per-inference-cost
+  // argument (target-format.md: "13%... or... negligible"). Pin both ends
+  // of that argument numerically so the convention cannot rot silently.
+  const CostReport report = fitReport(1000);
+
+  // 8 tiles x 480000 pJ/program = 3,840,000 pJ = 3.84 uJ -- NOT the
+  // spec prose's stated 3.84 mJ (which would be 3,840,000,000 pJ).
+  CIM_EXPECT_EQ(report.installEnergyPj, 3840000.0);
+
+  // Amortized over 1e6 inferences, the spec's own worked-example horizon:
+  // 3,840,000 pJ / 1e6 = 3.84 pJ/inference = 0.00384 nJ/inference, i.e.
+  // negligible -- NOT the spec's stated 3.84 nJ/inference, which implies
+  // install cost is a material 13% of the per-inference energy budget.
+  const double perInference =
+      amortizedInstallEnergyPjPerInference(report, 1000000);
+  CIM_EXPECT_EQ(perInference, 3.84);
+}
+
 CIM_TEST(action_kind_and_policy_names_round_trip) {
   // Used in cim-bench's JSON and in diagnostics; an unnamed enum value
   // would surface as "unknown" in a results file.

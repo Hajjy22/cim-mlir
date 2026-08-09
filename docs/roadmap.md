@@ -1138,6 +1138,58 @@ out of scope for v0.1 across the board, not just here.
   correct through the interpreter at all -- before this session it had
   zero interpreter-level coverage, since every existing test target
   already declared the capability.
+- ~~No packaging: no `pyproject.toml`/`setup.py`; the ONNX front end
+  cannot be `pip install`ed despite being the project's front door~~ --
+  **closed**. `python/pyproject.toml` packages `cim_frontend` with a real
+  `cim-import-onnx` console-script entry point and an `onnx` extra
+  mirroring `test/python/requirements-onnx.txt`'s split (numpy is a hard
+  dependency; onnx/onnxruntime stay opt-in, matching why they were kept
+  out of the C++ build entirely -- see `python/README.md`'s "Why Python,
+  and why not in `tools/`"). `test/python`'s suites already import
+  `cim_frontend` via a `sys.path.insert` hack that keeps working
+  unchanged (source-tree imports still take priority), so packaging is
+  additive: it does not touch how any existing test finds the module.
+
+  Verified for real rather than just configured: a new `packaging` CI job
+  (`.github/workflows/ci.yml`) does a fresh `pip install ./python[onnx]`
+  in an environment with no MLIR toolchain and no source-tree
+  `PYTHONPATH`, runs the installed `cim-import-onnx` console script
+  (not `python3 -m cim_frontend`) against a model built with the
+  project's own `test/python/onnx_fixtures.py` helper, and greps the
+  emitted MLIR for the expected `linalg.matmul_transpose_b` shape --
+  proving the packaged entry point does real importer work, not merely
+  that `--help` exits zero. Confirmed locally in a scratch venv before
+  writing the CI job.
+- ~~The Section 17 units discrepancy is unresolved -- 1000x on program
+  energy, documented in `target-format.md`, and it is the crux of the
+  whole amortization argument~~ -- **not resolvable without hardware, but
+  now pinned rather than merely documented**. The choice this project
+  already made (implement `energy_pj`/`latency_ns` fields exactly as
+  named, not as `docs/target-format.md`'s prose reading of the spec's
+  internally-inconsistent Section 17 worked example) was previously
+  enforced by nothing except that prose: a future change to
+  `lib/Placement/CostReport.cpp`'s arithmetic could silently reintroduce
+  the spec's 1000x error with no test catching it, since the existing
+  `cost_report_energy_units_scale_sensibly` test only checks that the
+  formatter picks the right *unit suffix* (`uJ`), not the right
+  underlying number.
+
+  New test `install_energy_pins_the_pj_as_written_convention`
+  (`test/unit/cost_report_test.cpp`) asserts the exact numeric values on
+  both ends of `target-format.md`'s own worked example against
+  `erbium-8t`'s real `program.energy_pj: 480000`: 8 tiles' install energy
+  is exactly `3840000.0` pJ (3.84 uJ, not the spec prose's stated 3.84
+  mJ, which is 1000x larger), and amortized over 1e6 inferences that is
+  exactly `3.84` pJ/inference (negligible, not the spec's stated 3.84
+  nJ/inference, which would make install cost a material 13% of the
+  per-inference budget). Mutation-tested by injecting the spec's implied
+  1000x factor into `costOfWindow`'s energy arithmetic and confirming
+  both assertions go red before reverting.
+
+  This does not resolve which figure is actually correct on real
+  hardware -- that still needs measured data, per M5 below -- it only
+  makes sure this project's own documented interpretation cannot drift
+  by 1000x silently.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
