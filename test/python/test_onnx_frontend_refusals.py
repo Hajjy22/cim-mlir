@@ -159,10 +159,18 @@ def test_refuses_a_graph_with_no_matmul_integer():
     _refuses(model, "no MatMulInteger")
 
 
-def test_refuses_multiple_matmul_integer_nodes():
+def test_refuses_two_matmuls_with_no_bridge_between_them():
+    # Two MatMulInteger nodes are now a valid chain (see
+    # test_onnx_frontend_chain.py) -- but only when the second layer's
+    # activation is produced by the accepted Cast->QuantizeLinear bridge.
+    # Reading the first layer's raw int32 output directly, as this fixture
+    # does, must still be refused: an int32 accumulator is not an int8
+    # activation, and cim-detect's own int8 contract would reject it
+    # anyway, just with a worse message that never mentions the model.
     second = helper.make_node("MatMulInteger", ["Y", "W"], ["Z"], name="mm2")
     model = matmul_integer_model(WEIGHT, extra_nodes=[second], check=False)
-    _refuses(model, "single one")
+    model.graph.output[0].name = "Z"
+    _refuses(model, "not produced by QuantizeLinear")
 
 
 def test_refuses_a_too_old_opset():

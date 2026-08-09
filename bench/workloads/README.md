@@ -147,12 +147,12 @@ that pin it).
   `python/cim_frontend` reads an ONNX `MatMulInteger` model and
   `test/python/test_onnx_frontend.py` checks the compiled result against
   ONNX's own reference implementation (`onnx.reference`, not PyTorch —
-  see that file's header for why). Still generated rather than sourced
-  from a real model file here: a checked-in `.onnx` reproducing one of
-  these shapes (`mlp-3layer` is the natural first target, since it is
-  exactly the multi-layer case the front end does not yet import — see
-  below).
-- **Chained layers.** The front end imports a single `MatMulInteger`
-  today. A chain of them is what would make the `mlp-3layer` row in this
-  table reachable from a real model file, and is what would exercise
-  `cim-placement`'s reuse *across* layers rather than only within one.
+  see that file's header for why). **Chained layers are also imported now**
+  (`test/python/test_onnx_frontend_chain.py`) — a graph of `MatMulInteger`
+  nodes bridged by `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+  zero_point=0)`, which is exactly the `mlp-3layer` shape: multiple weight
+  matrices competing for one tile budget. Still generated rather than
+  sourced from a checked-in file here: a `.onnx` reproducing this table's
+  `mlp-3layer` shape verbatim would make that row directly checkable
+  against a real model file rather than only against the front end's own
+  test fixtures.

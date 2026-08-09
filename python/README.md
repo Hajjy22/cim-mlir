@@ -41,8 +41,9 @@ belong there.
 
 ## What it accepts
 
-A graph consisting of exactly one `MatMulInteger` node and nothing else,
-where:
+A graph consisting of one or more `MatMulInteger` nodes and nothing else
+(chains are bridged as described below), where each layer's operands
+satisfy:
 
 - the weight operand (B) is a constant initializer,
 - both operands are `int8` (not `uint8`),
@@ -54,6 +55,32 @@ where:
 `MatMulInteger` is the accepted op because it *is* the v0.1 contract in
 one node: int8 A, int8 B, int32 Y — "INT8 in, wider integer accumulator
 out".
+
+## Chained layers
+
+A single `MatMulInteger` is the whole v0.1 contract, but it is also the
+one shape where `cim-placement` has nothing to reuse *across* — real
+cross-layer eviction, the `mlp-3layer` benchmark shape, needs more than
+one weight matrix competing for the tile budget. A graph of two or more
+`MatMulInteger` nodes is imported as a chain, provided consecutive layers
+are bridged by exactly one pattern: `Cast(to=float32) ->
+QuantizeLinear(scale=1.0, zero_point=0, int8 output)`. Anything else
+between layers — a different scale, a missing zero point, any other op —
+is refused.
+
+That specific bridge, and no other, is what keeps the compiled chain
+matching an *unquantized* ONNX oracle exactly rather than only
+approximately. It lowers to a real `cim.requantize(scale=1.0, zero_point=0,
+effective_bits=8)` between the two compiled matmuls. `cim.requantize`
+rounds half-away-from-zero; ONNX's `QuantizeLinear` rounds half-to-even —
+two modes that diverge only at a tie, a value ending in exactly `.5`.
+`scale=1.0` makes both sides compute `round(v / 1.0)` on a `v` that is
+already an integer (an accumulator), so there is never a fractional part
+and therefore never a tie either side could round differently. Both then
+saturate to the same `[-128, 127]`. This was checked against a real
+`cim-opt`/`cim-run` round trip by hand before the graph-walking code that
+finds this pattern was written — see `onnx_import.py`'s own module
+docstring for the exact numbers.
 
 ## What it refuses, and why refusing is the point
 
@@ -75,6 +102,9 @@ is worse than a refusal.
 | non-zero zero points | needs a per-output bias term the dialect cannot express |
 | more than one output row | v0.1 is a matrix-*vector* contract |
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
+| a chain bridge with scale ≠ 1.0 | reintroduces the rounding-mode divergence described below |
+| a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
+| a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
 
 ## The activation is required
 
@@ -119,6 +149,10 @@ any accumulator leaves `[-128, 127]`.
   `onnxruntime`.
 - `test/python/test_onnx_frontend_refusals.py` — one test per refusal
   above, plus a case proving it does not refuse everything.
+- `test/python/test_onnx_frontend_chain.py` — the multi-layer counterpart:
+  a 3-layer differential (the `mlp-3layer` shape), a case that actually
+  saturates the bridge's clamp, placement invariance across layers, and
+  the chain-specific refusals (bad scale, bad zero point, fan-out).
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 

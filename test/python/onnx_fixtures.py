@@ -59,6 +59,61 @@ def matmul_integer_model(weight, act_name="A", weight_name="W",
     return model
 
 
+def matmul_chain_model(weights, act_name="A", check=True):
+    """A linear chain of MatMulInteger nodes, each bridged into the next by
+    the one pattern python/cim_frontend/onnx_import.py accepts:
+    Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0, int8 out).
+
+    `weights` is a list of [K_i, N_i] int8 arrays in ONNX's own layout
+    (NOT transposed), with K_i == N_(i-1) for i > 0 -- same convention as
+    matmul_integer_model, so both fixtures hand the importer the same kind
+    of un-transposed input.
+    """
+    weights = [np.asarray(w) for w in weights]
+    nodes = []
+    initializers = []
+    cur = act_name
+
+    for i, w in enumerate(weights):
+        w_name = f"W{i}"
+        y_name = f"Y{i}"
+        initializers.append(numpy_helper.from_array(w, name=w_name))
+        nodes.append(helper.make_node("MatMulInteger", [cur, w_name],
+                                      [y_name], name=f"mm{i}"))
+
+        if i < len(weights) - 1:
+            float_name = f"f{i}"
+            q_name = f"q{i}"
+            scale_name = f"scale{i}"
+            zp_name = f"zp{i}"
+            initializers.append(numpy_helper.from_array(
+                np.array(1.0, dtype=np.float32), name=scale_name))
+            initializers.append(numpy_helper.from_array(
+                np.array(0, dtype=np.int8), name=zp_name))
+            nodes.append(helper.make_node(
+                "Cast", [y_name], [float_name], to=TensorProto.FLOAT,
+                name=f"cast{i}"))
+            nodes.append(helper.make_node(
+                "QuantizeLinear", [float_name, scale_name, zp_name],
+                [q_name], name=f"quant{i}"))
+            cur = q_name
+
+    k0 = weights[0].shape[0]
+    n_last = weights[-1].shape[1]
+    graph = helper.make_graph(
+        nodes, "chain",
+        [helper.make_tensor_value_info(act_name, TensorProto.INT8, [1, k0])],
+        [helper.make_tensor_value_info(f"Y{len(weights) - 1}",
+                                       TensorProto.INT32, [1, n_last])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def onnx_reference_eval(model, activation, act_name="A"):
     """Evaluate with onnx.reference -- the ONNX spec's own implementation.
 

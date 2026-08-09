@@ -615,9 +615,26 @@ wrong.
   `[-128, 127]`. The differential runs detect/partition/placement, and
   says so at the point it builds the pipeline string.
 
-  Not yet: chained layers (which is what would exercise `cim-placement`'s
-  reuse across layers, i.e. the `mlp-3layer` benchmark shape from a real
-  model file), and `Gemm`/`QLinearMatMul`/quantize-dequantize graphs.
+  **Chained layers are also closed**: a graph of two or more `MatMulInteger`
+  nodes, bridged by `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+  zero_point=0)` between consecutive layers, lowers to a real
+  `cim.requantize(scale=1.0, zero_point=0, effective_bits=8)` sitting
+  between the two compiled matmuls. Scale 1.0 is why this still matches an
+  unquantized oracle exactly rather than only approximately: it makes
+  ONNX's round-half-to-even and `cim.requantize`'s round-half-away-from-zero
+  compute the same thing, because rounding an already-integer accumulator
+  has no fractional part to round differently -- there is no tie for the
+  two modes to disagree about. Verified by hand against a real
+  `cim-opt`/`cim-run` round trip before the graph-walking code that finds
+  this pattern was written. This is what makes the `mlp-3layer` benchmark
+  shape reachable from a real model file, and it is the first time
+  `cim-placement`'s reuse *across* layers (not just within one) is
+  exercised from a model file rather than a generated one.
+
+  Still not accepted: `Gemm`, `QLinearMatMul`, and quantize/dequantize
+  graphs that are not this exact bridge (any other scale, or an absent
+  zero point, reintroduces the rounding-mode risk the scale=1.0
+  restriction exists to avoid).
 
 ### Known limits of cim-partition
 Each of the remaining two is refused with a warning and the `linalg` op left

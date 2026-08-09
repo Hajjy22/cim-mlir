@@ -121,3 +121,109 @@ func.func @main() {{
   return
 }}
 """
+
+
+def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
+                      header=""):
+    """A chain of matmuls, each layer's accumulator bridged into the next
+    via a real `cim.requantize` -- int8 in, int32 accumulator out, narrowed
+    back to int8 before it becomes the next layer's activation.
+
+    Why this is safe to compare against an UNQUANTIZED ONNX oracle,
+    despite requantize normally being the thing that introduces modeled
+    precision loss (see onnx_import.py's module docstring and
+    test_onnx_frontend.py's header on why the differential otherwise
+    avoids cim-legalize-precision entirely): with `scale=1.0` there is
+    nothing to round -- the accumulator is already an integer, so
+    round(v / 1.0) == v exactly, and round-half-to-even (ONNX
+    QuantizeLinear) cannot diverge from round-half-away-from-zero
+    (cim.requantize) when there is never a tie to break. Both sides then
+    saturate to the same [-128, 127]. So `cim.requantize(scale=1.0,
+    zero_point=0, effective_bits=8)` computes bit-for-bit the same
+    function as ONNX's `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+    zero_point=0)` pair, which is the only inter-layer pattern
+    onnx_import.py accepts.
+
+    This was verified by hand against a real cim-opt/cim-run round trip
+    (--cim-detect --cim-partition --cim-placement, no
+    cim-legalize-precision) before this function was written: a 2-layer
+    chain's compiled output matched `np.clip(layer0_output, -128,
+    127).astype(np.int8)` fed into layer 1, exactly.
+
+    `weights` is a list of already-transposed [N_i, K_i] int8 arrays, with
+    K_i == N_(i-1) for i > 0. `activation` is a length-K_0 int8 vector.
+    `weight_syms`, if given, must have one entry per layer.
+    """
+    weights = [np.asarray(w) for w in weights]
+    activation = np.asarray(activation)
+    if not weights:
+        raise ValueError("emit_chain_module needs at least one layer")
+    if weight_syms is None:
+        weight_syms = [f"w{i}" for i in range(len(weights))]
+    if len(weight_syms) != len(weights):
+        raise ValueError("weight_syms must have one entry per layer")
+
+    for i, w in enumerate(weights):
+        if w.ndim != 2:
+            raise ValueError(f"layer {i}'s weight must be 2-D [N, K], got "
+                             f"shape {w.shape}")
+    for i in range(1, len(weights)):
+        if weights[i].shape[1] != weights[i - 1].shape[0]:
+            raise ValueError(
+                f"layer {i}'s K ({weights[i].shape[1]}) does not match "
+                f"layer {i - 1}'s N ({weights[i - 1].shape[0]})")
+    if activation.ndim != 1 or activation.shape[0] != weights[0].shape[1]:
+        raise ValueError(
+            f"activation must be 1-D of length {weights[0].shape[1]} "
+            f"(layer 0's K), got shape {activation.shape}")
+
+    lines = [header.rstrip("\n")] if header else []
+    for sym, w in zip(weight_syms, weights):
+        n, k = w.shape
+        lines.append(
+            f'memref.global "private" constant @{sym} : memref<{n}x{k}xi8> '
+            f"= dense<{_dense_2d(w)}>")
+    acts = ", ".join(str(int(v)) for v in activation)
+    k0 = weights[0].shape[1]
+    lines.append(
+        f'memref.global "private" constant @{act_sym} : memref<1x{k0}xi8> '
+        f"= dense<[[{acts}]]>")
+    lines.append("func.func private @cim_print_i32(memref<*xi32>)")
+    lines.append("func.func @main() {")
+
+    for sym, w in zip(weight_syms, weights):
+        n, k = w.shape
+        lines.append(f"  %{sym} = memref.get_global @{sym} : memref<{n}x{k}xi8>")
+    lines.append(f"  %aInit = memref.get_global @{act_sym} : memref<1x{k0}xi8>")
+    lines.append("  %a0 = memref.alloc() : memref<1x" + str(k0) + "xi8>")
+    lines.append(
+        f"  memref.copy %aInit, %a0 : memref<1x{k0}xi8> to memref<1x{k0}xi8>")
+
+    act_val = "%a0"
+    for i, (sym, w) in enumerate(zip(weight_syms, weights)):
+        n, k = w.shape
+        out_val = f"%out{i}"
+        lines.append(f"  {out_val} = memref.alloc() : memref<1x{n}xi32>")
+        lines.append(
+            f"  linalg.matmul_transpose_b ins({act_val}, %{sym} : "
+            f"memref<1x{k}xi8>, memref<{n}x{k}xi8>)")
+        lines.append(f"    outs({out_val} : memref<1x{n}xi32>)")
+        if i < len(weights) - 1:
+            act_val = f"%act{i + 1}"
+            lines.append(
+                f"  {act_val} = cim.requantize {out_val} {{scale = 1.0 : f32, "
+                f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
+            lines.append(f"    : memref<1x{n}xi32> -> memref<1x{n}xi8>")
+
+    last_n = weights[-1].shape[0]
+    lines.append(
+        f"  %u = memref.cast %out{len(weights) - 1} : memref<1x{last_n}xi32> "
+        f"to memref<*xi32>")
+    lines.append("  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()")
+    lines.append(f"  memref.dealloc %a0 : memref<1x{k0}xi8>")
+    lines.append(
+        f"  memref.dealloc %out{len(weights) - 1} : memref<1x{last_n}xi32>")
+    lines.append("  return")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
