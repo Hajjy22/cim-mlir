@@ -663,10 +663,16 @@ wrong.
   restriction exists to avoid).
 
 ### Known limits of cim-partition
-The remaining one is refused with a warning and the `linalg` op left intact,
-so the module stays correct and is simply not offloaded:
-- Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
-  output-major convention). A plain `linalg.matmul` needs a transpose first.
+Everything genuinely out of v0.1's scope (a convolution, a batched matmul's
+3rd dimension, dynamic shapes) is still refused with a warning and the
+`linalg` op left intact, so the module stays correct and is simply not
+offloaded. Both weight-layout and row-count limits below are now closed:
+
+~~Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
+output-major convention). A plain `linalg.matmul` needs a transpose
+first.~~ -- **closed, M4 below**: a plain `linalg.matmul` (weights in
+`[K x N]`, ONNX's own layout) is now accepted too, transposed into a fresh
+`[N x K]` buffer by this pass itself rather than refused.
 
 ~~Only a single output row: `cim.mvm` is a matrix-vector primitive and the
 v0.1 contract is matrix-vector.~~ -- **closed, M4 below**: a matmul with
@@ -1288,6 +1294,52 @@ out of scope for v0.1 across the board, not just here.
   that file already follows. Mutation-tested: forcing `emit_module`'s `m`
   to a hardcoded `1` was caught immediately, by MLIR's own elements-literal
   shape check before ever reaching a numerical comparison.
+- ~~Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching
+  `cim.mvm`'s output-major convention). A plain `linalg.matmul` needs a
+  transpose first~~ -- **closed**. `cim-partition` now accepts a plain
+  `linalg.matmul` (weights in `[K x N]`, ONNX's own layout) directly,
+  transposing the weight into a fresh `[N x K]` buffer itself -- once, at
+  weight-staging time, the same place ragged-edge padding already happens
+  -- rather than refusing the candidate. The transpose is a genuine,
+  doubly-nested `scf.for` over `memref.load`/`memref.store`, deliberately
+  NOT a `linalg` buffer op (`linalg.transpose`/`linalg.fill`): this pass's
+  own existing padding logic already uses `linalg.fill` on memrefs, and no
+  real-target-e2e binary has ever exercised that through a real compiled
+  build (every shipped real-target shape is an exact tile multiple, so
+  padding's `needsPadding` branch is always false in practice today) --
+  `scf.for` is the one loop-emitting primitive this pass already knew
+  lowered correctly through the real `--convert-to-llvm` pipeline (the
+  M > 1 batching loop above uses it), so the new real-target-e2e coverage
+  a plain-matmul candidate gets tests this new code specifically, rather
+  than incidentally depending on a separate, still-unverified gap.
+
+  The ONNX front end does not directly exercise this path today -- it
+  already transposes the weight itself in Python at import time and always
+  emits `linalg.matmul_transpose_b` (see `onnx_import.py`'s own "THE
+  TRANSPOSE" note) -- so this closes a retargetability gap for a different
+  future front door: `lib/Transforms/CIMDetect.cpp`'s own comment already
+  names "an inline constant (tensor semantics, e.g. from torch-mlir)" as a
+  shape a frontend can produce, and the top-level README names plugging in
+  below IREE/TVM/XLA as this project's own stated position. A frontend
+  that does not pre-transpose no longer needs to.
+
+  Deliberately still out of scope: `linalg.batch_matmul` (a real 3rd batch
+  dimension, not just M-row batching, and materially more machinery) stays
+  refused, matching `cim-detect`'s own documented "detected, then refused
+  with a warning" status for it.
+
+  Verified: `test/Transforms/cim-partition.mlir`'s
+  `plain_matmul_is_transposed_and_tiled` replaces the old
+  `plain_matmul_layout_is_left_alone` refusal test, pinning the generated
+  transpose loop and the tiled `cim.program`/`cim.mvm` sequence that
+  follows it. New real-target-e2e pair `plain-matmul-correct`/`-wrong`
+  (`test/real-target/check-plain-matmul.mlir.in`) uses a deliberately
+  NON-symmetric weight, so a missing or backwards transpose reads entirely
+  different values rather than merely reordered ones -- the same
+  discipline `test_onnx_frontend.py`'s own transpose tests already use.
+  Mutation-tested: swapping the transpose loop's load indices (`weights[i][j]`
+  instead of `weights[j][i]`) was caught immediately by the real compiled
+  binary's checksum assert, then reverted.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

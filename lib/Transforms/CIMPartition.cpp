@@ -130,11 +130,21 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
   /// Rewrite one candidate, or explain why it was left alone.
   void partition(linalg::LinalgOp op, const ::cim::TargetSpec &spec, int64_t tileRows,
                  int64_t tileCols, MLIRContext *ctx) {
+    // cim.mvm indexes W[n][k] (output-major), exactly what
+    // linalg.matmul_transpose_b's B operand already is. A plain
+    // linalg.matmul's B is [K x N] -- ONNX's own layout -- so it is
+    // accepted too, transposed into a fresh [N x K] buffer below (once,
+    // at weight-staging time, the same place padding already happens),
+    // rather than refused the way it used to be. Anything else (a
+    // convolution, batched matmul, ...) is still refused: those need
+    // their own lowering, not a layout fix.
     auto transposeB = llvm::dyn_cast<linalg::MatmulTransposeBOp>(op.getOperation());
-    if (!transposeB) {
-      op->emitWarning("cim-partition only lowers linalg.matmul_transpose_b "
-                      "(weights in output-major [N x K] layout, matching "
-                      "cim.mvm); leaving this candidate unoffloaded");
+    auto plainMatmul = llvm::dyn_cast<linalg::MatmulOp>(op.getOperation());
+    if (!transposeB && !plainMatmul) {
+      op->emitWarning("cim-partition only lowers linalg.matmul and "
+                      "linalg.matmul_transpose_b (weights in [K x N] or "
+                      "output-major [N x K] layout, matching cim.mvm); "
+                      "leaving this candidate unoffloaded");
       return;
     }
     if (!op.hasPureBufferSemantics()) {
@@ -159,9 +169,14 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
 
     const int64_t m = actType.getShape()[0];
     const int64_t k = actType.getShape()[1];
-    const int64_t n = weightType.getShape()[0];
+    // matmul_transpose_b's B is [N, K] (shape[0] == N); a plain matmul's B
+    // is [K, N] (shape[1] == N) -- ONNX's own, untransposed layout.
+    const int64_t n = plainMatmul ? weightType.getShape()[1]
+                                  : weightType.getShape()[0];
+    const int64_t weightK =
+        plainMatmul ? weightType.getShape()[0] : weightType.getShape()[1];
 
-    if (weightType.getShape()[1] != k || outType.getShape()[1] != n) {
+    if (weightK != k || outType.getShape()[1] != n) {
       op->emitWarning("cim-partition: inconsistent matmul shapes; leaving this "
                       "candidate unoffloaded");
       return;
@@ -196,6 +211,41 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
     Type weightElem = weightType.getElementType();
     (void)i8;
     (void)i32;
+
+    // A plain linalg.matmul's weight is [K, N] -- ONNX's own layout, and
+    // the transpose of what cim.mvm wants. Transpose it into a fresh
+    // [N, K] buffer, ONCE, here -- the same place padding already happens
+    // for a ragged edge below -- so every line after this keeps treating
+    // `weights` uniformly as cim.mvm's own output-major layout regardless
+    // of which linalg op this candidate came from. Plain scf.for +
+    // memref.load/store, deliberately not a linalg buffer op: the padding
+    // logic two blocks below already uses linalg.fill on memrefs, and no
+    // real-target-e2e binary has ever exercised THAT through a real
+    // compiled build (every shipped real-target shape is an exact tile
+    // multiple, so `needsPadding` there is always false in practice) --
+    // scf.for is the one loop-emitting primitive this pass already knows
+    // lowers correctly through the real --convert-to-llvm pipeline (the
+    // M > 1 batching loop above uses it), so the new real-target-e2e
+    // coverage a plain-matmul candidate gets tests THIS code, not an
+    // unrelated, still-open gap.
+    if (plainMatmul) {
+      auto transposedType = MemRefType::get({n, k}, weightElem);
+      Value transposed = builder.create<memref::AllocOp>(loc, transposedType);
+      Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+      Value cn = builder.create<arith::ConstantIndexOp>(loc, n);
+      Value ck = builder.create<arith::ConstantIndexOp>(loc, k);
+      Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+      auto outer = builder.create<scf::ForOp>(loc, c0, cn, c1);
+      OpBuilder outerBody = OpBuilder::atBlockBegin(outer.getBody());
+      Value i = outer.getInductionVar(); // 0 .. N
+      auto inner = outerBody.create<scf::ForOp>(loc, c0, ck, c1);
+      OpBuilder innerBody = OpBuilder::atBlockBegin(inner.getBody());
+      Value j = inner.getInductionVar(); // 0 .. K
+      // weights[j][i] (the plain [K, N] operand) -> transposed[i][j].
+      Value v = innerBody.create<memref::LoadOp>(loc, weights, ValueRange{j, i});
+      innerBody.create<memref::StoreOp>(loc, v, transposed, ValueRange{i, j});
+      weights = transposed;
+    }
 
     // Device handle.
     auto deviceType = DeviceType::get(ctx, spec.name);

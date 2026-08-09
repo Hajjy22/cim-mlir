@@ -174,14 +174,35 @@ memref.global "private" constant @weights_multi : memref<512x256xi8> = dense<1>
 // Weights in [K x N] layout do not match cim.mvm's output-major convention.
 // Lowering them anyway would program transposed tiles and produce wrong
 // numbers, so the candidate is left alone.
-// CHECK-LABEL: func.func @plain_matmul_layout_is_left_alone
-func.func @plain_matmul_layout_is_left_alone(%act: memref<1x256xi8>, %out: memref<1x512xi32>) {
+// A plain linalg.matmul (weights in ONNX's own [K, N] layout) used to be
+// refused outright; it is now ACCEPTED, transposed into a fresh [N, K]
+// buffer via a real scf.for this pass generates itself, the same
+// treatment linalg.matmul_transpose_b's own weight already gets used
+// as-is (docs/roadmap.md's M4 entry).
+// CHECK-LABEL: func.func @plain_matmul_is_transposed_and_tiled
+func.func @plain_matmul_is_transposed_and_tiled(%act: memref<1x256xi8>, %out: memref<1x512xi32>) {
   %w = memref.get_global @weights_kn : memref<256x512xi8>
-  // expected-warning @+2 {{output-major}}
-  // CHECK: linalg.matmul
+  // The transpose: a fresh [N, K] = [512, 256] buffer, filled by a real
+  // doubly-nested scf.for copying weights[k][n] into transposed[n][k].
+  // CHECK: %[[TRANS:.*]] = memref.alloc() : memref<512x256xi8>
+  // CHECK: scf.for
+  // CHECK: scf.for
+  // CHECK: memref.load
+  // CHECK: memref.store %{{.*}}, %[[TRANS]]
+
+  // Then tiled exactly like a matmul_transpose_b candidate would be:
+  // 512 / 256 = 2 N-blocks against erbium-8t's 256x256 tiles, 256 / 256 =
+  // 1 K-block each, so no cim.reduce_partial.
+  // CHECK: cim.device_open
+  // CHECK: cim.tile_alloc {{.*}} {id = 0 : i64}
+  // CHECK: cim.program
+  // CHECK: cim.mvm
+  // CHECK-NOT: cim.reduce_partial
+  // CHECK: cim.tile_alloc {{.*}} {id = 1 : i64}
+  // CHECK: cim.program
+  // CHECK: cim.mvm
   linalg.matmul ins(%act, %w : memref<1x256xi8>, memref<256x512xi8>)
                 outs(%out : memref<1x512xi32>)
-  // CHECK-NOT: cim.program
   return
 }
 memref.global "private" constant @weights_kn : memref<256x512xi8> = dense<1>
