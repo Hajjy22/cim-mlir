@@ -842,44 +842,58 @@ LogicalResult Interpreter::runRequantize(RequantizeOp op) {
   if (!(scale > 0.0))
     return op.emitError("cim.requantize scale must be positive, got ")
            << scale;
-  const int64_t zeroPoint = static_cast<int32_t>(op.getZeroPoint());
-  const uint32_t effectiveBits = op.getEffectiveBits();
-  // RequantizeOp::verify() already enforces 0 < effective_bits <= the result
-  // element width, so the shift below is always in range. The clamp models
-  // the readout path this op stands for (an analog ADC's real resolution,
-  // or a digital requantizer's narrower accumulator) -- the *signed* range
-  // that many bits can hold, regardless of whether the result element type
-  // is nominally wider than effective_bits.
-  const int64_t clampMin = -(static_cast<int64_t>(1) << (effectiveBits - 1));
-  const int64_t clampMax = (static_cast<int64_t>(1) << (effectiveBits - 1)) - 1;
 
-  std::vector<uint8_t> outBytes(static_cast<size_t>(count) * outElemBytes);
-  const unsigned inBits = inElem.getWidth();
-  for (int64_t i = 0; i < count; ++i) {
-    uint64_t raw = 0;
-    std::memcpy(&raw, srcBytes.data() + i * src.elemBytes, src.elemBytes);
-    // Sign-extend from the input's actual bit width (little-endian, as read
-    // by gather/readElement throughout this file).
-    int64_t value = static_cast<int64_t>(raw);
-    if (inBits < 64) {
-      const uint64_t signBit = static_cast<uint64_t>(1) << (inBits - 1);
-      value = static_cast<int64_t>((raw ^ signBit) - signBit);
-    }
-    // quantized = zero_point + round(value / scale), round-half-away-from-
-    // zero -- the one rounding mode that treats positive and negative
-    // accumulator values symmetrically, which matters because cim's i32
-    // accumulator is signed. Then clamp to what effective_bits can hold:
-    // that clamp is this op's whole point on a sub-8-bit target (spec
-    // Sec. 5.3), not a defensive afterthought.
-    const double scaled = static_cast<double>(value) / scale;
-    int64_t quantized = zeroPoint + static_cast<int64_t>(std::llround(scaled));
-    quantized = std::clamp(quantized, clampMin, clampMax);
+  // Route through cimrt_requantize -- the same device-side call cim.program
+  // and cim.mvm already go through -- rather than recomputing the
+  // round/clamp arithmetic here in host code a second time. Two reasons:
+  // (1) cim.requantize's cost (costs.requantize in the target file) is only
+  // ever charged inside cimrt_requantize's own accounting
+  // (dev->cost.recordRequantize()), so a host-side reimplementation here
+  // would silently execute cim.requantize for free, the same class of gap
+  // this file already avoids for cim.program/cim.mvm; and (2) it is the one
+  // real implementation of the arithmetic instead of a second copy that has
+  // to be kept bit-for-bit in sync with simulator.cpp's by hand.
+  cimrt_device *dev = devices.empty() ? nullptr : devices.begin()->second;
+  if (!dev)
+    return op.emitError(
+        "cim.requantize has no open device to run cimrt_requantize against "
+        "(cim.requantize's only producer, cim.mvm, always requires one, so "
+        "this indicates malformed IR)");
 
-    const uint64_t bits = static_cast<uint64_t>(quantized);
-    std::memcpy(outBytes.data() + i * outElemBytes, &bits, outElemBytes);
+  cimrt_buffer *inBuf = nullptr;
+  if (cimrt_alloc(dev, srcBytes.size(), CIMRT_SPACE_NEAR, &inBuf) != CIMRT_OK)
+    return op.emitError(
+        "failed to allocate a staging buffer for the requantize input");
+  if (cimrt_write(inBuf, 0, srcBytes.data(), srcBytes.size()) != CIMRT_OK) {
+    cimrt_free(inBuf);
+    return op.emitError("failed to stage the requantize input");
   }
 
-  cimrt_device *dev = devices.empty() ? nullptr : devices.begin()->second;
+  const size_t outByteSize = static_cast<size_t>(count) * outElemBytes;
+  cimrt_buffer *outBuf = nullptr;
+  if (cimrt_alloc(dev, outByteSize, CIMRT_SPACE_NEAR, &outBuf) != CIMRT_OK) {
+    cimrt_free(inBuf);
+    return op.emitError("failed to allocate the requantize output buffer");
+  }
+
+  const cimrt_status status = cimrt_requantize(
+      dev, inBuf, outBuf, static_cast<size_t>(count), inElem.getWidth(),
+      outElem.getWidth(), static_cast<float>(scale),
+      static_cast<int32_t>(op.getZeroPoint()), op.getEffectiveBits());
+  cimrt_free(inBuf);
+  if (status != CIMRT_OK) {
+    cimrt_free(outBuf);
+    return op.emitError("cimrt_requantize failed: ")
+           << cimrt_status_string(status);
+  }
+
+  std::vector<uint8_t> outBytes(outByteSize);
+  const cimrt_status read = cimrt_read(outBuf, 0, outBytes.data(), outByteSize);
+  cimrt_free(outBuf);
+  if (read != CIMRT_OK)
+    return op.emitError("failed to read the requantize result: ")
+           << cimrt_status_string(read);
+
   auto alloc = makeAllocation(resultType, outBytes.size(), dev);
   if (!alloc)
     return op.emitError("failed to allocate the requantize result");
@@ -1032,6 +1046,7 @@ LogicalResult Interpreter::run(ModuleOp mod, StringRef entryName) {
     if (cimrt_profile_stop(devices.begin()->second, &profile) == CIMRT_OK) {
       out << "cimrt_profile programs=" << profile.programs_issued
           << " mvms=" << profile.mvms_issued
+          << " requantizes=" << profile.requantizes_issued
           << " bytes=" << profile.bytes_transferred << "\n";
     }
   }
