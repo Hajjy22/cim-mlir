@@ -1,0 +1,229 @@
+"""MLIR text emission for the ONNX front end.
+
+Deliberately free of any `onnx` dependency: this module turns plain numpy
+arrays into MLIR text, so it can be imported -- and tested -- in a build
+that has no model-reading libraries installed at all. `onnx_import.py` is
+the only place that knows what a model file is.
+
+THE IR SHAPE HERE IS NOT FREE TO VARY. It must stay byte-identical, for
+the single-layer case, to `build_module()` in
+test/python/test_numerical_differential.py, which is in turn the same
+shape as `buildModule()` in test/mlir/pipeline_e2e_test.cpp. That shape is
+the one the entire eight-pass pipeline is tested against, and two details
+of it look redundant and are not:
+
+  * The activation is staged through `memref.alloc` + `memref.copy` rather
+    than used straight from its global. cim-detect counts constant
+    operands and requires exactly ONE (lib/Transforms/CIMDetect.cpp,
+    `isWeightOperand`): a matmul of two constants has nothing to make
+    resident, so it is not a CIM candidate at all. Using the global
+    directly makes the whole module silently fail to offload -- no error,
+    just no cim.program anywhere.
+  * Weights are output-major [N x K], not [K x N]. That is `cim.mvm`'s
+    convention, and what `cimrt_mvm` in runtime/src/simulator/simulator.cpp
+    actually indexes: out[r] = sum_c W[r*cols + c] * act[c].
+
+test/python/test_onnx_frontend.py pins the first property by comparing
+this module's output against `build_module` byte for byte.
+"""
+
+import numpy as np
+
+# MLIR symbol names are [A-Za-z_$.][A-Za-z0-9_$.]* -- ONNX tensor names are
+# not, and routinely contain '/', ':' and '-'.
+_SAFE_FIRST = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$.")
+_SAFE_REST = _SAFE_FIRST | set("0123456789")
+
+
+def sanitize_symbol(name, taken):
+    """An MLIR-legal symbol for `name`, unique against everything in `taken`.
+
+    `taken` is mutated. Uniqueness is the point, not prettiness: two
+    distinct ONNX tensors that sanitize to the same string would end up
+    sharing one `memref.global`, so two layers would silently compute
+    against the same weights. The IR would verify and the numbers would be
+    wrong -- exactly the failure mode this project refuses -- so a
+    collision gets a numeric suffix rather than a warning.
+    """
+    # Every position is sanitized against the same (wider) alphabet, and a
+    # leading character that is legal-but-not-legal-first is PREFIXED
+    # rather than replaced. Replacing it would silently discard
+    # information -- '0abc' and '9abc' would both become '_abc' and then
+    # need the collision suffix to tell them apart, which is a worse name
+    # for no reason.
+    base = "".join(ch if ch in _SAFE_REST else "_" for ch in name) or "_"
+    if base[0] not in _SAFE_FIRST:
+        base = "_" + base
+
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    taken.add(candidate)
+    return candidate
+
+
+def _dense_2d(arr):
+    """A 2-D dense<> literal body, without the enclosing `dense<...>`."""
+    rows = ", ".join(
+        "[" + ", ".join(str(int(v)) for v in row) + "]" for row in arr)
+    return f"[{rows}]"
+
+
+def emit_module(weight, activation, weight_sym="w", act_sym="a", header=""):
+    """A self-contained module computing `activation @ weight.T`.
+
+    `weight` is [N, K] int8 -- ALREADY TRANSPOSED into cim.mvm's
+    output-major convention. This function does not transpose: the ONNX
+    -> output-major flip happens once, at a named boundary in
+    onnx_import.py, so exactly one place in the front end can get it
+    wrong and exactly one test has to guard it.
+
+    `activation` is a length-K int8 vector.
+
+    With the default symbol names and no header this returns text
+    byte-identical to test/python/test_numerical_differential.py's
+    `build_module()`.
+    """
+    weight = np.asarray(weight)
+    activation = np.asarray(activation)
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be 2-D [N, K], got shape {weight.shape}")
+    if activation.ndim != 1:
+        raise ValueError(
+            f"activation must be 1-D [K], got shape {activation.shape}")
+
+    n, k = weight.shape
+    if activation.shape[0] != k:
+        raise ValueError(
+            f"activation length {activation.shape[0]} does not match the "
+            f"weight's K of {k}")
+
+    rows = _dense_2d(weight)
+    acts = ", ".join(str(int(v)) for v in activation)
+    return f"""\
+{header}memref.global "private" constant @{weight_sym} : memref<{n}x{k}xi8> = dense<{rows}>
+memref.global "private" constant @{act_sym} : memref<1x{k}xi8> = dense<[[{acts}]]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {{
+  %w = memref.get_global @{weight_sym} : memref<{n}x{k}xi8>
+  %aInit = memref.get_global @{act_sym} : memref<1x{k}xi8>
+  %a = memref.alloc() : memref<1x{k}xi8>
+  memref.copy %aInit, %a : memref<1x{k}xi8> to memref<1x{k}xi8>
+  %out = memref.alloc() : memref<1x{n}xi32>
+  linalg.matmul_transpose_b ins(%a, %w : memref<1x{k}xi8>, memref<{n}x{k}xi8>)
+    outs(%out : memref<1x{n}xi32>)
+  %u = memref.cast %out : memref<1x{n}xi32> to memref<*xi32>
+  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+  memref.dealloc %a : memref<1x{k}xi8>
+  memref.dealloc %out : memref<1x{n}xi32>
+  return
+}}
+"""
+
+
+def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
+                      header=""):
+    """A chain of matmuls, each layer's accumulator bridged into the next
+    via a real `cim.requantize` -- int8 in, int32 accumulator out, narrowed
+    back to int8 before it becomes the next layer's activation.
+
+    Why this is safe to compare against an UNQUANTIZED ONNX oracle,
+    despite requantize normally being the thing that introduces modeled
+    precision loss (see onnx_import.py's module docstring and
+    test_onnx_frontend.py's header on why the differential otherwise
+    avoids cim-legalize-precision entirely): with `scale=1.0` there is
+    nothing to round -- the accumulator is already an integer, so
+    round(v / 1.0) == v exactly, and round-half-to-even (ONNX
+    QuantizeLinear) cannot diverge from round-half-away-from-zero
+    (cim.requantize) when there is never a tie to break. Both sides then
+    saturate to the same [-128, 127]. So `cim.requantize(scale=1.0,
+    zero_point=0, effective_bits=8)` computes bit-for-bit the same
+    function as ONNX's `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+    zero_point=0)` pair, which is the only inter-layer pattern
+    onnx_import.py accepts.
+
+    This was verified by hand against a real cim-opt/cim-run round trip
+    (--cim-detect --cim-partition --cim-placement, no
+    cim-legalize-precision) before this function was written: a 2-layer
+    chain's compiled output matched `np.clip(layer0_output, -128,
+    127).astype(np.int8)` fed into layer 1, exactly.
+
+    `weights` is a list of already-transposed [N_i, K_i] int8 arrays, with
+    K_i == N_(i-1) for i > 0. `activation` is a length-K_0 int8 vector.
+    `weight_syms`, if given, must have one entry per layer.
+    """
+    weights = [np.asarray(w) for w in weights]
+    activation = np.asarray(activation)
+    if not weights:
+        raise ValueError("emit_chain_module needs at least one layer")
+    if weight_syms is None:
+        weight_syms = [f"w{i}" for i in range(len(weights))]
+    if len(weight_syms) != len(weights):
+        raise ValueError("weight_syms must have one entry per layer")
+
+    for i, w in enumerate(weights):
+        if w.ndim != 2:
+            raise ValueError(f"layer {i}'s weight must be 2-D [N, K], got "
+                             f"shape {w.shape}")
+    for i in range(1, len(weights)):
+        if weights[i].shape[1] != weights[i - 1].shape[0]:
+            raise ValueError(
+                f"layer {i}'s K ({weights[i].shape[1]}) does not match "
+                f"layer {i - 1}'s N ({weights[i - 1].shape[0]})")
+    if activation.ndim != 1 or activation.shape[0] != weights[0].shape[1]:
+        raise ValueError(
+            f"activation must be 1-D of length {weights[0].shape[1]} "
+            f"(layer 0's K), got shape {activation.shape}")
+
+    lines = [header.rstrip("\n")] if header else []
+    for sym, w in zip(weight_syms, weights):
+        n, k = w.shape
+        lines.append(
+            f'memref.global "private" constant @{sym} : memref<{n}x{k}xi8> '
+            f"= dense<{_dense_2d(w)}>")
+    acts = ", ".join(str(int(v)) for v in activation)
+    k0 = weights[0].shape[1]
+    lines.append(
+        f'memref.global "private" constant @{act_sym} : memref<1x{k0}xi8> '
+        f"= dense<[[{acts}]]>")
+    lines.append("func.func private @cim_print_i32(memref<*xi32>)")
+    lines.append("func.func @main() {")
+
+    for sym, w in zip(weight_syms, weights):
+        n, k = w.shape
+        lines.append(f"  %{sym} = memref.get_global @{sym} : memref<{n}x{k}xi8>")
+    lines.append(f"  %aInit = memref.get_global @{act_sym} : memref<1x{k0}xi8>")
+    lines.append("  %a0 = memref.alloc() : memref<1x" + str(k0) + "xi8>")
+    lines.append(
+        f"  memref.copy %aInit, %a0 : memref<1x{k0}xi8> to memref<1x{k0}xi8>")
+
+    act_val = "%a0"
+    for i, (sym, w) in enumerate(zip(weight_syms, weights)):
+        n, k = w.shape
+        out_val = f"%out{i}"
+        lines.append(f"  {out_val} = memref.alloc() : memref<1x{n}xi32>")
+        lines.append(
+            f"  linalg.matmul_transpose_b ins({act_val}, %{sym} : "
+            f"memref<1x{k}xi8>, memref<{n}x{k}xi8>)")
+        lines.append(f"    outs({out_val} : memref<1x{n}xi32>)")
+        if i < len(weights) - 1:
+            act_val = f"%act{i + 1}"
+            lines.append(
+                f"  {act_val} = cim.requantize {out_val} {{scale = 1.0 : f32, "
+                f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
+            lines.append(f"    : memref<1x{n}xi32> -> memref<1x{n}xi8>")
+
+    last_n = weights[-1].shape[0]
+    lines.append(
+        f"  %u = memref.cast %out{len(weights) - 1} : memref<1x{last_n}xi32> "
+        f"to memref<*xi32>")
+    lines.append("  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()")
+    lines.append(f"  memref.dealloc %a0 : memref<1x{k0}xi8>")
+    lines.append(
+        f"  memref.dealloc %out{len(weights) - 1} : memref<1x{last_n}xi32>")
+    lines.append("  return")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)

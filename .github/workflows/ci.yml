@@ -200,7 +200,9 @@ jobs:
             llvm-18-dev libmlir-18-dev mlir-18-tools
 
       - name: Install Python dependencies
-        run: pip install -r test/python/requirements.txt
+        run: |
+          pip install -r test/python/requirements.txt
+          pip install -r test/python/requirements-onnx.txt
 
       - name: Configure
         run: |
@@ -234,6 +236,7 @@ jobs:
             llvm-18-dev libmlir-18-dev mlir-18-tools
           pip install lit gcovr
           pip install -r test/python/requirements.txt
+          pip install -r test/python/requirements-onnx.txt
 
       # A clean build directory is not optional: stale .gcda files from a
       # different binary layout make gcov emit silently wrong numbers rather

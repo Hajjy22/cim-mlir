@@ -1,0 +1,23 @@
+# Dependencies for the ONNX front-end tests (test/python/test_onnx_*.py).
+#
+# Split out from requirements.txt so that `pytest test/python` still runs
+# the target-reader and numpy differentials after a minimal install --
+# the ONNX tests skip cleanly when these are absent, matching the rule
+# that the Python suites are an additional oracle rather than the gate.
+#
+# onnx carries the oracle these tests actually compare against:
+# onnx.reference.ReferenceEvaluator is the specification's own reference
+# implementation, written by the people who write the spec. That is the
+# same property conftest.py names as the only one that makes a
+# differential test worth running, and it is why this is not PyTorch --
+# torch is ~800MB and is a *producer* of ONNX rather than the spec's
+# reference implementation, so it would be both heavier and a weaker
+# oracle.
+onnx>=1.13
+
+# A second, independent oracle: a production engine rather than the
+# reference implementation, so agreement between the two is a stronger
+# statement than either alone. Its quantized kernels are registered per
+# dtype pair, so int8 x int8 support is a property of the installed
+# build -- the tests treat a failure here as "skip", never as a failure.
+onnxruntime>=1.16

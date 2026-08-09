@@ -143,8 +143,16 @@ that pin it).
 
 ## Still to come
 
-- ONNX ingestion, so the shapes come from a real model file rather than
-  being generated (spec M2).
-- Numerical correctness against a PyTorch reference alongside these counts
-  (spec Sec. 10) — needs the compiler pipeline to actually emit runnable
-  artifacts.
+- **ONNX ingestion (spec M2) is closed for a single layer.**
+  `python/cim_frontend` reads an ONNX `MatMulInteger` model and
+  `test/python/test_onnx_frontend.py` checks the compiled result against
+  ONNX's own reference implementation (`onnx.reference`, not PyTorch —
+  see that file's header for why). **Chained layers are also imported now**
+  (`test/python/test_onnx_frontend_chain.py`) — a graph of `MatMulInteger`
+  nodes bridged by `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+  zero_point=0)`, which is exactly the `mlp-3layer` shape: multiple weight
+  matrices competing for one tile budget. Still generated rather than
+  sourced from a checked-in file here: a `.onnx` reproducing this table's
+  `mlp-3layer` shape verbatim would make that row directly checkable
+  against a real model file rather than only against the front end's own
+  test fixtures.

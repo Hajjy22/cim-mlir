@@ -3,7 +3,12 @@
 Milestones from the v0.1 spec (Section 13). Each has a public artifact —
 nothing counts until it is public.
 
-**Current state.** M0, M1 and M3 are done. All eight lowering passes are real,
+**Current state.** M0, M1, M2 and M3 are done. A `.onnx` file now compiles and runs:
+`python/cim_frontend` reads an INT8 `MatMulInteger` model and emits the MLIR the
+pipeline consumes, and the result is checked for exact int32 equality against
+ONNX's own reference implementation (`docs/roadmap.md` M2's last box, closed).
+Before that, every numerical claim this project made started from MLIR this
+repository had written itself. All eight lowering passes are real,
 though the last one covers a deliberately scoped slice (see below):
 `cim-detect` annotates eligible matmuls, `cim-partition` lowers them
 into per-tile `cim.program`/`cim.mvm` with partial-sum reduction and explicit
@@ -574,9 +579,62 @@ wrong.
   happy path. Still not part of the main gate or CI (same reasoning as
   before: a linker and target triple this suite should not require to
   configure), but no longer only documented in a file header either.
-- [ ] End-to-end: an ONNX INT8 matmul compiles and produces numerically
-  correct output vs. PyTorch. Nothing yet connects the compiled IR to the
-  simulator, so there is no numerical check across the whole pipeline.
+- [x] End-to-end: an ONNX INT8 matmul compiles and produces numerically
+  correct output, checked against ONNX's own reference implementation
+  rather than PyTorch. `python/cim_frontend` reads a `.onnx` file and
+  emits the MLIR the pipeline consumes; `test/python/test_onnx_frontend.py`
+  runs the model through `cim-opt` and `cim-run` and requires exact int32
+  equality with the oracle.
+
+  **The oracle is `onnx.reference.ReferenceEvaluator`, not PyTorch**, and
+  that is an improvement on this box's original wording rather than a
+  shortcut. It ships inside the `onnx` package, and it is the
+  specification's own reference implementation -- written by the people
+  who write the spec, which is precisely the "written by other people for
+  other reasons" property `test/python/conftest.py` names as the only one
+  that makes a differential test worth running. PyTorch is ~800MB in CI
+  and is a *producer* of ONNX rather than the spec's reference, so it
+  would be both heavier and a weaker oracle. `onnxruntime` runs as a
+  second, independent oracle where it is installed; the two must agree
+  with each other as well as with us.
+
+  What is verified: a graph of one `MatMulInteger` with a constant int8
+  weight, swept over shapes that tile a target's geometry in N, in K, in
+  both, and past the tile count. What is refused, loudly and with a test
+  each: every other ONNX op, non-constant weights, `uint8` operands,
+  non-zero zero points, more than one output row, symbolic shapes. The
+  importer never emits a module it is unsure about -- silently dropping an
+  unrecognized op would produce something that compiles, runs, and
+  computes a different function than the model.
+
+  One thing this deliberately does NOT do: run the full eight-pass chain.
+  `cim-legalize-precision` inserts a `cim.requantize` clamping every
+  accumulator to `precision.output_effective_bits` (8 in every shipped
+  target), which is a real modeled hardware effect and means the result
+  stops matching an unquantized oracle as soon as an accumulator leaves
+  `[-128, 127]`. The differential runs detect/partition/placement, and
+  says so at the point it builds the pipeline string.
+
+  **Chained layers are also closed**: a graph of two or more `MatMulInteger`
+  nodes, bridged by `Cast(to=float32) -> QuantizeLinear(scale=1.0,
+  zero_point=0)` between consecutive layers, lowers to a real
+  `cim.requantize(scale=1.0, zero_point=0, effective_bits=8)` sitting
+  between the two compiled matmuls. Scale 1.0 is why this still matches an
+  unquantized oracle exactly rather than only approximately: it makes
+  ONNX's round-half-to-even and `cim.requantize`'s round-half-away-from-zero
+  compute the same thing, because rounding an already-integer accumulator
+  has no fractional part to round differently -- there is no tie for the
+  two modes to disagree about. Verified by hand against a real
+  `cim-opt`/`cim-run` round trip before the graph-walking code that finds
+  this pattern was written. This is what makes the `mlp-3layer` benchmark
+  shape reachable from a real model file, and it is the first time
+  `cim-placement`'s reuse *across* layers (not just within one) is
+  exercised from a model file rather than a generated one.
+
+  Still not accepted: `Gemm`, `QLinearMatMul`, and quantize/dequantize
+  graphs that are not this exact bridge (any other scale, or an absent
+  zero point, reintroduces the rounding-mode risk the scale=1.0
+  restriction exists to avoid).
 
 ### Known limits of cim-partition
 Each of the remaining two is refused with a warning and the `linalg` op left
