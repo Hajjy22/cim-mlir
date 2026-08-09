@@ -37,6 +37,13 @@ if(NOT EXISTS "${LLVM_TOOLS_BINARY_DIR}/mlir-translate")
 endif()
 
 set(CIM_REAL_TARGET_YAML "${PROJECT_SOURCE_DIR}/test/targets/tiny-4x4.yaml")
+# Same 2-tiles-of-4x4 geometry as tiny-4x4.yaml, differing only in
+# persistence (persistent: false, persistence: volatile) -- see that
+# file's own header. Used by exactly one variant pair below, to prove the
+# whole chain down to a real compiled binary does not silently assume a
+# nonvolatile target (docs/roadmap.md's M4 "prove retargetability" entry).
+set(CIM_DIGITAL_CIM_TARGET_YAML
+    "${PROJECT_SOURCE_DIR}/test/targets/tiny-digital-cim.yaml")
 
 # Runs the whole cim-opt -> mlir-opt -> mlir-translate -> clang chain for
 # one variant (NAME, e.g. "correct" or "requantize-wrong"), configured from
@@ -46,6 +53,15 @@ set(CIM_REAL_TARGET_YAML "${PROJECT_SOURCE_DIR}/test/targets/tiny-4x4.yaml")
 # how they are built -- only in EXPECTED_VALUE, which is the whole point
 # of having two per template.
 function(add_real_target_object NAME TEMPLATE EXPECTED_VALUE)
+  # A 4th, optional argument overrides which target file this one variant
+  # is built against; every existing call site omits it and gets the
+  # default. set() with no PARENT_SCOPE only shadows CIM_REAL_TARGET_YAML
+  # for the rest of THIS function call, so the override never leaks to
+  # variants added after it.
+  if(ARGC GREATER 3)
+    set(CIM_REAL_TARGET_YAML ${ARGV3})
+  endif()
+
   set(configured_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.mlir")
   set(lowered_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.lowered.mlir")
   set(llvm_dialect_src "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.llvmdialect.mlir")
@@ -154,11 +170,23 @@ add_real_target_object(multi-k-tile-wrong check-multi-k-tile.mlir.in 999)
 # correct per-row result.
 add_real_target_object(loop-correct check-loop.mlir.in 951)
 add_real_target_object(loop-wrong check-loop.mlir.in 999)
+# Same template and expected value as correct/wrong above (identity
+# weight, out[0] == act[0] == 7 by construction) -- the only thing this
+# pair changes is the target file, to a volatile one. If cim-partition,
+# cim-lower-to-target, or cimrt_program ever silently assumed
+# `persistent: true`, this is what would catch it: not a FileCheck
+# assertion on an attribute, a real binary that must still compute the
+# right answer.
+add_real_target_object(digital-cim-volatile-correct check.mlir.in 7
+                       ${CIM_DIGITAL_CIM_TARGET_YAML})
+add_real_target_object(digital-cim-volatile-wrong check.mlir.in 999
+                       ${CIM_DIGITAL_CIM_TARGET_YAML})
 
 foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
                 multi-k-tile-correct multi-k-tile-wrong
-                loop-correct loop-wrong)
+                loop-correct loop-wrong
+                digital-cim-volatile-correct digital-cim-volatile-wrong)
   add_executable(real-target-e2e-${variant}
     driver.c
     ${CIM_REAL_TARGET_OBJ_${variant}})
@@ -195,6 +223,11 @@ add_test(NAME real-target-e2e-multi-k-tile-correct-value-passes
 add_test(NAME real-target-e2e-loop-correct-value-passes
          COMMAND real-target-e2e-loop-correct
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+# check.mlir.in hand-writes cim.device_open with the absolute path
+# substituted in directly (see correct/wrong above), so this needs no
+# WORKING_DIRECTORY -- same reasoning as correct-value-passes itself.
+add_test(NAME real-target-e2e-digital-cim-volatile-correct-value-passes
+         COMMAND real-target-e2e-digital-cim-volatile-correct)
 
 # The whole point of these two variants: cf.assert firing inside the
 # compiled binary is a real SIGABRT, not just a nonzero exit -- and CTest's
@@ -218,3 +251,5 @@ add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
 add_test(NAME real-target-e2e-loop-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-loop-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME real-target-e2e-digital-cim-volatile-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-digital-cim-volatile-wrong>")

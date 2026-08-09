@@ -370,9 +370,12 @@ cimrt_status cimrt_requantize(cimrt_device *dev, const cimrt_buffer *input,
     std::memcpy(output->data.data() + i * outBytes, &bits, outBytes);
   }
 
-  // Not accounted in the cost model yet -- see cimrt.h's own doc comment
-  // on this function for why (no requantize/readout entry in the target
-  // schema's costs: section; real M4 work, not a silent omission).
+  // Not accounted by cimrt_profile_stop yet -- see cimrt.h's own doc
+  // comment on this function: the target schema's costs.requantize entry
+  // exists now and cim-cost-report charges for it at compile time, but
+  // this runtime entry point does not yet feed a call here into
+  // cimrt_profile_stop's own counters (real M4 work, not a silent
+  // omission).
   return CIMRT_OK;
 }
 

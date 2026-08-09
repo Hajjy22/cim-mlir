@@ -29,6 +29,9 @@ costs:
   mvm:
     latency_ns: 900
     energy_pj: 5200
+  requantize:
+    latency_ns: 60        # narrowing the i32 accumulator, lossless digital
+    energy_pj: 200
   transfer:
     bandwidth_gbps: 6.4  # DIMM-local bandwidth is the bottleneck resource
     energy_pj_per_byte: 6.8

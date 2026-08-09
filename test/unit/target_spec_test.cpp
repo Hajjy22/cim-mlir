@@ -69,6 +69,9 @@ costs:
   mvm:
     latency_ns: 10
     energy_pj: 20
+  requantize:
+    latency_ns: 5
+    energy_pj: 10
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5
@@ -110,6 +113,8 @@ CIM_TEST(erbium_8t_parses_with_the_documented_values) {
   CIM_EXPECT(spec.costs.program.energyPj == 480000.0);
   CIM_EXPECT(spec.costs.mvm.latencyNs == 640.0);
   CIM_EXPECT(spec.costs.mvm.energyPj == 3100.0);
+  CIM_EXPECT(spec.costs.requantize.latencyNs == 50.0);
+  CIM_EXPECT(spec.costs.requantize.energyPj == 150.0);
   CIM_EXPECT(spec.costs.transfer.bandwidthGbps == 12.8);
   CIM_EXPECT(spec.costs.transfer.energyPjPerByte == 4.2);
   // The non-volatile advantage: zero standby leakage.
@@ -212,6 +217,20 @@ CIM_TEST(missing_required_field_is_rejected) {
   std::string error;
   CIM_EXPECT(!parseText(doc, spec, &error));
   CIM_EXPECT(error.find("tiles.rows") != std::string::npos);
+}
+
+CIM_TEST(missing_requantize_cost_is_rejected) {
+  // costs.requantize is required, the same as program/mvm/transfer: leaving
+  // it unset would silently cost every cim.requantize at zero rather than
+  // say so, which is exactly the "confidently wrong number" this parser's
+  // required-field discipline exists to prevent.
+  std::string doc = validDocument();
+  const std::string from = "  requantize:\n    latency_ns: 5\n    energy_pj: 10\n";
+  doc.erase(doc.find(from), from.size());
+  TargetSpec spec;
+  std::string error;
+  CIM_EXPECT(!parseText(doc, spec, &error));
+  CIM_EXPECT(error.find("costs.requantize") != std::string::npos);
 }
 
 CIM_TEST(unknown_target_class_is_rejected) {

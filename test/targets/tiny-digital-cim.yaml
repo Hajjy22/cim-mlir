@@ -1,0 +1,61 @@
+# test/targets/tiny-digital-cim.yaml
+#
+# A deliberately tiny device, for tests only -- not a model of real
+# hardware. Same 2-tiles-of-4x4 geometry as test/targets/tiny-4x4.yaml, so
+# every template and test pattern written against that file's shape works
+# here unchanged; the two differ ONLY in the axis this file exists to
+# exercise: persistence.
+#
+# Every compiler-level test target before this one (tiny-4x4.yaml,
+# tiny-4x4-8t.yaml, tiny-4x4-4bit.yaml) declares `persistent: true`, which
+# means `persistent: false` -- the value cim-partition writes onto every
+# cim.program's own `persistent` attribute (lib/Transforms/CIMPartition.cpp)
+# -- had never been checked as false anywhere past the parser: not in a
+# single FileCheck test, not in a single real-target-e2e binary. This file
+# is what closes that (docs/roadmap.md's M4 "prove retargetability" entry),
+# mirroring targets/generic-digital-cim.yaml's own real characteristics
+# (volatile SRAM, no nonvolatile advantage, double-buffering capable) at
+# reduced scale, the same relationship tiny-4x4.yaml has to erbium-8t.yaml.
+#
+# The cost numbers are round and arbitrary, same as tiny-4x4.yaml's.
+
+name: tiny-digital-cim
+description: Tiny synthetic volatile target for tests (2 tiles of 4x4)
+version: 0.1
+
+class: digital_cim
+
+provenance: estimated  # synthetic; not measured, not modelling any real part
+
+tiles:
+  count: 2
+  rows: 4
+  cols: 4
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: false
+  persistence: volatile
+
+costs:
+  program:
+    latency_ns: 800
+    energy_pj: 20000
+  mvm:
+    latency_ns: 120
+    energy_pj: 900
+  requantize:
+    latency_ns: 20
+    energy_pj: 80
+  transfer:
+    bandwidth_gbps: 1.0
+    energy_pj_per_byte: 1.0
+  standby_leakage_uw_per_tile: 4.5   # volatile SRAM leaks; no nonvolatile advantage
+
+precision:
+  output_effective_bits: 8
+
+capabilities:
+  double_buffer_program: true
+  partial_sum_in_place: true
+  autonomous_control: false

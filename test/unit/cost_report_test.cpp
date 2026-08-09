@@ -57,10 +57,11 @@ CIM_TEST(cost_report_json_has_the_fields_consumers_read) {
   // bench/plots/plot_residency.py reads these by name; renaming one without
   // updating the plot script would break silently at plot time.
   for (const char *field :
-       {"\"label\"", "\"persistent\"", "\"programs\"", "\"mvms\"", "\"reuses\"",
-        "\"install_programs\"", "\"install_energy_pj\"",
-        "\"install_latency_ns\"", "\"steady_state_programs_per_inference\"",
-        "\"total_energy_pj\"", "\"total_latency_ns\""})
+       {"\"label\"", "\"persistent\"", "\"programs\"", "\"mvms\"",
+        "\"requantizes\"", "\"reuses\"", "\"install_programs\"",
+        "\"install_energy_pj\"", "\"install_latency_ns\"",
+        "\"steady_state_programs_per_inference\"", "\"total_energy_pj\"",
+        "\"total_latency_ns\""})
     CIM_EXPECT_CONTAINS(json, field);
 
   CIM_EXPECT_CONTAINS(json, "\"label\": \"mm-fit\"");
@@ -112,6 +113,18 @@ CIM_TEST(cost_report_text_labels_a_volatile_target_differently) {
       computeCostReport(volatileSpec, r, wl.stepsPerInference), "vol");
 
   CIM_EXPECT_CONTAINS(text, "per power-on, volatile");
+}
+
+CIM_TEST(compute_cost_report_leaves_requantize_at_zero) {
+  // computeCostReport (this engine) models weight-programming amortization
+  // from a PlacementResult alone, which has no notion of a cim.requantize
+  // step -- cim-cost-report (lib/Transforms/CIMCostReport.cpp), which walks
+  // real compiled IR, is what actually charges for it. Pinning the zero
+  // here documents that boundary rather than leaving it implicit.
+  const CostReport report = fitReport(1000);
+  CIM_EXPECT_EQ(report.requantizes, uint64_t(0));
+  CIM_EXPECT(report.requantizeEnergyPj == 0.0);
+  CIM_EXPECT(report.requantizeLatencyNs == 0.0);
 }
 
 CIM_TEST(cost_report_energy_units_scale_sensibly) {

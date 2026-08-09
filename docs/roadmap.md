@@ -157,7 +157,7 @@ wrong.
   verifiers actually reject bad IR (10 tests, all passing).
 - [x] CI builds and tests both layers.
 
-## M2 — Functional correctness (in progress)
+## M2 — Functional correctness (complete)
 - [x] Pass 1 `cim-detect`: annotates INT8 matmuls with a constant weight
   operand. Rejects f32, activation-times-activation, narrow accumulators,
   and convolution (`test/Transforms/cim-detect.mlir`).
@@ -673,7 +673,7 @@ none of cim-partition's other scratch buffers (the staged activation, each
 block's host output copy) are freed either -- buffer lifetime management is
 out of scope for v0.1 across the board, not just here.
 
-## M3 — The placement pass
+## M3 — The placement pass (complete)
 - [x] Belady/MIN eviction implemented and unit-tested, with LRU and FIFO
   baselines to compare against (`lib/Placement/`, `test/unit/placement_test.cpp`).
   Every schedule is replayed through `validatePlacement()` before its
@@ -841,9 +841,30 @@ out of scope for v0.1 across the board, not just here.
   cross at least once.
 
 ## M4 — Second target and generalization (future)
-- `targets/generic-digital-cim.yaml` already exists as a placeholder
+- ~~`targets/generic-digital-cim.yaml` already exists as a placeholder
   second-class target file; needs real (or better-estimated) numbers and a
-  working lowering to prove retargetability.
+  working lowering to prove retargetability.~~ -- **closed, on the axis
+  that actually mattered**: the `class:` enum itself turned out to already
+  be incidentally covered (`test/targets/tiny-4x4.yaml` and
+  `generic-digital-cim.yaml` are both `digital_cim`;
+  `tiny-4x4-4bit.yaml` is `analog_cim`), and grepping every pass confirms
+  none of them branch on `TargetClass` at all -- so the class tag was
+  never actually a retargetability risk. The real, previously-untested
+  axis was **persistence**: every compiler-level test target before this
+  declared `persistent: true`, so `cim.program`'s own `persistent`
+  attribute (set directly from `spec.tiles.persistent` in
+  `lib/Transforms/CIMPartition.cpp`) had never been checked as `false`
+  past the parser. `test/targets/tiny-digital-cim.yaml` mirrors
+  `generic-digital-cim.yaml`'s real characteristics (volatile SRAM, no
+  nonvolatile advantage, double-buffering capable) at tiny-4x4.yaml's
+  scale, and now backs both a structural check
+  (`test/Transforms/cim-partition-volatile.mlir`) and a full
+  `real-target-e2e` binary pair
+  (`digital-cim-volatile-correct`/`-wrong`) -- the strongest form of this
+  proof, since it is a real compiled binary computing the right answer,
+  not an attribute assertion. `targets/generic-digital-cim.yaml` itself
+  still carries placeholder, estimated numbers (unchanged by this) --
+  "better-estimated" real numbers for it remains open.
 - `cim-legalize-precision` with real `effective_bits` modeling.
 - ~~`cim-lower-to-target` beyond its v0.1 straight-line slice: lowering a
   cim op inside an `scf.for`~~ -- **closed**: one level of loop nesting
@@ -861,11 +882,35 @@ out of scope for v0.1 across the board, not just here.
   remains open, and is a real, separate design question (a loop-carried
   device value would need to survive as part of the loop's own iter_args
   type list, which this hoisting design says nothing about).
-- `cimrt_requantize` accounted in the cost model: the target schema's
+- ~~`cimrt_requantize` accounted in the cost model: the target schema's
   `costs:` section needs a requantize/readout entry before
   `cimrt_profile_stop`/`cim-cost-report` can count it (currently zero-cost,
   a known simplification, not a silent omission -- see the Pass 7 entry
-  above).
+  above).~~ -- **closed, on the `cim-cost-report` side**: every shipped
+  target file now declares `costs.requantize.latency_ns`/`energy_pj`
+  (required, same as `program`/`mvm` -- an old file without it is rejected
+  rather than silently charged zero), and `cim-cost-report`
+  (`lib/Transforms/CIMCostReport.cpp`) walks and weights `cim.requantize`
+  sites exactly like `cim.program`/`cim.mvm`, folding the result into
+  `total_energy_pj`/`total_latency_ns`. This was a live gap, not a
+  theoretical one: `cim-legalize-precision` inserts a `cim.requantize`
+  after *every* terminal accumulator regardless of `output_effective_bits`,
+  so any target run through the ordinary detect/partition/placement/
+  schedule/transfers/legalize-precision/cost-report chain already had one
+  silently uncounted (`test/Transforms/cim-pipeline-full.mlir`'s own
+  PRECISION run is the existence proof, now with a `COST-JSON` check
+  reading its cost-report output directly).
+
+  **Still open, the other half of the same gap**: `cimrt_profile_stop`
+  itself (`runtime/src/simulator/simulator.cpp`) does not count
+  `cimrt_requantize` calls, so `test/mlir/cost_report_e2e_test.cpp`'s
+  static-count-vs-runtime-counter differential has nothing on the runtime
+  side to check `cim.requantize`'s weighted count against yet, unlike
+  `programs`/`mvms`. `lib/Placement/CostReport.cpp` (the `cim-bench`
+  engine, which models weight-programming amortization from a
+  `PlacementResult` alone) is deliberately left out of this too -- see
+  that file's own header and `docs/target-format.md`'s units note for why
+  it has no notion of a requantize step at all.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

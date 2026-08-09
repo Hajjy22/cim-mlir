@@ -46,6 +46,9 @@ costs:
   mvm:
     latency_ns: 10
     energy_pj: 20
+  requantize:
+    latency_ns: 5
+    energy_pj: 10
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5
@@ -116,6 +119,8 @@ CIM_TEST(parser_rejects_every_malformed_document) {
        "tiles.weight_dtype"},
       {"missing mvm energy", removed("    energy_pj: 20\n"),
        "costs.mvm.energy_pj"},
+      {"missing requantize latency", removed("    latency_ns: 5\n"),
+       "costs.requantize.latency_ns"},
       {"missing effective bits", removed("  output_effective_bits: 8\n"),
        "precision.output_effective_bits"},
 
