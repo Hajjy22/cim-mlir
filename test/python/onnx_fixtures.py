@@ -59,19 +59,29 @@ def matmul_integer_model(weight, act_name="A", weight_name="W",
     return model
 
 
-def matmul_chain_model(weights, act_name="A", check=True, act_shape=None):
+def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
+                       scales=None):
     """A linear chain of MatMulInteger nodes, each bridged into the next by
     the one pattern python/cim_frontend/onnx_import.py accepts:
-    Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0, int8 out).
+    Cast(to=float32) -> QuantizeLinear(scale, zero_point=0, int8 out).
 
     `weights` is a list of [K_i, N_i] int8 arrays in ONNX's own layout
     (NOT transposed), with K_i == N_(i-1) for i > 0 -- same convention as
     matmul_integer_model, so both fixtures hand the importer the same kind
     of un-transposed input. `act_shape`, like matmul_integer_model's own,
     overrides the declared [1, K_0] activation shape -- e.g. [M, K_0] for
-    a batched (M > 1) chain.
+    a batched (M > 1) chain. `scales`, if given, is a list of
+    `len(weights) - 1` positive floats, one per bridge -- a real,
+    calibrated scale instead of the default 1.0 (see onnx_import.py's own
+    "WHY THIS EXACT BRIDGE" note on what a non-1.0 scale changes).
     """
     weights = [np.asarray(w) for w in weights]
+    if scales is None:
+        scales = [1.0] * (len(weights) - 1)
+    if len(scales) != len(weights) - 1:
+        raise ValueError(
+            f"scales must have one entry per bridge (len(weights) - 1 = "
+            f"{len(weights) - 1}), got {len(scales)}")
     nodes = []
     initializers = []
     cur = act_name
@@ -89,7 +99,7 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None):
             scale_name = f"scale{i}"
             zp_name = f"zp{i}"
             initializers.append(numpy_helper.from_array(
-                np.array(1.0, dtype=np.float32), name=scale_name))
+                np.array(scales[i], dtype=np.float32), name=scale_name))
             initializers.append(numpy_helper.from_array(
                 np.array(0, dtype=np.int8), name=zp_name))
             nodes.append(helper.make_node(

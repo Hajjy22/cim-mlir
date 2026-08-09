@@ -655,18 +655,26 @@ wrong.
   this pattern was written. This is what makes the `mlp-3layer` benchmark
   shape reachable from a real model file, and it is the first time
   `cim-placement`'s reuse *across* layers (not just within one) is
-  exercised from a model file rather than a generated one.
+  exercised from a model file rather than a generated one. Scale 1.0 is
+  no longer the only accepted value -- see M4 below for a real, calibrated
+  scale.
 
   Still not accepted: `Gemm`, `QLinearMatMul`, and quantize/dequantize
-  graphs that are not this exact bridge (any other scale, or an absent
-  zero point, reintroduces the rounding-mode risk the scale=1.0
-  restriction exists to avoid).
+  graphs that are not this exact bridge (an absent zero point, or a
+  non-positive scale). A real, non-1.0 calibrated scale is now accepted
+  -- see M4 below.
 
 ### Known limits of cim-partition
-The remaining one is refused with a warning and the `linalg` op left intact,
-so the module stays correct and is simply not offloaded:
-- Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
-  output-major convention). A plain `linalg.matmul` needs a transpose first.
+Everything genuinely out of v0.1's scope (a convolution, a batched matmul's
+3rd dimension, dynamic shapes) is still refused with a warning and the
+`linalg` op left intact, so the module stays correct and is simply not
+offloaded. Both weight-layout and row-count limits below are now closed:
+
+~~Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
+output-major convention). A plain `linalg.matmul` needs a transpose
+first.~~ -- **closed, M4 below**: a plain `linalg.matmul` (weights in
+`[K x N]`, ONNX's own layout) is now accepted too, transposed into a fresh
+`[N x K]` buffer by this pass itself rather than refused.
 
 ~~Only a single output row: `cim.mvm` is a matrix-vector primitive and the
 v0.1 contract is matrix-vector.~~ -- **closed, M4 below**: a matmul with
@@ -1288,6 +1296,119 @@ out of scope for v0.1 across the board, not just here.
   that file already follows. Mutation-tested: forcing `emit_module`'s `m`
   to a hardcoded `1` was caught immediately, by MLIR's own elements-literal
   shape check before ever reaching a numerical comparison.
+- ~~Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching
+  `cim.mvm`'s output-major convention). A plain `linalg.matmul` needs a
+  transpose first~~ -- **closed**. `cim-partition` now accepts a plain
+  `linalg.matmul` (weights in `[K x N]`, ONNX's own layout) directly,
+  transposing the weight into a fresh `[N x K]` buffer itself -- once, at
+  weight-staging time, the same place ragged-edge padding already happens
+  -- rather than refusing the candidate. The transpose is a genuine,
+  doubly-nested `scf.for` over `memref.load`/`memref.store`, deliberately
+  NOT a `linalg` buffer op (`linalg.transpose`/`linalg.fill`): this pass's
+  own existing padding logic already uses `linalg.fill` on memrefs, and no
+  real-target-e2e binary has ever exercised that through a real compiled
+  build (every shipped real-target shape is an exact tile multiple, so
+  padding's `needsPadding` branch is always false in practice today) --
+  `scf.for` is the one loop-emitting primitive this pass already knew
+  lowered correctly through the real `--convert-to-llvm` pipeline (the
+  M > 1 batching loop above uses it), so the new real-target-e2e coverage
+  a plain-matmul candidate gets tests this new code specifically, rather
+  than incidentally depending on a separate, still-unverified gap.
+
+  The ONNX front end does not directly exercise this path today -- it
+  already transposes the weight itself in Python at import time and always
+  emits `linalg.matmul_transpose_b` (see `onnx_import.py`'s own "THE
+  TRANSPOSE" note) -- so this closes a retargetability gap for a different
+  future front door: `lib/Transforms/CIMDetect.cpp`'s own comment already
+  names "an inline constant (tensor semantics, e.g. from torch-mlir)" as a
+  shape a frontend can produce, and the top-level README names plugging in
+  below IREE/TVM/XLA as this project's own stated position. A frontend
+  that does not pre-transpose no longer needs to.
+
+  Deliberately still out of scope: `linalg.batch_matmul` (a real 3rd batch
+  dimension, not just M-row batching, and materially more machinery) stays
+  refused, matching `cim-detect`'s own documented "detected, then refused
+  with a warning" status for it.
+
+  Verified: `test/Transforms/cim-partition.mlir`'s
+  `plain_matmul_is_transposed_and_tiled` replaces the old
+  `plain_matmul_layout_is_left_alone` refusal test, pinning the generated
+  transpose loop and the tiled `cim.program`/`cim.mvm` sequence that
+  follows it. New real-target-e2e pair `plain-matmul-correct`/`-wrong`
+  (`test/real-target/check-plain-matmul.mlir.in`) uses a deliberately
+  NON-symmetric weight, so a missing or backwards transpose reads entirely
+  different values rather than merely reordered ones -- the same
+  discipline `test_onnx_frontend.py`'s own transpose tests already use.
+  Mutation-tested: swapping the transpose loop's load indices (`weights[i][j]`
+  instead of `weights[j][i]`) was caught immediately by the real compiled
+  binary's checksum assert, then reverted.
+- ~~`scale=1.0`/`zero_point=0` always: v0.1 has no per-layer calibration
+  step anywhere in the pipeline~~ -- **partially closed**. `cim.requantize`
+  and `cimrt_requantize` were already fully scale-generic (proven at
+  `scale=2.0, zp=3, effective_bits=4` in
+  `legalize_precision_e2e_test.cpp`); the only thing standing between that
+  and a real calibrated model was the ONNX chain bridge's own hard-coded
+  `scale == 1.0` refusal. `_validate_bridge` (`onnx_import.py`) now accepts
+  any positive scale, threaded from each `QuantizeLinear` node through
+  `load_matmul_chain`/`import_model` into `emit_chain_module`'s
+  `cim.requantize` text. `zero_point` stays pinned at 0 -- deriving a real
+  zero point from calibration data is a separate, harder problem this
+  change does not touch, which is why "partially".
+
+  This changes what "matches the oracle" means: `scale=1.0` was exact
+  because rounding an already-integer accumulator has no fractional part
+  for round-half-to-even (ONNX) and round-half-away-from-zero
+  (`cim.requantize`) to disagree about. A real scale reintroduces genuine
+  ties, so this is tested as two separate claims rather than one. First,
+  an ODD integer scale makes a tie mathematically impossible (`v / s` at a
+  half-integer requires `s/2` to itself be an integer, which an odd `s`
+  never is), so `test_a_real_calibrated_scale_matches_the_quantized_
+  reference` checks an odd-scale chain against `onnx.reference`'s own
+  fully-quantized evaluation (not an unquantized oracle -- that stopped
+  being valid the moment scale left 1.0) for an exact match, with no
+  hedging. Second, `test_a_real_scale_at_an_exact_rounding_tie_documents_
+  the_known_divergence` hand-constructs a minimal (1x1, 1x1) chain where
+  ONNX and `cim.requantize` provably land on opposite sides of a tie, and
+  asserts the divergence explicitly, by exactly 1 -- documenting the
+  known rounding-mode difference as a modeled hardware fact rather than
+  hiding it, the same way the M2 note above already characterizes
+  `scale=1.0` as a special case rather than the general rule.
+
+  Mutation-tested, and this caught a real test-quality gap, not just the
+  intended one: the first attempt at the odd-scale test used a small
+  scale (3.0) against randomly-generated, full-int8-range weights.
+  Hardcoding the emitter's scale back to `1.0` still passed, because at
+  that weight magnitude every accumulator saturates to the same +-128
+  clamp regardless of which small scale divides it -- the test was
+  checking that saturation matches, not that the scale threads through.
+  Fixed by picking a scale (199) large enough that this fixture's
+  specific accumulators requantize to their exact, unclamped value, and
+  by adding an explicit assertion that the scale=199 and scale=1.0
+  references actually differ for this fixture -- a permanent guard against
+  the same mutation being silently unmasked again by a future change to
+  either the weights or the scale.
+
+  A genuine, unrelated bug was found via this feature's own differential
+  test, not by inspection: `cim-run` segfaulted on the two-layer chain
+  MLIR this scale support emits. AddressSanitizer traced it to
+  `Interpreter.cpp`'s `memref.cast` handler --
+  `memrefs[o.getResult()] = it->second;` -- a classic self-referential
+  `DenseMap` insert: `operator[]` on the left evaluates (and can grow/
+  rehash the table) before the right-hand side `it->second` is read,
+  invalidating `it` first. Triggered by this particular module's
+  allocation count happening to land on a rehash boundary, not by the
+  scale value itself -- a latent bug the interpreter has carried since
+  `memref.cast` support was added, exposed by the first differential test
+  with this exact shape. Fixed by copying the value out to a local
+  before the insert (`MemRefValue` is a `shared_ptr` plus small vectors,
+  cheap to copy). Every other map-write site in `Interpreter.cpp` was
+  audited for the same pattern (`runSubView`, `runLinalgFill`, `runMvm`,
+  `runReducePartial`'s partial-sum loop, `runCimCopy`, `runRequantize`)
+  and confirmed to either write a freshly-constructed value or never read
+  the stale reference again after the write -- this was the only
+  instance. Mutation-tested by reverting the fix and confirming the
+  ASan build reproduces the original heap-use-after-free before
+  restoring it.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

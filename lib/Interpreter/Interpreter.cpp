@@ -1099,7 +1099,15 @@ LogicalResult Interpreter::execute(Operation *op) {
         auto it = memrefs.find(o.getSource());
         if (it == memrefs.end())
           return o.emitError("cast of an unknown buffer");
-        memrefs[o.getResult()] = it->second;
+        // Copy out of the map BEFORE inserting the result: `memrefs[key] =
+        // it->second` would evaluate operator[] first, which can grow/
+        // rehash the table and invalidate `it` (and the reference
+        // `it->second` names) before the assignment's right-hand side is
+        // read -- a real heap-use-after-free this project's own ASan gate
+        // caught, not a hypothetical one. MemRefValue is cheap to copy
+        // (a shared_ptr plus small vectors), so this has no real cost.
+        MemRefValue aliased = it->second;
+        memrefs[o.getResult()] = std::move(aliased);
         return success();
       })
       .Case<memref::DeallocOp>([&](auto) { return success(); })

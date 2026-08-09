@@ -9,24 +9,41 @@ fixed tile budget -- is what the mlp-3layer benchmark shape actually is,
 and it is the first time that shape is reachable from a real model file
 rather than a generated one.
 
-THE BRIDGE, AND WHY IT IS SAFE AGAINST AN UNQUANTIZED ORACLE
+THE BRIDGE, SCALE=1.0, AND A REAL CALIBRATED SCALE
 --------------------------------------------------------------
 Layer i's int32 accumulator has to become layer i+1's int8 activation.
-cim_frontend accepts exactly one way to do that:
-Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0, int8 out),
-which it lowers to a real cim.requantize(scale=1.0, zero_point=0,
-effective_bits=8) sitting between the two matmuls in the emitted MLIR.
+cim_frontend accepts exactly one shape for that:
+Cast(to=float32) -> QuantizeLinear(scale, zero_point=0, int8 out), which
+it lowers to a real cim.requantize(scale, zero_point=0, effective_bits=8)
+sitting between the two matmuls in the emitted MLIR. The scale may be ANY
+positive constant, not just 1.0 -- a real, calibrated per-layer scale,
+the standard shape of a real post-training-quantized multi-layer INT8
+model.
 
-scale=1.0 is not a simplification, it is the reason this stays exact:
-QuantizeLinear rounds half-to-even and cim.requantize rounds
-half-away-from-zero, and those two modes diverge only at a tie -- a value
-ending in exactly .5. With scale=1.0 both sides compute round(v / 1.0) on
-a v that is already an integer (an accumulator), so there is never a
-fractional part and therefore never a tie either side could round
-differently. Both sides then saturate to the same [-128, 127]. This was
+scale=1.0 is not required by the machinery (cim.requantize's own
+arithmetic is scale/zero_point/effective_bits-generic -- see
+test/mlir/legalize_precision_e2e_test.cpp), it is what keeps the compiled
+result exactly matching an UNQUANTIZED ONNX oracle: QuantizeLinear rounds
+half-to-even and cim.requantize rounds half-away-from-zero, and those two
+modes diverge only at a tie -- a value ending in exactly .5. With
+scale=1.0, both sides compute round(v / 1.0) on a v that is already an
+integer (an accumulator), so there is never a fractional part and
+therefore never a tie either side could round differently. This was
 confirmed against a real cim-opt/cim-run round trip by hand before any of
 onnx_import.py's chain-walking code was written (see its own module
 docstring for the exact numbers).
+
+A REAL scale can land exactly on a tie, and at that exact point the two
+rounding modes genuinely, correctly disagree by 1 -- a real
+hardware-fidelity fact about cim.requantize's modeled rounding mode (a
+digital requantizer or ADC readout path), not a bug. So a real-scale
+chain below is checked two different ways: an ODD integer scale can PROVE
+no tie ever occurs (v = scale*(n + 0.5) has no integer solution v when
+scale is odd, since that requires scale/2 to be an integer), so that case
+is checked for exact agreement against onnx.reference's own full
+(quantized) evaluation; and a second, deliberately constructed EVEN-scale
+case names the exact-tie divergence explicitly, rather than letting it
+surface as a mysterious near-miss somewhere else.
 """
 
 import os
@@ -182,18 +199,116 @@ def test_a_wrong_weight_in_a_later_layer_would_actually_be_caught(cim_opt,
     assert np.array_equal(np.asarray(outputs), want)
 
 
+# --- a real, calibrated (non-1.0) bridge scale ------------------------------
+
+def test_a_real_calibrated_scale_matches_the_quantized_reference(cim_opt,
+                                                                  cim_run):
+    # An ODD integer scale makes a rounding tie IMPOSSIBLE: v/scale = n+0.5
+    # for integer v and n requires scale/2 to be an integer too, which an
+    # odd scale never is. So every accumulator this test's random weights
+    # produce is provably rounded identically by cim.requantize
+    # (half-away-from-zero) and QuantizeLinear (half-to-even) -- an exact
+    # match is not luck here, it is guaranteed by the choice of scale.
+    #
+    # Checked against onnx.reference's own FULL evaluation (which runs the
+    # graph's real QuantizeLinear, at this real scale) rather than an
+    # unquantized oracle -- unlike the scale=1.0 tests above, this model's
+    # own reference output IS the quantized one.
+    #
+    # scale=199, not a small value like 3: caught by mutation-testing this
+    # test against a build of emit.py with the scale hardcoded back to
+    # 1.0 -- with a small scale, this fixture's K=4..6, full-int8-range
+    # weights push every accumulator's magnitude into the thousands, so
+    # EVERY tried scale saturates the requantized activation to the same
+    # +-128 clamp and the test passes for the wrong reason (a masked
+    # mutation, not a real check). 199 is chosen large enough that this
+    # fixture's specific (seeded) accumulators requantize to their exact,
+    # unclamped value -- see the explicit divergence-from-scale=1 assertion
+    # below, which is the actual guard against that failure mode recurring.
+    scale = 199.0
+    weights = _chain_weights([(4, 6), (6, 5)], SEED + 7)
+    model = matmul_chain_model(weights, scales=[scale])
+    act = np.random.default_rng(SEED + 8).integers(
+        -127, 128, size=4, dtype=np.int64).astype(np.int8)
+
+    want = onnx_reference_eval(model, act)
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(model, act))
+    assert np.array_equal(np.asarray(outputs), want), (
+        f"compiled output {list(outputs)} != ONNX's own quantized "
+        f"reference {want.tolist()} at scale={scale} -- an odd scale "
+        f"should make this an exact match, never a rounding-tie mismatch")
+
+    # The guard the paragraph above promises: if the importer/emitter ever
+    # regressed to silently hardcoding scale=1.0 (this feature's entire
+    # reason for existing), the compiled output would equal a scale=1.0
+    # reference instead of the real, scale=199 one requested. Prove those
+    # two are actually different for this fixture, so the assertion above
+    # is a genuine check on the calibrated scale and not a coincidence of
+    # both scales saturating to the same clamp.
+    wrong_reference = onnx_reference_eval(
+        matmul_chain_model(weights, scales=[1.0]), act)
+    assert not np.array_equal(want, wrong_reference), (
+        "the scale=199 and scale=1.0 references are identical for this "
+        "fixture, which would make the assertion above pass even if the "
+        "importer silently ignored the calibrated scale -- pick a scale "
+        "or weights where they diverge")
+
+
+def test_a_real_scale_at_an_exact_rounding_tie_documents_the_known_divergence(
+        cim_opt, cim_run):
+    # Deliberately constructed, not random: a single-element K=1, N=1
+    # layer 0 with weight=[[1]] and activation=[1] gives a raw accumulator
+    # of exactly 1. At scale=2.0, 1 / 2.0 = 0.5 EXACTLY -- a genuine tie.
+    # cim.requantize (half-away-from-zero) rounds 0.5 to 1; QuantizeLinear
+    # (half-to-even) rounds 0.5 to 0, since 0 is the nearest even integer.
+    # This is the ONE input shape in this test file where the two engines
+    # are EXPECTED to disagree, by exactly 1 -- named and asserted
+    # explicitly, rather than left to surface as an unexplained failure
+    # somewhere a random seed happens to hit it.
+    scale = 2.0
+    w0 = np.array([[1]], dtype=np.int8)   # K0=1, N0=1
+    w1 = np.array([[1]], dtype=np.int8)   # K1=1, N1=1: pass layer 1's
+                                          # requantized activation through
+                                          # unchanged, so the disagreement
+                                          # is visible in the final output.
+    model = matmul_chain_model([w0, w1], scales=[scale])
+    act = np.array([1], dtype=np.int8)
+
+    onnx_result = onnx_reference_eval(model, act)
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(model, act))
+    compiled_result = np.asarray(outputs)
+
+    assert onnx_result.tolist() == [0], (
+        "fixture assumption broken: expected ONNX's round-half-to-even "
+        "to round the 0.5 tie down to 0")
+    assert compiled_result.tolist() == [1], (
+        "fixture assumption broken: expected cim.requantize's "
+        "round-half-away-from-zero to round the 0.5 tie up to 1")
+    assert compiled_result[0] - onnx_result[0] == 1, (
+        f"the known rounding-tie divergence changed shape: compiled "
+        f"{compiled_result.tolist()} vs ONNX {onnx_result.tolist()} -- "
+        f"expected exactly a +1 difference at this tie, not something "
+        f"else")
+
+
 # --- chain-specific refusals -----------------------------------------------
 
-def test_refuses_a_quantizelinear_with_nonunit_scale():
+def test_refuses_a_non_positive_scale():
+    # A non-unit scale is now accepted (see the tests above) -- only a
+    # genuinely invalid one (non-positive, or not a constant at all) is
+    # still refused. Covers the "prove it doesn't refuse everything"
+    # requirement this file's docstring names for every refusal here.
     weights = _chain_weights(THREE_LAYER_SHAPES, SEED)
     model = matmul_chain_model(weights, check=False)
     for init in model.graph.initializer:
         if init.name == "scale0":
             init.CopyFrom(
                 __import__("onnx").numpy_helper.from_array(
-                    np.array(2.0, dtype=np.float32), name="scale0"))
+                    np.array(-1.0, dtype=np.float32), name="scale0"))
     act = np.ones(THREE_LAYER_SHAPES[0][0], dtype=np.int8)
-    with pytest.raises(Refusal, match="not 1.0"):
+    with pytest.raises(Refusal, match="positive"):
         import_model(model, act)
 
 

@@ -227,7 +227,7 @@ def load_matmul_integer(model):
 
 
 # ---------------------------------------------------------------------------
-# Chained layers: MatMulInteger -> Cast(to=float32) -> QuantizeLinear(1.0, 0)
+# Chained layers: MatMulInteger -> Cast(to=float32) -> QuantizeLinear(scale, 0)
 # -> MatMulInteger -> ...
 #
 # WHY THIS EXACT BRIDGE, AND NOTHING ELSE
@@ -237,30 +237,48 @@ def load_matmul_integer(model):
 # that narrowing wrong is a second, quieter place a wrong answer could
 # hide (the first being the transpose above).
 #
-# Two things have to line up for the compiled result to still match an
-# UNQUANTIZED ONNX oracle, which is what this front end promises:
+# The bridge's scale may be ANY positive constant, not just 1.0 -- a real,
+# calibrated per-layer scale, the standard shape of a real post-training-
+# quantized multi-layer INT8 model. cim.requantize's own arithmetic is
+# already scale/zero_point/effective_bits-generic (test/mlir/
+# legalize_precision_e2e_test.cpp proves it at scale=2.0), so there was
+# never a machinery reason to require 1.0 here -- only a testing-
+# convenience one, explained below.
+#
+# What scale=1.0 specifically buys, and a real scale does not:
 #
 #   1. cim.requantize (what the compiled side actually executes, emitted
 #      by emit.emit_chain_module) rounds half-away-from-zero.
 #      QuantizeLinear (what ONNX defines) rounds half-to-even. Those two
 #      modes diverge exactly at a tie -- a value ending in exactly .5 --
-#      and NOWHERE else. Requiring scale == 1.0 makes both sides compute
+#      and NOWHERE else. With scale == 1.0, both sides compute
 #      round(v / 1.0) on a v that is ALREADY an integer, so there is never
-#      a fractional part and therefore never a tie to break differently.
-#   2. Both sides then saturate to the same range: cim.requantize with
-#      effective_bits=8 clamps to [-128, 127], and QuantizeLinear with an
-#      explicit int8 zero_point saturates to the same range by definition.
+#      a fractional part and therefore never a tie to break differently:
+#      the compiled result matches an UNQUANTIZED ONNX oracle exactly. A
+#      real scale can land exactly on a tie -- a real, hardware-fidelity
+#      fact about cim.requantize's modeled rounding mode (a digital
+#      requantizer or ADC readout path), not a bug -- so a real-scale
+#      chain is compared against onnx.reference's own full (quantized)
+#      evaluation instead, in test_onnx_frontend_chain.py, which documents
+#      the exact-tie divergence explicitly rather than treating it as a
+#      mysterious near-miss.
+#   2. Both sides then saturate to the same range regardless of scale:
+#      cim.requantize with effective_bits=8 clamps to [-128, 127], and
+#      QuantizeLinear with an explicit int8 zero_point saturates to the
+#      same range by definition.
 #
-# This was checked against a real cim-opt/cim-run round trip (--cim-detect
-# --cim-partition --cim-placement, deliberately NOT
+# scale=1.0's exactness was checked against a real cim-opt/cim-run round
+# trip (--cim-detect --cim-partition --cim-placement, deliberately NOT
 # --cim-legalize-precision -- see this file's own module docstring) before
 # any of this graph-walking code was written: a hand-written 2-layer
 # chain's compiled output matched `np.clip(layer0_output, -128,
 # 127).astype(np.int8)` fed into layer 1, exactly.
 #
-# Any other scale, any other rounding path, or zero_point left absent
-# (which makes QuantizeLinear's own output dtype ambiguous -- uint8 by
-# default in the opsets this checks) is refused rather than approximated.
+# Any other rounding path, a non-constant scale, or zero_point left absent
+# or non-zero (which either makes QuantizeLinear's own output dtype
+# ambiguous -- uint8 by default in the opsets this checks -- or asks for
+# an asymmetric zero point this dialect cannot express) is still refused
+# rather than approximated.
 # ---------------------------------------------------------------------------
 
 _CAST_TO_FLOAT = 1  # TensorProto.FLOAT
@@ -278,31 +296,44 @@ def _initializer_array(graph, name):
 def _validate_bridge(graph, producer, consumers, expected_source, act_name,
                      where):
     """`act_name` must be `expected_source` narrowed by exactly one
-    Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0 int8) pair,
-    consumed by nothing else along the way. Raises Refusal otherwise.
+    Cast(to=float32) -> QuantizeLinear(scale=<positive>, zero_point=0 int8)
+    pair, consumed by nothing else along the way. Returns the bridge's
+    scale (a Python float) on success; raises Refusal otherwise.
+
+    Any positive scale is accepted, not just 1.0: cim.requantize's
+    arithmetic is scale/zero_point/effective_bits-generic already (see
+    test/mlir/legalize_precision_e2e_test.cpp), so refusing a real,
+    calibrated scale here would be refusing a caller-supplied number this
+    project's own compiler has no trouble with. What a non-1.0 scale
+    changes is exactness against an UNQUANTIZED oracle: QuantizeLinear
+    (round-half-to-even) and cim.requantize (round-half-away-from-zero)
+    can only diverge at a rounding tie, and scale=1.0 is what makes
+    `v / scale` always already an integer, i.e. never a tie to round
+    differently. A real scale can land exactly on a tie -- a real,
+    hardware-fidelity fact about cim.requantize's modeled rounding mode,
+    not a bug -- so the emitted module compiled from a real scale should
+    be compared against onnx.reference's own full quantized evaluation,
+    not an unquantized one. See emit.emit_chain_module's own docstring.
     """
     quant_node = producer.get(act_name)
     if quant_node is None or quant_node.op_type != "QuantizeLinear":
         raise Refusal(
             f"the activation operand '{act_name}' is not produced by "
             f"QuantizeLinear. Layers in a chain may only be bridged by "
-            f"Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0) -- "
-            f"anything else risks a rounding-mode or overflow divergence "
-            f"from what actually gets compiled. Nothing emitted.",
-            where=where)
+            f"Cast(to=float32) -> QuantizeLinear(scale=<positive>, "
+            f"zero_point=0) -- anything else risks a rounding-mode or "
+            f"overflow divergence from what actually gets compiled. "
+            f"Nothing emitted.", where=where)
 
     scale_name = quant_node.input[1] if len(quant_node.input) > 1 else ""
     scale_arr = _initializer_array(graph, scale_name)
-    if scale_arr is None or float(np.asarray(scale_arr).reshape(-1)[0]) != 1.0:
+    scale = None if scale_arr is None else float(np.asarray(scale_arr).reshape(-1)[0])
+    if scale is None or not (scale > 0.0):
         raise Refusal(
             f"QuantizeLinear '{quant_node.name}' has scale "
             f"{scale_arr.tolist() if scale_arr is not None else '<non-constant>'}"
-            f", not 1.0. A non-unit scale reintroduces the rounding-mode "
-            f"divergence between QuantizeLinear (round-half-to-even) and "
-            f"cim.requantize (round-half-away-from-zero) that scale=1.0 "
-            f"exists to avoid -- with scale=1.0 the value being rounded is "
-            f"already an integer, so there is never a tie to round "
-            f"differently. Nothing emitted.", where=where)
+            f"; a bridge scale must be a positive constant. Nothing "
+            f"emitted.", where=where)
 
     zp_name = quant_node.input[2] if len(quant_node.input) > 2 else ""
     zp_arr = _initializer_array(graph, zp_name)
@@ -362,12 +393,16 @@ def _validate_bridge(graph, producer, consumers, expected_source, act_name,
                 f"once needs buffer-liveness reasoning it does not do. "
                 f"Nothing emitted.", where=where)
 
+    return scale
+
 
 def load_matmul_chain(model):
     """Two or more MatMulInteger nodes bridged as described above.
 
-    Returns (nodes, weights, first_activation_name), where `weights[i]` is
-    layer i's weight ALREADY transposed to cim.mvm's [N, K] convention.
+    Returns (nodes, weights, first_activation_name, scales), where
+    `weights[i]` is layer i's weight ALREADY transposed to cim.mvm's
+    [N, K] convention, and `scales[i]` is bridge i's real, positive
+    QuantizeLinear scale (see _validate_bridge's own docstring).
     """
     from onnx import numpy_helper
 
@@ -411,6 +446,7 @@ def load_matmul_chain(model):
                 consumers.setdefault(inp, []).append(n)
 
     weights = []
+    scales = []
     first_act_name = None
     for i, node in enumerate(matmul_nodes):
         where = f"node '{node.name or ACCEPTED_OP}' (layer {i})"
@@ -471,8 +507,9 @@ def load_matmul_chain(model):
                     f"is {list(weight.shape)}. Nothing emitted.", where=where)
             first_act_name = a_name
         else:
-            _validate_bridge(graph, producer, consumers,
-                             matmul_nodes[i - 1].output[0], a_name, where)
+            scales.append(_validate_bridge(
+                graph, producer, consumers, matmul_nodes[i - 1].output[0],
+                a_name, where))
             if weight.shape[0] != weights[-1].shape[0]:
                 raise Refusal(
                     f"layer {i}'s K ({weight.shape[0]}) does not match layer "
@@ -482,7 +519,7 @@ def load_matmul_chain(model):
         # THE transpose, same as the single-layer path.
         weights.append(np.ascontiguousarray(weight.T))
 
-    return matmul_nodes, weights, first_act_name
+    return matmul_nodes, weights, first_act_name, scales
 
 
 def provenance(model_path, model_bytes, activation_source):
@@ -552,7 +589,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
                        if n.op_type == ACCEPTED_OP)
 
     if matmul_count >= 2:
-        nodes, weights, first_act_name = load_matmul_chain(model)
+        nodes, weights, first_act_name, scales = load_matmul_chain(model)
         activation = _validate_activation(activation, weights[0].shape[1])
 
         taken = set()
@@ -561,7 +598,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
 
         header = provenance(model_path, model_bytes, activation_source)
         return emit_chain_module(weights, activation, weight_syms=weight_syms,
-                                 act_sym=act_sym, header=header)
+                                 act_sym=act_sym, header=header,
+                                 scales=scales)
 
     node, weight, act_name = load_matmul_integer(model)
     activation = _validate_activation(activation, weight.shape[1])

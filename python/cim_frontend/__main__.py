@@ -79,7 +79,7 @@ def main(argv=None):
             matmul_count = sum(1 for n in model.graph.node
                               if n.op_type == ACCEPTED_OP)
             if matmul_count >= 2:
-                _, weights, _ = load_matmul_chain(model)
+                _, weights, _, _ = load_matmul_chain(model)
                 k0 = weights[0].shape[1]
             else:
                 _, weight, _ = load_matmul_integer(model)
