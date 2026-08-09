@@ -67,6 +67,26 @@ def test_emitter_requires_the_weight_already_transposed():
         emit_module(np.zeros(4, dtype=np.int8), act)
 
 
+def test_emitter_supports_a_batched_m_greater_than_1_activation():
+    # M > 1 is additive: cim-partition now tiles a real multi-row matmul
+    # itself (docs/roadmap.md's M4 entry), so the emitter no longer needs
+    # to refuse anything but a genuine rank/shape mismatch. See
+    # test_onnx_frontend.py's own differential for the numerical proof;
+    # this only pins the emitted shape.
+    w = np.zeros((4, 8), dtype=np.int8)
+    act = np.zeros((3, 8), dtype=np.int8)
+    text = emit_module(w, act)
+    assert "memref<3x8xi8>" in text
+    assert "memref<3x4xi32>" in text
+
+
+def test_emitter_still_rejects_an_activation_with_the_wrong_k_when_batched():
+    w = np.zeros((4, 8), dtype=np.int8)
+    act = np.zeros((3, 5), dtype=np.int8)
+    with pytest.raises(ValueError, match="does not match"):
+        emit_module(w, act)
+
+
 def test_symbol_sanitization_makes_onnx_names_legal():
     taken = set()
     assert sanitize_symbol("layer1/MatMul:0", taken) == "layer1_MatMul_0"

@@ -59,7 +59,7 @@ def matmul_integer_model(weight, act_name="A", weight_name="W",
     return model
 
 
-def matmul_chain_model(weights, act_name="A", check=True):
+def matmul_chain_model(weights, act_name="A", check=True, act_shape=None):
     """A linear chain of MatMulInteger nodes, each bridged into the next by
     the one pattern python/cim_frontend/onnx_import.py accepts:
     Cast(to=float32) -> QuantizeLinear(scale=1.0, zero_point=0, int8 out).
@@ -67,7 +67,9 @@ def matmul_chain_model(weights, act_name="A", check=True):
     `weights` is a list of [K_i, N_i] int8 arrays in ONNX's own layout
     (NOT transposed), with K_i == N_(i-1) for i > 0 -- same convention as
     matmul_integer_model, so both fixtures hand the importer the same kind
-    of un-transposed input.
+    of un-transposed input. `act_shape`, like matmul_integer_model's own,
+    overrides the declared [1, K_0] activation shape -- e.g. [M, K_0] for
+    a batched (M > 1) chain.
     """
     weights = [np.asarray(w) for w in weights]
     nodes = []
@@ -100,11 +102,13 @@ def matmul_chain_model(weights, act_name="A", check=True):
 
     k0 = weights[0].shape[0]
     n_last = weights[-1].shape[1]
+    m = (act_shape or [1, k0])[0]
     graph = helper.make_graph(
         nodes, "chain",
-        [helper.make_tensor_value_info(act_name, TensorProto.INT8, [1, k0])],
+        [helper.make_tensor_value_info(act_name, TensorProto.INT8,
+                                       act_shape or [1, k0])],
         [helper.make_tensor_value_info(f"Y{len(weights) - 1}",
-                                       TensorProto.INT32, [1, n_last])],
+                                       TensorProto.INT32, [m, n_last])],
         initializers,
     )
     model = helper.make_model(
@@ -112,6 +116,15 @@ def matmul_chain_model(weights, act_name="A", check=True):
     if check:
         onnx.checker.check_model(model)
     return model
+
+
+def _as_activation_feed(activation):
+    """[K] promotes to [1, K]; a real [M, K] batch passes through as-is --
+    same normalization `cim_frontend.onnx_import._validate_activation`
+    applies, so both oracles and the compiled pipeline see the same shape
+    for the same input."""
+    activation = np.asarray(activation, dtype=np.int8)
+    return activation.reshape(1, -1) if activation.ndim == 1 else activation
 
 
 def onnx_reference_eval(model, activation, act_name="A"):
@@ -125,7 +138,7 @@ def onnx_reference_eval(model, activation, act_name="A"):
     """
     from onnx.reference import ReferenceEvaluator
 
-    feeds = {act_name: np.asarray(activation, dtype=np.int8).reshape(1, -1)}
+    feeds = {act_name: _as_activation_feed(activation)}
     return np.asarray(ReferenceEvaluator(model).run(None, feeds)[0]).ravel()
 
 
@@ -141,5 +154,5 @@ def onnxruntime_eval(model, activation, act_name="A"):
 
     session = ort.InferenceSession(model.SerializeToString(),
                                    providers=["CPUExecutionProvider"])
-    feeds = {act_name: np.asarray(activation, dtype=np.int8).reshape(1, -1)}
+    feeds = {act_name: _as_activation_feed(activation)}
     return np.asarray(session.run(None, feeds)[0]).ravel()

@@ -76,7 +76,8 @@ satisfy:
 - the weight operand (B) is a constant initializer,
 - both operands are `int8` (not `uint8`),
 - zero points are absent or zero,
-- operands are rank 2 and the activation has a single row,
+- operands are rank 2 (the activation may have one row or many — see
+  "Batching" below),
 - every dimension is a known constant,
 - the model targets opset 10 or later.
 
@@ -110,6 +111,21 @@ saturate to the same `[-128, 127]`. This was checked against a real
 finds this pattern was written — see `onnx_import.py`'s own module
 docstring for the exact numbers.
 
+## Batching (M > 1)
+
+The activation may have more than one row. `cim-partition` tiles a real
+M-row matmul the same way it tiles a single row: the same weight
+programming, activation staging, `cim.mvm`, and write-back, generated
+once and wrapped in a real `scf.for` it builds itself over the rows,
+rather than refused (`docs/roadmap.md`'s M4 entry). This threads through a
+chain unchanged too — `cim.requantize` never changes shape, so a batched
+layer 0 makes every later layer genuinely `[M, ...]` as well, with no
+per-layer bookkeeping in this front end.
+
+Pass a real `[M, K]` array via `--input` (a `.npy` or `.json` file) to use
+it; `--input-random` still synthesizes a single row only, since it exists
+for quick smoke-testing rather than as the batching entry point.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the
@@ -128,7 +144,6 @@ is worse than a refusal.
 | two constant operands | `cim-detect` needs exactly one, and silently declines otherwise |
 | `uint8` operands | `cim.mvm` and the simulator are signed; reading a `uint8` 200 as `int8` computes with −56 |
 | non-zero zero points | needs a per-output bias term the dialect cannot express |
-| more than one output row | v0.1 is a matrix-*vector* contract |
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
 | a chain bridge with scale ≠ 1.0 | reintroduces the rounding-mode divergence described below |
 | a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
@@ -174,13 +189,15 @@ any accumulator leaves `[-128, 127]`.
   the emitted IR shape against the pipeline's own module builder.
 - `test/python/test_onnx_frontend.py` — the end-to-end differential
   against `onnx.reference` (the spec's own implementation) and
-  `onnxruntime`.
+  `onnxruntime`, including a batched (M > 1) case with independently
+  sampled per-row values.
 - `test/python/test_onnx_frontend_refusals.py` — one test per refusal
   above, plus a case proving it does not refuse everything.
 - `test/python/test_onnx_frontend_chain.py` — the multi-layer counterpart:
-  a 3-layer differential (the `mlp-3layer` shape), a case that actually
-  saturates the bridge's clamp, placement invariance across layers, and
-  the chain-specific refusals (bad scale, bad zero point, fan-out).
+  a 3-layer differential (the `mlp-3layer` shape), a batched 3-layer
+  differential, a case that actually saturates the bridge's clamp,
+  placement invariance across layers, and the chain-specific refusals (bad
+  scale, bad zero point, fan-out).
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 
