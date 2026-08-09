@@ -143,8 +143,16 @@ that pin it).
 
 ## Still to come
 
-- ONNX ingestion, so the shapes come from a real model file rather than
-  being generated (spec M2).
-- Numerical correctness against a PyTorch reference alongside these counts
-  (spec Sec. 10) — needs the compiler pipeline to actually emit runnable
-  artifacts.
+- **ONNX ingestion (spec M2) is closed for a single layer.**
+  `python/cim_frontend` reads an ONNX `MatMulInteger` model and
+  `test/python/test_onnx_frontend.py` checks the compiled result against
+  ONNX's own reference implementation (`onnx.reference`, not PyTorch —
+  see that file's header for why). Still generated rather than sourced
+  from a real model file here: a checked-in `.onnx` reproducing one of
+  these shapes (`mlp-3layer` is the natural first target, since it is
+  exactly the multi-layer case the front end does not yet import — see
+  below).
+- **Chained layers.** The front end imports a single `MatMulInteger`
+  today. A chain of them is what would make the `mlp-3layer` row in this
+  table reachable from a real model file, and is what would exercise
+  `cim-placement`'s reuse *across* layers rather than only within one.

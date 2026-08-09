@@ -306,6 +306,18 @@ cmake --build build --target check-cim-opt   # dialect FileCheck suite
 
 If you have your own LLVM/MLIR build, point `MLIR_DIR` and `LLVM_DIR` at it instead.
 
+A real `.onnx` file compiles and runs through that same `cim-opt`/`cim-run`, via
+the ONNX front end in [`python/`](python/README.md):
+
+```sh
+pip install -r test/python/requirements-onnx.txt
+PYTHONPATH=python python3 -m cim_frontend model.onnx --input activations.npy \
+  | ./build/bin/cim-opt - --cim-detect \
+      --cim-partition=target-yaml=targets/erbium-8t.yaml \
+      --cim-placement=target-yaml=targets/erbium-8t.yaml \
+  | ./build/bin/cim-run --target-yaml=targets/erbium-8t.yaml --profile -
+```
+
 ## Verification
 
 A compiler that produces plausible-looking IR is worth nothing; the question is
@@ -317,7 +329,7 @@ and CI runs all of them.
 | `ctest` — `cim-unit-tests` | Placement, cost model, target reader and `cimrt` error branches. Includes a property test asserting Belady placement equals exhaustive-search optimal over ~4700 instances, and a mutation test of the schedule validator. |
 | `ctest` — `cim-mlir-tests` | Runs the real pass pipeline and then *executes* the emitted IR through the interpreter and `cimrt`, comparing against a C++ reference. Shapes matching is not arithmetic matching. |
 | `check-cim-opt` (lit/FileCheck) | Dialect round-tripping, verifier rejections, pass output structure, and `cim-run`'s refusals. |
-| `pytest test/python` | Differentials against oracles written by other people: the target reader vs PyYAML, and the compiled pipeline vs numpy. |
+| `pytest test/python` | Differentials against oracles written by other people: the target reader vs PyYAML, the compiled pipeline vs numpy, and a real `.onnx` model vs ONNX's own reference implementation (`onnx.reference`, plus `onnxruntime` where installed). |
 | ASan + UBSan, valgrind | Memory and undefined-behaviour bugs that produce correct answers today. |
 | gcovr, clang-tidy, cppcheck | Untested branches and defects no test was written for. |
 
@@ -325,7 +337,8 @@ and CI runs all of them.
 # Everything, on a build configured as above
 ctest --test-dir build --output-on-failure
 cmake --build build --target check-cim-opt
-pip install -r test/python/requirements.txt && pytest test/python
+pip install -r test/python/requirements.txt -r test/python/requirements-onnx.txt
+pytest test/python
 
 # Instrumented builds (all default OFF; a release build is unaffected)
 cmake -S . -B build-asan -G Ninja -DCIM_SANITIZER=address,undefined \
@@ -360,12 +373,13 @@ runtime/                 cimrt C API: functional simulator, hardware backends
 tools/cim-bench/         benchmark harness   (core, no MLIR)
 tools/cim-opt/           the MLIR opt driver (MLIR)
 tools/cim-run/           runs a compiled module and prints its results (MLIR)
+python/cim_frontend/     ONNX front end: .onnx -> pipeline MLIR (no MLIR dep)
 test/unit/               unit tests for the core
 test/mlir/               numerical end-to-end test: compile, execute, compare
 test/Dialect/            FileCheck tests for every dialect op
 test/Transforms/         FileCheck tests for the lowering passes
 test/Run/                FileCheck tests for cim-run
-test/python/             differentials against PyYAML and numpy
+test/python/             differentials against PyYAML, numpy, and ONNX's own reference impl
 targets/                 hardware target description YAML files
 docs/                    abstraction model, dialect reference, target format, roadmap
 bench/                   benchmark workloads and plot scripts
