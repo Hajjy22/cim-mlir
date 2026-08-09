@@ -50,9 +50,17 @@ memref.global "private" constant @weights_4x8 : memref<4x8xi8> = dense<1>
 // MINIMAL: call @cimrt_program
 // MINIMAL: call @cimrt_copy_range(%{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}}, %[[ACTBUF]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}})
 // MINIMAL: call @cimrt_mvm
-// Two partial sums reduced into one -- this session's first fix.
-// MINIMAL: call @cimrt_reduce_add
-// MINIMAL-NOT: call @cimrt_reduce_add
+// Two partial sums reduced into one -- this session's first fix. tiny-4x4
+// .yaml declares capabilities.partial_sum_in_place: true, so this is the
+// in-place path: one accumulator (copied from the first partial), one
+// cimrt_reduce_add_inplace call, never cimrt_reduce_add -- and the CHECK
+// below spells the full identifier with its opening paren specifically so
+// it cannot silently match @cimrt_reduce_add_inplace's own call as a
+// substring (that mistake is exactly what made this file's checks pass
+// vacuously against the wrong function before this comment was added).
+// MINIMAL: call @cimrt_copy(
+// MINIMAL: call @cimrt_reduce_add_inplace(
+// MINIMAL-NOT: call @cimrt_reduce_add(
 // MINIMAL-NOT: cim.device_open
 // MINIMAL-NOT: cim.tile_alloc
 // MINIMAL-NOT: cim.program
@@ -73,8 +81,10 @@ memref.global "private" constant @weights_4x8 : memref<4x8xi8> = dense<1>
 // FULL: call @cimrt_program
 // FULL: call @cimrt_copy_range
 // FULL: call @cimrt_mvm
-// FULL: call @cimrt_reduce_add
+// FULL: call @cimrt_copy(
+// FULL: call @cimrt_reduce_add_inplace(
 // FULL: call @cimrt_requantize
+// FULL-NOT: call @cimrt_reduce_add(
 // FULL-NOT: cim.device_open
 // FULL-NOT: cim.tile_alloc
 // FULL-NOT: cim.program

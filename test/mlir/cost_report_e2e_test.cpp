@@ -45,19 +45,21 @@ using namespace mlir;
 
 namespace {
 
-std::string tinyTarget() {
-  static std::string path = [] {
-    for (const char *candidate :
-         {"test/targets/tiny-4x4.yaml", "../test/targets/tiny-4x4.yaml",
-          "../../test/targets/tiny-4x4.yaml"}) {
-      if (FILE *f = std::fopen(candidate, "r")) {
-        std::fclose(f);
-        return std::string(candidate);
-      }
+/// `name` defaults to tiny-4x4.yaml; pass "tiny-4x4-no-inplace.yaml" for
+/// the one test that specifically wants capabilities.partial_sum_in_place:
+/// false (every other tiny test target, including the default, declares
+/// it true).
+std::string tinyTarget(const char *name = "tiny-4x4.yaml") {
+  const std::string prefixed[] = {std::string("test/targets/") + name,
+                                  std::string("../test/targets/") + name,
+                                  std::string("../../test/targets/") + name};
+  for (const std::string &candidate : prefixed) {
+    if (FILE *f = std::fopen(candidate.c_str(), "r")) {
+      std::fclose(f);
+      return candidate;
     }
-    return std::string("test/targets/tiny-4x4.yaml");
-  }();
-  return path;
+  }
+  return prefixed[0];
 }
 
 /// Runtime counters actually parsed out of `cim-run --profile`'s
@@ -105,8 +107,10 @@ struct Differential {
 };
 
 Differential runDifferential(const std::string &source, bool withPlacement,
-                             bool withLegalizePrecision = false) {
+                             bool withLegalizePrecision = false,
+                             const char *targetName = "tiny-4x4.yaml") {
   Differential result;
+  const std::string target = tinyTarget(targetName);
 
   DialectRegistry registry;
   registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
@@ -124,14 +128,14 @@ Differential runDifferential(const std::string &source, bool withPlacement,
   PassManager pm(&context);
   pm.addPass(cim::createCIMDetectPass());
   auto partition = cim::createCIMPartitionPass();
-  if (failed(partition->initializeOptions("target-yaml=" + tinyTarget()))) {
+  if (failed(partition->initializeOptions("target-yaml=" + target))) {
     result.error = "failed to set cim-partition options";
     return result;
   }
   pm.addPass(std::move(partition));
   if (withPlacement) {
     auto placement = cim::createCIMPlacementPass();
-    if (failed(placement->initializeOptions("target-yaml=" + tinyTarget()))) {
+    if (failed(placement->initializeOptions("target-yaml=" + target))) {
       result.error = "failed to set cim-placement options";
       return result;
     }
@@ -145,7 +149,7 @@ Differential runDifferential(const std::string &source, bool withPlacement,
     // interpreter needs neither to execute cim.requantize correctly, and
     // this test is about the count, not about composition).
     auto legalize = cim::createCIMLegalizePrecisionPass();
-    if (failed(legalize->initializeOptions("target-yaml=" + tinyTarget()))) {
+    if (failed(legalize->initializeOptions("target-yaml=" + target))) {
       result.error = "failed to set cim-legalize-precision options";
       return result;
     }
@@ -164,7 +168,7 @@ Differential runDifferential(const std::string &source, bool withPlacement,
   std::string captured;
   llvm::raw_string_ostream stream(captured);
   cim::InterpreterOptions options;
-  options.targetYAMLPath = tinyTarget();
+  options.targetYAMLPath = target;
   options.out = &stream;
   options.dumpProfile = true;
   if (failed(cim::run(*module, "main", options))) {
@@ -326,9 +330,10 @@ func.func @main() {
 
 void expectDifferentialAgrees(const char *label, const std::string &source,
                               bool withPlacement,
-                              bool withLegalizePrecision = false) {
+                              bool withLegalizePrecision = false,
+                              const char *targetName = "tiny-4x4.yaml") {
   Differential d = runDifferential(source, withPlacement,
-                                   withLegalizePrecision);
+                                   withLegalizePrecision, targetName);
   if (!d.error.empty()) {
     CIM_FAIL(std::string(label) + ": " + d.error);
     return;
@@ -414,6 +419,33 @@ CIM_TEST(cost_report_matches_runtime_on_a_reduced_module) {
   expectDifferentialAgrees("two-k-tiles", kTwoKTiles, /*withPlacement=*/true);
   expectDifferentialAgrees("two-k-tiles-unplaced", kTwoKTiles,
                            /*withPlacement=*/false);
+}
+
+CIM_TEST(cost_report_matches_runtime_on_a_reduced_module_without_the_inplace_capability) {
+  // tiny-4x4.yaml (every case above) declares capabilities.partial_sum_
+  // in_place: true, so Interpreter.cpp's runReducePartial always took its
+  // cimrt_reduce_add_inplace branch in every test above -- the general,
+  // no-capability branch (plain cimrt_reduce_add, unchanged from Phase 0)
+  // was reachable only by inspection, not by any test actually running it
+  // through the interpreter. Confirmed by mutation: forcing runReducePartial
+  // to ignore the capability and always take the in-place branch broke
+  // nothing above. tiny-4x4-no-inplace.yaml -- byte-for-byte identical
+  // otherwise -- is what actually exercises it.
+  //
+  // This does NOT distinguish "took the right branch" from "took the
+  // wrong one": both branches compute the identical wrapping-add result
+  // and charge the identical cost (CostAccumulator::recordReduceAdd, by
+  // design -- see cimrt_reduce_add_inplace's own doc comment in cimrt.h),
+  // so cimrt_profile's counters cannot tell them apart from the outside.
+  // What this proves is narrower but still real: the general branch is
+  // reachable, executes without error, and its count still agrees with
+  // the static prediction -- the same three properties every other case
+  // in this file checks, now for the one branch that had zero interpreter
+  // coverage at all.
+  expectDifferentialAgrees("two-k-tiles-no-inplace", kTwoKTiles,
+                           /*withPlacement=*/true,
+                           /*withLegalizePrecision=*/false,
+                           /*targetName=*/"tiny-4x4-no-inplace.yaml");
 }
 
 CIM_TEST(cost_report_install_vs_steady_state_reflects_hoisting) {

@@ -1279,11 +1279,56 @@ private:
       return finish(only, scratch);
     }
 
+    Value countVal = constI64(b, loc, count);
+    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
+
+    // capabilities.partial_sum_in_place (spec target-format.md): a target
+    // that can accumulate without a fresh destination buffer per step gets
+    // exactly ONE accumulator allocation for the whole chain instead of
+    // N-1 -- see cimrt_reduce_add_inplace's own doc comment in cimrt.h for
+    // why this is a separate ABI call rather than a relaxed
+    // cimrt_reduce_add, and why partials[0]'s own buffer is copied into a
+    // fresh one rather than mutated directly (it may have other uses this
+    // pass cannot see -- stageForRead can hand back an ALREADY-LIVE handle,
+    // not always a fresh one, whenever the operand is already device-space).
+    if (spec.capabilities.partialSumInPlace) {
+      OpBuilder accAllocB = creationBuilder(b);
+      Value acc = allocBuffer(accAllocB, loc, dev, *bytes, stageSpace);
+      noteHoisted(acc);
+
+      bool firstScratch = false;
+      Value first =
+          stageForRead(b, loc, dev, partials[0], stageSpace, firstScratch);
+      auto copyFn = getOrInsertFunc("cimrt_copy",
+                                    b.getFunctionType({ptrTy, ptrTy}, {i32Ty}));
+      Value copyStatus =
+          b.create<func::CallOp>(loc, copyFn, ValueRange{acc, first})
+              .getResult(0);
+      checkOk(b, loc, copyStatus, "cimrt_copy failed");
+      if (firstScratch)
+        freeBuffer(b, loc, first);
+
+      auto inplaceFn = getOrInsertFunc(
+          "cimrt_reduce_add_inplace",
+          b.getFunctionType({ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
+      for (size_t i = 1; i < partials.size(); ++i) {
+        bool rhsScratch = false;
+        Value rhs =
+            stageForRead(b, loc, dev, partials[i], stageSpace, rhsScratch);
+        Value status = b.create<func::CallOp>(
+                             loc, inplaceFn,
+                             ValueRange{dev, acc, rhs, countVal, bitsVal})
+                            .getResult(0);
+        checkOk(b, loc, status, "cimrt_reduce_add_inplace failed");
+        if (rhsScratch)
+          freeBuffer(b, loc, rhs);
+      }
+      return finish(acc, /*accIsOwnScratch=*/true);
+    }
+
     auto fn = getOrInsertFunc(
         "cimrt_reduce_add",
         b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
-    Value countVal = constI64(b, loc, count);
-    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
 
     bool accScratch = false;
     Value acc = stageForRead(b, loc, dev, partials[0], stageSpace, accScratch);
