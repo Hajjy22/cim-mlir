@@ -572,6 +572,90 @@ func.func @loop_defers_a_hoisted_device_buffers_free(%acts: memref<3x4xi8>) {
 
 // -----
 
+// A cim op nested TWO levels deep inside a PLAIN scf.for nested inside
+// another PLAIN scf.for (no iter_args at either level) -- the shape file
+// header point 1 describes as now lowered at arbitrary depth. The point
+// of this test is `loopHoistBefore`: every buffer this pass allocates
+// while lowering the INNERMOST loop's body must still be hoisted all the
+// way to before the OUTERMOST scf.for, not just the immediately
+// enclosing one -- reused across every (outer, inner) iteration pair,
+// not once per outer iteration. Otherwise this is exactly
+// @loop_hoists_and_reuses_its_buffers above, generalized from one row
+// index to two.
+//
+// Manually verified once beyond what this structural check covers, the
+// same way the single-level loop test's own header comment does:
+// test/real-target/check-nested-loop.mlir.in takes this exact shape all
+// the way through MLIR's --convert-to-llvm pipeline, mlir-translate,
+// clang, and the real runtime/libcimrt.a, and computes the correct result
+// for all six (outer, inner) iterations of a real doubly-nested matmul
+// when actually RUN as a native binary.
+// CHECK-LABEL: func.func @doubly_nested_loop_hoists_to_the_outermost_loop
+func.func @doubly_nested_loop_hoists_to_the_outermost_loop(%acts: memref<2x3x4xi8>) {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %t = cim.tile_alloc %dev {id = 0 : i64} : (!cim.device<"t">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w5 : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c3 = arith.constant 3 : index
+  scf.for %i = %c0 to %c2 step %c1 {
+    scf.for %j = %c0 to %c3 step %c1 {
+      %rowview = memref.subview %acts[%i, %j, 0] [1, 1, 4] [1, 1, 1]
+                 : memref<2x3x4xi8> to memref<1x1x4xi8, strided<[12, 4, 1], offset: ?>>
+      %local = memref.alloc() : memref<1x1x4xi8>
+      memref.copy %rowview, %local
+        : memref<1x1x4xi8, strided<[12, 4, 1], offset: ?>> to memref<1x1x4xi8>
+      %row = memref.subview %local[0, 0, 0] [1, 1, 4] [1, 1, 1]
+             : memref<1x1x4xi8> to memref<4xi8, strided<[1]>>
+      %near = cim.copy %row : memref<4xi8, strided<[1]>> to memref<4xi8, #cim.space<near>>
+      %out = cim.mvm %r, %near : (!cim.resident<4x4xi8>, memref<4xi8, #cim.space<near>>) -> memref<4xi32, #cim.space<near>>
+      %host = cim.copy %out : memref<4xi32, #cim.space<near>> to memref<4xi32>
+      memref.dealloc %local : memref<1x1x4xi8>
+      memref.dealloc %host : memref<4xi32>
+    }
+  }
+  return
+}
+memref.global "private" constant @w5 : memref<4x4xi8> = dense<1>
+// CHECK: call @cimrt_program
+// Both cimrt_alloc calls this nest's body needs (the activation-stage
+// copy's device buffer, the mvm's result buffer) happen ONCE, before the
+// OUTER scf.for -- not once per outer iteration, and not repeated inside
+// either loop.
+// CHECK: %[[ACTBUF:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// CHECK: %[[OUTBUF:.*]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.ptr
+// The readback copy's host buffer is a real memref.alloc, also hoisted
+// before the OUTER loop.
+// CHECK: %[[HOSTBUF:.*]] = memref.alloc()
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK-NOT: cimrt_alloc
+// Every (outer, inner) iteration writes fresh activation bytes into the
+// SAME %[[ACTBUF]], computes into the SAME %[[OUTBUF]], and reads back
+// into the SAME %[[HOSTBUF]] -- reused, not reallocated, and not
+// reallocated once per outer iteration either.
+// CHECK: call @cimrt_write(%[[ACTBUF]]
+// CHECK: call @cimrt_mvm(%{{.*}}, %{{.*}}, %[[ACTBUF]], %[[OUTBUF]]
+// CHECK: call @cimrt_read(%[[OUTBUF]]
+// CHECK-NOT: cimrt_alloc
+// %local's own real memref.dealloc is left completely alone, exactly as
+// in the one-level case -- it is a genuine per-iteration local this pass
+// never touches.
+// CHECK: memref.dealloc %{{.*}} : memref<1x1x4xi8>
+// The inner loop's closing brace, then the outer loop's -- and only
+// AFTER both does the hoisted host buffer's dealloc appear, proving it
+// was deferred past the OUTER loop, not just the inner one.
+// CHECK: }
+// CHECK: }
+// CHECK-NEXT: memref.dealloc %[[HOSTBUF]]
+// CHECK-NOT: cim.copy
+// CHECK-NOT: cim.mvm
+
+// -----
+
 // An scf.for with loop-carried values (iter_args) whose body contains a
 // cim op has no lowering in this v0.1 slice: loopHoistBefore's hoisting
 // design assumes a buffer created before the loop is the only value that
@@ -592,18 +676,43 @@ func.func @loop_with_carried_values_is_refused(%dev: !cim.device<"t">) {
 
 // -----
 
-// A cim op nested TWO levels deep -- inside an scf.if inside an scf.for --
-// is still refused: "one level" is the whole of what loopHoistBefore's
-// hoisting handles (file header point 1). A doubly nested scf.for would
-// trip the same check the same way.
-func.func @doubly_nested_cim_op_is_refused(%dev: !cim.device<"t">, %cond: i1) {
+// A cim op inside an scf.if, itself inside an scf.for, is still refused:
+// a doubly (or arbitrarily) nested PLAIN scf.for now lowers (see
+// @doubly_nested_loop_hoists_to_the_outermost_loop above), but conditional
+// control flow is the one construct collectRecognizedLoopBodies never
+// recognizes, at any depth (file header point 1) -- a hoisted buffer's
+// single allocation has no way to express "only on the branch that runs".
+func.func @cim_op_inside_an_scf_if_is_refused(%dev: !cim.device<"t">, %cond: i1) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c3 = arith.constant 3 : index
-  // expected-error @+1 {{nested more than one level deep}}
   scf.for %i = %c0 to %c3 step %c1 {
+    // expected-error @+1 {{construct other than a plain scf.for}}
     scf.if %cond {
       cim.barrier %dev : !cim.device<"t">
+    }
+  }
+  return
+}
+
+// -----
+
+// The same refusal fires no matter how many levels of PLAIN scf.for
+// nesting sit above the scf.if -- collectRecognizedLoopBodies recurses
+// into every one of them and still refuses the first non-scf.for
+// construct it finds containing a cim op, at whatever depth that turns
+// out to be.
+func.func @cim_op_inside_an_scf_if_is_refused_at_any_loop_depth(
+    %dev: !cim.device<"t">, %cond: i1) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  scf.for %i = %c0 to %c2 step %c1 {
+    scf.for %j = %c0 to %c2 step %c1 {
+      // expected-error @+1 {{construct other than a plain scf.for}}
+      scf.if %cond {
+        cim.barrier %dev : !cim.device<"t">
+      }
     }
   }
   return

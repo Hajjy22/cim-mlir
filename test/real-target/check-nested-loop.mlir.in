@@ -1,0 +1,97 @@
+// Configured the same way as check-loop.mlir.in (see that file's own
+// header and this directory's CMakeLists.txt) into nested-loop-correct.mlir
+// (EXPECTED_VALUE=654321) and nested-loop-wrong.mlir (EXPECTED_VALUE=999).
+//
+// Unlike check-loop.mlir.in, this hand-writes cim ops directly (device_open/
+// tile_alloc/program/mvm/copy, the same style check.mlir.in uses) rather
+// than a real linalg.matmul_transpose_b cim-partition rewrites: cim-placement
+// never emits a SECOND level of loop nesting (v0.1 handles one,
+// docs/roadmap.md M3's own note), so there is no real front-end path that
+// produces this shape today. What this file exercises is cim-lower-to-target's
+// OWN lowering of a doubly-nested, PLAIN scf.for (no iter_args at either
+// level) it can now be handed directly -- see that pass's file header point
+// 1, and test/Transforms/cim-lower-to-target.mlir's
+// @doubly_nested_loop_hoists_to_the_outermost_loop for the structural half
+// of this same claim. cim-detect/cim-partition/cim-placement all still run
+// ahead of cim-lower-to-target in the CMakeLists.txt pipeline for this
+// template, exactly as they do for check.mlir.in/check-requantize.mlir.in/
+// check-reduce-partial.mlir.in -- true no-ops here, since there is no
+// linalg.matmul_transpose_b anywhere in this module for cim-detect to find.
+//
+// THE POINT OF THIS TEST: proving a buffer allocated while lowering the
+// INNERMOST loop's body is hoisted all the way to before the OUTERMOST
+// loop, and reused across every (outer, inner) iteration pair -- not
+// reallocated once per outer iteration, and not leaked once per total
+// iteration. A 4x4 IDENTITY weight, so cim.mvm's result is just each
+// activation row unchanged: out[i][j][0] = act[i][j][0]. Six (outer=2,
+// inner=3) iterations, each with a DIFFERENT first element (1, 2, 3, 4, 5,
+// 6, laid out so idx = i*3+j gives act[i][j][0] = idx+1) -- if the loop
+// nest's hoisted buffers were reused incorrectly (a write landing in the
+// wrong iteration's buffer, or a stale value surviving from a previous
+// iteration instead of being overwritten, at either loop level), at least
+// one of the six would read back some OTHER iteration's value instead of
+// its own. The checksum below (Σ act[i][j][0] * 10^idx for idx=0..5 =
+// 1 + 20 + 300 + 4000 + 50000 + 600000 = 654321) only comes out right if
+// all six iterations, across both loop levels, independently computed and
+// preserved their own correct value.
+func.func @run_check() {
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+  %t = cim.tile_alloc %dev {id = 0 : i64}
+       : (!cim.device<"@CIM_REAL_TARGET_YAML@">) -> !cim.tile<4x4xi8>
+  %w = memref.get_global @w : memref<4x4xi8>
+  %r = cim.program %t, %w {cost_ns = 1 : i64, cost_pj = 1 : i64}
+       : (!cim.tile<4x4xi8>, memref<4x4xi8>) -> !cim.resident<4x4xi8>
+  %actsInit = memref.get_global @actsInit : memref<2x3x4xi8>
+  %acts = memref.alloc() : memref<2x3x4xi8>
+  memref.copy %actsInit, %acts : memref<2x3x4xi8> to memref<2x3x4xi8>
+  %out = memref.alloc() : memref<2x3x4xi32>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c3 = arith.constant 3 : index
+  scf.for %i = %c0 to %c2 step %c1 {
+    scf.for %j = %c0 to %c3 step %c1 {
+      %rowview = memref.subview %acts[%i, %j, 0] [1, 1, 4] [1, 1, 1]
+                 : memref<2x3x4xi8> to memref<1x1x4xi8, strided<[12, 4, 1], offset: ?>>
+      %local = memref.alloc() : memref<1x1x4xi8>
+      memref.copy %rowview, %local
+        : memref<1x1x4xi8, strided<[12, 4, 1], offset: ?>> to memref<1x1x4xi8>
+      %row = memref.subview %local[0, 0, 0] [1, 1, 4] [1, 1, 1]
+             : memref<1x1x4xi8> to memref<4xi8, strided<[1]>>
+      %mvmOut = cim.mvm %r, %row : (!cim.resident<4x4xi8>, memref<4xi8, strided<[1]>>) -> memref<4xi32>
+      %outSlot = memref.subview %out[%i, %j, 0] [1, 1, 4] [1, 1, 1]
+                 : memref<2x3x4xi32> to memref<4xi32, strided<[1], offset: ?>>
+      memref.copy %mvmOut, %outSlot : memref<4xi32> to memref<4xi32, strided<[1], offset: ?>>
+      memref.dealloc %local : memref<1x1x4xi8>
+    }
+  }
+  %v00 = memref.load %out[%c0, %c0, %c0] : memref<2x3x4xi32>
+  %v01 = memref.load %out[%c0, %c1, %c0] : memref<2x3x4xi32>
+  %v02 = memref.load %out[%c0, %c2, %c0] : memref<2x3x4xi32>
+  %v10 = memref.load %out[%c1, %c0, %c0] : memref<2x3x4xi32>
+  %v11 = memref.load %out[%c1, %c1, %c0] : memref<2x3x4xi32>
+  %v12 = memref.load %out[%c1, %c2, %c0] : memref<2x3x4xi32>
+  %m10 = arith.constant 10 : i32
+  %m100 = arith.constant 100 : i32
+  %m1000 = arith.constant 1000 : i32
+  %m10000 = arith.constant 10000 : i32
+  %m100000 = arith.constant 100000 : i32
+  %t01 = arith.muli %v01, %m10 : i32
+  %t02 = arith.muli %v02, %m100 : i32
+  %t10 = arith.muli %v10, %m1000 : i32
+  %t11 = arith.muli %v11, %m10000 : i32
+  %t12 = arith.muli %v12, %m100000 : i32
+  %s0 = arith.addi %v00, %t01 : i32
+  %s1 = arith.addi %s0, %t02 : i32
+  %s2 = arith.addi %s1, %t10 : i32
+  %s3 = arith.addi %s2, %t11 : i32
+  %got = arith.addi %s3, %t12 : i32
+  %expected = arith.constant @EXPECTED_VALUE@ : i32
+  %ok = arith.cmpi eq, %got, %expected : i32
+  cf.assert %ok, "real-target e2e: doubly-nested loop-body matmul's per-(outer,inner) results did not match the expected checksum"
+  memref.dealloc %acts : memref<2x3x4xi8>
+  memref.dealloc %out : memref<2x3x4xi32>
+  return
+}
+memref.global "private" constant @actsInit : memref<2x3x4xi8> = dense<[[[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]], [[4, 4, 4, 4], [5, 5, 5, 5], [6, 6, 6, 6]]]>
+memref.global "private" constant @w : memref<4x4xi8> = dense<[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]>

@@ -311,9 +311,11 @@ wrong.
   `cim-placement`'s own loop hoisting produces) was refused with a
   diagnostic, since a buffer this pass allocated would either leak every
   iteration or need a hoisting analysis of its own, neither designed
-  here. **That is no longer true for one level of loop nesting** -- see
-  the loop-body lowering paragraph below, added in the same session as
-  the multi-K-tile closure. `cim.reduce_partial`, originally refused
+  here. **That is no longer true for plain `scf.for` nesting, at any
+  depth** -- see the loop-body lowering paragraph below, added in the
+  same session as the multi-K-tile closure and later generalized past its
+  original one-level limit (M4 above). `cim.reduce_partial`, originally
+  refused
   alongside it for a stated reason ("multi-tile K-reduction needs its own
   buffer-lifetime story this pass does not have -- multiple partial-sum
   buffers alive at once, reduced into one"), turned out to overstate the
@@ -461,62 +463,77 @@ wrong.
   target schema's `costs:` section has no requantize/readout entry, a
   known simplification (spec M4), not a silent omission.
 
-  **Loop-body lowering** (one level of `scf.for` nesting, closed in a
-  later session than the multi-K-tile work above): `run()` now recognizes
-  a single, plain `scf.for` (no `iter_args`) sitting directly in a
-  function's entry block as a second lowering target, alongside the entry
-  block itself -- exactly the shape `cim-placement`'s own loop hoisting
-  produces once a matmul's activation has more than one row (recall
-  `cim-partition` implements the matrix-*vector* contract only; a
-  multi-row loop is always something the CALLER wrote, never something
-  `cim-partition` introduces itself -- `test/Transforms/cim-placement-loop.mlir`'s
-  `@fits_hoists_entirely` is exactly that hand-written shape). A cim op
-  nested any deeper than that one level (a second `scf.for`, an `scf.if`,
-  or a loop with loop-carried `iter_args`) is still refused with a
-  diagnostic, matching the discipline every other scope limit here
+  **Loop-body lowering** (originally one level of `scf.for` nesting,
+  closed in a later session than the multi-K-tile work above; generalized
+  to arbitrarily many levels of plain `scf.for` nesting in a later
+  session still -- see the M4 entry above for that part): `run()` now
+  recognizes a plain `scf.for` (no `iter_args`) sitting directly in a
+  function's entry block, or nested inside another such recognized loop
+  at any depth, as a lowering target alongside the entry block itself --
+  exactly the shape `cim-placement`'s own loop hoisting produces once a
+  matmul's activation has more than one row (recall `cim-partition`
+  implements the matrix-*vector* contract only; a multi-row loop is
+  always something the CALLER wrote, never something `cim-partition`
+  introduces itself -- `test/Transforms/cim-placement-loop.mlir`'s
+  `@fits_hoists_entirely` is exactly that hand-written shape).
+  `collectRecognizedLoopBodies` recurses through the whole nest to find
+  every such loop's body; an `scf.if`, or a loop with loop-carried
+  `iter_args`, containing a cim op is still refused with a diagnostic at
+  any depth, matching the discipline every other scope limit here
   follows.
   
   The actual hoisting: every buffer this pass allocates while lowering a
-  recognized loop's body -- an activation-stage `cim.copy`'s device
+  recognized loop nest's body -- an activation-stage `cim.copy`'s device
   buffer, `cim.mvm`'s result, a readback `cim.copy`'s host buffer, and so
   on for every other op's own buffer creation site -- is created ONCE,
-  immediately before the loop (`creationBuilder`, `FunctionLowering`),
-  instead of at the un-lowered op's own position inside it. The loop body
-  keeps only the write/compute/read calls that use the result, an
-  ordinary SSA value the body can reference with no special capture
-  (`scf.for`'s region has no capture-list concept to begin with). This is
-  what keeps a real, multi-row matmul from leaking one buffer's worth of
-  device memory per row: the SAME handle is reused (overwritten) every
-  iteration, matching how actual scratchpad hardware would behave, rather
-  than a fresh one being handed out and abandoned every time. A buffer's
-  matching free -- either this pass' own `cimrt_free` for a device
-  handle, or a real `memref.dealloc` for a host one -- is, symmetrically,
-  deferred to just after the loop if and only if that specific buffer's
-  own allocation was itself hoisted (`hoistedThisLoop`, a `Value` set
-  scoped to the current loop lowering): freeing the one shared, reused
-  buffer on whichever iteration the original free happened to sit on
-  would make every later iteration's use of it a use-after-free. A buffer
-  this pass both allocates AND frees within one op's own lowering (e.g.
-  `stageForRead`'s scratch buffer, `cim.program`'s weight-staging buffer,
-  a non-final `cim.reduce_partial` accumulator) is hoisted exactly the
-  same way, for the same reason -- reused every iteration instead of
-  realloc'd -- and its free just moves with it, to the same after-loop
-  position, rather than needing separate treatment.
+  immediately before the OUTERMOST loop in the nest (`creationBuilder`,
+  `FunctionLowering`; `loopHoistBefore` is set once on entering that
+  outermost loop and left unchanged while recursing into anything nested
+  inside it), instead of at the un-lowered op's own position inside it.
+  Every loop body in the nest keeps only the write/compute/read calls
+  that use the result, an ordinary SSA value any level can reference with
+  no special capture (`scf.for`'s region has no capture-list concept to
+  begin with, and a value defined before the outermost loop dominates
+  every level nested inside it). This is what keeps a real, multi-row (or
+  multi-row-and-column) matmul from leaking one buffer's worth of device
+  memory per innermost iteration: the SAME handle is reused (overwritten)
+  on every iteration of every nesting level, matching how actual
+  scratchpad hardware would behave, rather than a fresh one being handed
+  out and abandoned every time. A buffer's matching free -- either this
+  pass' own `cimrt_free` for a device handle, or a real `memref.dealloc`
+  for a host one -- is, symmetrically, deferred to just after the
+  OUTERMOST loop if and only if that specific buffer's own allocation was
+  itself hoisted (`hoistedThisLoop`, a `Value` set scoped to the current
+  loop nest's lowering, not just whichever level is being visited):
+  freeing the one shared, reused buffer on whichever iteration the
+  original free happened to sit on would make every later iteration's use
+  of it a use-after-free. A buffer this pass both allocates AND frees
+  within one op's own lowering (e.g. `stageForRead`'s scratch buffer,
+  `cim.program`'s weight-staging buffer, a non-final `cim.reduce_partial`
+  accumulator) is hoisted exactly the same way, for the same reason --
+  reused every iteration instead of realloc'd -- and its free just moves
+  with it, to the same after-outermost-loop position, rather than needing
+  separate treatment.
   
   Verified four ways: `test/Transforms/cim-lower-to-target.mlir`'s
-  `loop_hoists_and_reuses_its_buffers` covers the positive case
+  `loop_hoists_and_reuses_its_buffers` covers the one-level positive case
   structurally (every `cimrt_alloc` and the host readback's
   `memref.alloc` appear once, before `scf.for`; the write/mvm/read calls
-  reuse the same handles inside it); `loop_defers_a_hoisted_device_buffers_free`
-  and that same first test's host-buffer check cover the deferred-free
+  reuse the same handles inside it), and
+  `doubly_nested_loop_hoists_to_the_outermost_loop` covers the same claim
+  one level deeper -- the buffers this time must appear once before the
+  OUTER `scf.for`, not the inner one, and the deferred frees must land
+  after BOTH closing braces; `loop_defers_a_hoisted_device_buffers_free`
+  and the first test's own host-buffer check cover the deferred-free
   mechanism directly (an explicit `memref.dealloc`/free inside the loop
   body, on a buffer this pass hoisted, ends up relocated to just after
-  `scf.for` -- not exercised by real pipeline output today, since neither
+  the loop -- not exercised by real pipeline output today, since neither
   `cim-partition` nor `cim-placement` currently emit such a dealloc, but
   worth guaranteeing correct rather than leaving it an untested, silently
-  wrong case waiting for the day something does); `loop_with_carried_values_is_refused`
-  and `doubly_nested_cim_op_is_refused` cover what is still refused. Beyond
-  the structural suite, a genuine multi-row `linalg.matmul_transpose_b`
+  wrong case waiting for the day something does); `loop_with_carried_values_is_refused`,
+  `cim_op_inside_an_scf_if_is_refused`, and
+  `cim_op_inside_an_scf_if_is_refused_at_any_loop_depth` cover what is
+  still refused. Beyond the structural suite, a genuine multi-row `linalg.matmul_transpose_b`
   (identity weight, three rows with distinct values) was run through the
   real `cim-detect`/`cim-partition`/`cim-placement`/`cim-lower-to-target`
   chain, then all the way through MLIR's `--convert-to-llvm` pipeline
@@ -533,7 +550,16 @@ wrong.
   and kept their own correct value rather than reusing or clobbering a
   stale one -- the strongest evidence yet that the buffer reuse this
   paragraph describes is a working artifact on real, compiled, executed
-  hardware-shaped code, not just well-typed IR.
+  hardware-shaped code, not just well-typed IR. The doubly-nested case has
+  its own real-binary proof too, hand-written rather than produced by
+  `cim-placement` (which never nests two levels itself, M3 above):
+  `test/real-target/check-nested-loop.mlir.in`
+  (`nested-loop-correct`/`nested-loop-wrong`) hand-writes `cim.device_open`/
+  `cim.program`/`cim.mvm`/`cim.copy` directly inside a doubly-nested,
+  plain `scf.for`, six (2 outer x 3 inner) iterations each with a distinct
+  first activation element, checked against a checksum (654321) that only
+  comes out right if all six iterations, across both loop levels,
+  independently computed and preserved their own correct value.
 
   A real bug this design surfaced during its own gate run, worth keeping
   in mind for any future pass that touches already-rewritten operands: the
@@ -876,12 +902,44 @@ out of scope for v0.1 across the board, not just here.
   per iteration -- see the Pass 7 entry's own loop-body-lowering
   paragraph for the full design, and
   `test/real-target/loop-correct`/`-wrong` for a genuine multi-row matmul
-  run as a real binary end to end. A cim op nested any deeper than that
+  run as a real binary end to end. ~~A cim op nested any deeper than that
   one level (a second `scf.for`, an `scf.if`, or a loop with
-  loop-carried `iter_args`) is still refused with a diagnostic -- that
-  remains open, and is a real, separate design question (a loop-carried
-  device value would need to survive as part of the loop's own iter_args
-  type list, which this hoisting design says nothing about).
+  loop-carried `iter_args`) is still refused with a diagnostic~~ --
+  **closed, for plain `scf.for` nesting**: `cim-lower-to-target` now
+  recognizes and lowers a cim op nested inside a plain `scf.for` (no
+  `iter_args`) nested inside another such loop, at any depth, not just
+  one level -- `collectRecognizedLoopBodies`
+  (`lib/Transforms/CIMLowerToTarget.cpp`) recurses through the whole nest
+  instead of hardcoding a depth of one, and the hoisting design
+  generalizes by hoisting every buffer this pass creates to just before
+  the OUTERMOST loop in the nest (not merely the nearest enclosing one)
+  and reusing it across every iteration of every level, freeing it once,
+  after that same outermost loop. `cim-placement` itself still never
+  *produces* a second level of nesting (v0.1 handles one, M3 above) --
+  this closes what `cim-lower-to-target` can *lower* when handed such IR
+  directly, the same way `cim.reduce_partial`'s and a genuine
+  `memref.subview`'s lowering closed real gaps for shapes `cim-partition`
+  already emitted before this pass could handle them. Structural proof:
+  `test/Transforms/cim-lower-to-target.mlir`'s
+  `@doubly_nested_loop_hoists_to_the_outermost_loop`. Real-binary proof:
+  `test/real-target/nested-loop-correct`/`-wrong`, a genuine doubly-nested
+  matmul (2 outer x 3 inner iterations) computed and checked end to end.
+  Mutation-tested: forcing every recursion level to treat itself as
+  outermost (hoisting to the nearest loop instead of the outermost one)
+  was caught immediately by the structural test -- and, instructively,
+  *not* by the real-binary test, which only proves numeric correctness,
+  not hoisting depth; a buffer reallocated once per outer iteration
+  instead of once total still computes the right answer, just less
+  efficiently, so the structural test is the one that actually has teeth
+  here.
+
+  **Still open**: an `scf.if`, or a loop with loop-carried `iter_args`,
+  containing a cim op is still refused with a diagnostic at any depth --
+  that remains a real, separate design question (a loop-carried device
+  value would need to survive as part of the loop's own iter_args type
+  list, which this hoisting design says nothing about; conditional
+  control flow has no notion here of which branch a hoisted buffer's
+  single allocation should apply to).
 - ~~`cimrt_requantize` accounted in the cost model: the target schema's
   `costs:` section needs a requantize/readout entry before
   `cimrt_profile_stop`/`cim-cost-report` can count it (currently zero-cost,
