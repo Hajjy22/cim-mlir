@@ -71,22 +71,31 @@ def main(argv=None):
         if args.input:
             activation, source = load_activation(args.input)
         elif args.input_random is not None:
-            # Mirror import_model's own single-vs-chain dispatch: only
-            # layer 0's K is needed here (the length of the FIRST
-            # activation), but which loader can name it depends on whether
-            # the graph is one node or a chain.
-            from .onnx_import import ACCEPTED_OP, load_matmul_chain, load_matmul_integer
+            # Mirror import_model's own dispatch: only the shape of the
+            # FIRST activation is needed here, but which loader can name it
+            # depends on whether the graph is a matmul chain, a single
+            # matmul, or a single convolution.
+            from .onnx_import import (ACCEPTED_CONV_OP, ACCEPTED_OP,
+                                      load_matmul_chain, load_matmul_integer,
+                                      load_qlinear_conv)
             matmul_count = sum(1 for n in model.graph.node
                               if n.op_type == ACCEPTED_OP)
-            if matmul_count >= 2:
-                _, weights, _, _ = load_matmul_chain(model)
-                k0 = weights[0].shape[1]
-            else:
-                _, weight, _ = load_matmul_integer(model)
-                k0 = weight.shape[1]
+            conv_count = sum(1 for n in model.graph.node
+                            if n.op_type == ACCEPTED_CONV_OP)
             rng = np.random.default_rng(args.input_random)
-            activation = rng.integers(-128, 128, size=k0,
-                                      dtype=np.int64).astype(np.int8)
+            if matmul_count == 0 and conv_count >= 1:
+                _, _, _, x_shape, _, _ = load_qlinear_conv(model)
+                activation = rng.integers(
+                    -128, 128, size=x_shape, dtype=np.int64).astype(np.int8)
+            else:
+                if matmul_count >= 2:
+                    _, weights, _, _ = load_matmul_chain(model)
+                    k0 = weights[0].shape[1]
+                else:
+                    _, weight, _ = load_matmul_integer(model)
+                    k0 = weight.shape[1]
+                activation = rng.integers(-128, 128, size=k0,
+                                          dtype=np.int64).astype(np.int8)
             source = f"pseudorandom, seed={hex(args.input_random)}"
         else:
             raise Refusal(

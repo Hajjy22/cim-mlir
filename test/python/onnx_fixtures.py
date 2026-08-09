@@ -128,6 +128,81 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
     return model
 
 
+def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                       y_scale=1.0, strides=(1, 1), pads=(0, 0, 0, 0),
+                       auto_pad="NOTSET", node_name="conv", check=True):
+    """A graph of one QLinearConv: Y = requantize(conv(X, weight)).
+
+    `weight` is [Cout, Cin, Kh, Kw] -- ONNX's own layout, and (unlike
+    matmul_integer_model's [K, N]) the SAME layout
+    cim_frontend.onnx_import.load_qlinear_conv consumes directly; see
+    im2col.py's own module docstring for why a conv kernel needs no
+    transpose the way a matmul's weight does. `x_shape` is the
+    activation's [N, Cin, H, W] -- required up front, since QLinearConv's
+    output shape (and so the graph's declared output value_info) depends
+    on it before any real activation values exist.
+
+    Zero points are fixed at 0 throughout (symmetric quantization, the
+    only case `load_qlinear_conv` accepts) and there is no bias operand --
+    both match that function's own documented scope.
+    """
+    weight = np.asarray(weight)
+    cout, cin, kh, kw = weight.shape
+    n, x_cin, h, w = x_shape
+    if x_cin != cin:
+        raise ValueError(
+            f"x_shape's Cin ({x_cin}) does not match weight's Cin ({cin})")
+
+    stride_h, stride_w = strides
+    if auto_pad == "NOTSET":
+        pad_top, pad_left, pad_bottom, pad_right = pads
+    else:
+        pad_top = pad_left = pad_bottom = pad_right = 0
+    out_h = (h + pad_top + pad_bottom - kh) // stride_h + 1
+    out_w = (w + pad_left + pad_right - kw) // stride_w + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"non-positive output size ({out_h}, {out_w}) for the given "
+            f"x_shape/weight/strides/pads")
+
+    x_name = "X"
+    initializers = [
+        numpy_helper.from_array(weight, name="W"),
+        numpy_helper.from_array(np.array(x_scale, dtype=np.float32),
+                                name="x_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), name="x_zp"),
+        numpy_helper.from_array(np.array(w_scale, dtype=np.float32),
+                                name="w_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), name="w_zp"),
+        numpy_helper.from_array(np.array(y_scale, dtype=np.float32),
+                                name="y_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), name="y_zp"),
+    ]
+    node_kwargs = {"strides": list(strides)}
+    if auto_pad == "NOTSET":
+        node_kwargs["pads"] = list(pads)
+    else:
+        node_kwargs["auto_pad"] = auto_pad
+    node = helper.make_node(
+        "QLinearConv",
+        [x_name, "x_scale", "x_zp", "W", "w_scale", "w_zp", "y_scale",
+         "y_zp"],
+        ["Y"], name=node_name, **node_kwargs)
+    graph = helper.make_graph(
+        [node], "conv_g",
+        [helper.make_tensor_value_info(x_name, TensorProto.INT8,
+                                       list(x_shape))],
+        [helper.make_tensor_value_info(
+            "Y", TensorProto.INT8, [n, cout, out_h, out_w])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def _as_activation_feed(activation):
     """[K] promotes to [1, K]; a real [M, K] batch passes through as-is --
     same normalization `cim_frontend.onnx_import._validate_activation`

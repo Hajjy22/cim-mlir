@@ -83,7 +83,8 @@ satisfy:
 
 `MatMulInteger` is the accepted op because it *is* the v0.1 contract in
 one node: int8 A, int8 B, int32 Y — "INT8 in, wider integer accumulator
-out".
+out". A single, standalone `QLinearConv` node is also accepted, as a
+second entry point — see "A single 2-D convolution" below.
 
 ## Chained layers
 
@@ -139,6 +140,47 @@ Pass a real `[M, K]` array via `--input` (a `.npy` or `.json` file) to use
 it; `--input-random` still synthesizes a single row only, since it exists
 for quick smoke-testing rather than as the batching entry point.
 
+## A single 2-D convolution (`QLinearConv`)
+
+A graph consisting of exactly one `QLinearConv` node (and no
+`MatMulInteger`) is imported too — via im2col, entirely in Python, with no
+new MLIR op and no `cim-detect`/`cim-partition`/interpreter change. This
+works because of the same fact "The activation is required" (below)
+already establishes: every emitted module bakes ONE inference, so the
+activation is always a compile-time constant. im2col is normally
+considered expensive because it materializes every overlapping window
+redundantly, at every inference — that cost does not apply here, since
+there is no per-inference cost in this project's execution model at all.
+A 2-D convolution over a constant activation and a constant kernel is
+exactly a matmul in disguise: the kernel reshapes `[Cout, Cin, Kh, Kw] ->
+[Cout, Cin*Kh*Kw]` (no transpose needed — see `im2col.py`'s own module
+docstring for why this is different from `MatMulInteger`'s weight), the
+activation im2cols into `[N*OutH*OutW, Cin*Kh*Kw]`, and the result is
+handed to the exact same emitter this front end already runs a full
+verification gate against for a plain matmul. `N*OutH*OutW` flattens
+straight into the M > 1 batching machinery above, so a batched convolution
+needs no separate support either.
+
+Unlike `MatMulInteger`, `QLinearConv` always quantizes its own output in
+one node, so the emitted module ends in a `cim.requantize` even for this
+single "layer" — the scale it needs is derived as
+`y_scale / (x_scale * w_scale)`, matching `QLinearConv`'s own reference
+semantics for an integer accumulator.
+
+Only a plain, non-grouped, non-dilated, symmetric-quantization,
+no-bias, explicit-padding convolution is accepted — see `onnx_import.py`'s
+`load_qlinear_conv` module section header for the full list of what is
+refused and why (each is a real scope boundary, not an oversight; the
+refusal table below has an entry for the exact-padding requirement, which
+is the one surprise: `auto_pad=VALID` is refused too, despite being
+definitionally just zero padding, because `onnx.reference`'s own `Conv`
+implementation computes it with a padding formula that is wrong for any
+model with more than one image or input channel — an oracle bug this
+front end sidesteps by refusing it, rather than a limitation of its own).
+A chain of convolutions, or a convolution feeding a matmul, is not
+supported — only a single, standalone `QLinearConv`, matching how
+single-layer `MatMulInteger` import preceded chained import.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the
@@ -161,6 +203,12 @@ is worse than a refusal.
 | a chain bridge with a non-positive scale | `cim.requantize` requires a positive scale; a real positive scale is accepted (see above) |
 | a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
 | a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
+| a grouped/depthwise `QLinearConv` (`group != 1`) | each group is really an independent matmul over a slice of channels, not one reshape |
+| a dilated `QLinearConv` (`dilations != (1, 1)`) | a dilated kernel tap reads a non-contiguous patch, which this front end's im2col does not express |
+| a `QLinearConv` with a non-scalar `w_scale` | per-output-channel quantization; a single `cim.requantize` call takes exactly one scalar scale |
+| a `QLinearConv` bias operand | added directly to the raw int32 accumulator per output channel; there is no cim op for that at this point in the pipeline without risking an unverified interaction with `cim-partition`'s own use of `cim.reduce_partial` for K-tiling |
+| a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
+| more than one `QLinearConv` node | only a single, standalone convolution is imported; not a chain of them, and not one feeding a matmul |
 
 ## The activation is required
 
@@ -214,6 +262,14 @@ any accumulator leaves `[-128, 127]`.
   matched against `onnx.reference`'s quantized evaluation, and a hand-built
   exact-tie case documenting the known rounding-mode divergence at an even
   scale.
+- `test/python/test_onnx_frontend_conv.py` — the convolution counterpart:
+  a strided/padded differential against `onnx.reference`'s own quantized
+  `QLinearConv` evaluation, a batched (N > 1) case proving im2col's batch
+  flattening composes with M > 1, a full-int8-range 1x1-kernel case at an
+  odd derived scale (guaranteed no rounding tie), a hand-built exact-tie
+  case documenting the known rounding-mode divergence, one refusal test
+  per convolution-specific row above, and a direct, `onnx`-free unit test
+  of `im2col_nchw` against an independent hand-written convolution loop.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 
