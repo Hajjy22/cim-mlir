@@ -841,9 +841,30 @@ out of scope for v0.1 across the board, not just here.
   cross at least once.
 
 ## M4 — Second target and generalization (future)
-- `targets/generic-digital-cim.yaml` already exists as a placeholder
+- ~~`targets/generic-digital-cim.yaml` already exists as a placeholder
   second-class target file; needs real (or better-estimated) numbers and a
-  working lowering to prove retargetability.
+  working lowering to prove retargetability.~~ -- **closed, on the axis
+  that actually mattered**: the `class:` enum itself turned out to already
+  be incidentally covered (`test/targets/tiny-4x4.yaml` and
+  `generic-digital-cim.yaml` are both `digital_cim`;
+  `tiny-4x4-4bit.yaml` is `analog_cim`), and grepping every pass confirms
+  none of them branch on `TargetClass` at all -- so the class tag was
+  never actually a retargetability risk. The real, previously-untested
+  axis was **persistence**: every compiler-level test target before this
+  declared `persistent: true`, so `cim.program`'s own `persistent`
+  attribute (set directly from `spec.tiles.persistent` in
+  `lib/Transforms/CIMPartition.cpp`) had never been checked as `false`
+  past the parser. `test/targets/tiny-digital-cim.yaml` mirrors
+  `generic-digital-cim.yaml`'s real characteristics (volatile SRAM, no
+  nonvolatile advantage, double-buffering capable) at tiny-4x4.yaml's
+  scale, and now backs both a structural check
+  (`test/Transforms/cim-partition-volatile.mlir`) and a full
+  `real-target-e2e` binary pair
+  (`digital-cim-volatile-correct`/`-wrong`) -- the strongest form of this
+  proof, since it is a real compiled binary computing the right answer,
+  not an attribute assertion. `targets/generic-digital-cim.yaml` itself
+  still carries placeholder, estimated numbers (unchanged by this) --
+  "better-estimated" real numbers for it remains open.
 - `cim-legalize-precision` with real `effective_bits` modeling.
 - ~~`cim-lower-to-target` beyond its v0.1 straight-line slice: lowering a
   cim op inside an `scf.for`~~ -- **closed**: one level of loop nesting
