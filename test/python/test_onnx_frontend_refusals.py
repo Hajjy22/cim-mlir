@@ -59,12 +59,18 @@ def test_a_valid_model_is_not_refused():
 
 # --- shape and contract refusals -------------------------------------------
 
-def test_refuses_more_than_one_output_row():
-    # v0.1 is matrix-VECTOR. cim-partition refuses m != 1 downstream and
-    # leaves linalg intact, so cim-run would then die on an unlowered op
-    # with an error naming neither the model nor the real reason.
+def test_accepts_more_than_one_output_row():
+    # Used to be refused: v0.1 was matrix-VECTOR only. cim-partition now
+    # tiles an M > 1 activation the same way it tiles M == 1 (a real
+    # scf.for over the rows, docs/roadmap.md's M4 entry), so this is no
+    # longer this importer's business to refuse -- see
+    # test_onnx_frontend.py's own differential for the numerical proof;
+    # this only pins that the importer itself does not stand in the way.
     model = matmul_integer_model(WEIGHT, act_shape=[4, K])
-    _refuses(model, "matrix-VECTOR")
+    activation = np.arange(1, 4 * K + 1, dtype=np.int64).reshape(4, K).astype(np.int8)
+    text = import_model(model, activation)
+    assert "linalg.matmul_transpose_b" in text
+    assert f"memref<4x{K}xi8>" in text
 
 
 def test_refuses_a_symbolic_activation_shape():

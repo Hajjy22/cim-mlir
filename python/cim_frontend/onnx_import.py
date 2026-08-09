@@ -216,11 +216,6 @@ def load_matmul_integer(model):
             where=where)
 
     m, k = a_shape
-    if m != 1:
-        raise Refusal(
-            f"the activation has {m} rows. The v0.1 contract is matrix-VECTOR "
-            f"(a single output row); cim-partition refuses more and would "
-            f"leave the matmul unoffloaded. Nothing emitted.", where=where)
     if weight.shape[0] != k:
         raise Refusal(
             f"shape mismatch: activation is [{m}, {k}] but the weight is "
@@ -465,11 +460,11 @@ def load_matmul_chain(model):
                 raise Refusal(
                     f"the activation operand '{a_name}' has a symbolic or "
                     f"unknown shape. Nothing emitted.", where=where)
-            if len(a_shape) != 2 or a_shape[0] != 1:
+            if len(a_shape) != 2:
                 raise Refusal(
-                    f"the activation operand '{a_name}' must be [1, K]; got "
-                    f"{a_shape}. The v0.1 contract is matrix-VECTOR. Nothing "
-                    f"emitted.", where=where)
+                    f"the activation operand '{a_name}' has rank "
+                    f"{len(a_shape)}; cim-partition requires rank-2 "
+                    f"operands. Nothing emitted.", where=where)
             if weight.shape[0] != a_shape[1]:
                 raise Refusal(
                     f"shape mismatch: activation is {a_shape} but the weight "
@@ -508,16 +503,25 @@ def provenance(model_path, model_bytes, activation_source):
 
 
 def _validate_activation(activation, expected_k):
+    """Accepts a flat [K] vector (M == 1) or a real [M, K] batch, M >= 1.
+
+    Always RETURNS a 2-D [M, K] array: emit_module/emit_chain_module also
+    accept a 1-D [K] array directly (and reshape it the same way, so the
+    M == 1 shape stays byte-identical either way), but normalizing here
+    means every caller downstream of this function -- both single-layer
+    and chain -- sees the same shape regardless of which form was
+    supplied.
+    """
     activation = np.asarray(activation)
-    if activation.ndim == 2 and activation.shape[0] == 1:
-        activation = activation[0]
-    if activation.ndim != 1:
+    if activation.ndim == 1:
+        activation = activation.reshape(1, -1)
+    if activation.ndim != 2:
         raise Refusal(
             f"the supplied activation has shape {list(activation.shape)}; "
-            f"expected [1, K] or [K]. Nothing emitted.")
-    if activation.shape[0] != expected_k:
+            f"expected [K] or [M, K]. Nothing emitted.")
+    if activation.shape[1] != expected_k:
         raise Refusal(
-            f"the supplied activation has length {activation.shape[0]} but the "
+            f"the supplied activation has K={activation.shape[1]} but the "
             f"model's K is {expected_k}. Nothing emitted.")
     if activation.dtype != np.int8:
         lo, hi = int(activation.min()), int(activation.max())

@@ -6,7 +6,7 @@ that has no model-reading libraries installed at all. `onnx_import.py` is
 the only place that knows what a model file is.
 
 THE IR SHAPE HERE IS NOT FREE TO VARY. It must stay byte-identical, for
-the single-layer case, to `build_module()` in
+the single-layer, single-ROW case, to `build_module()` in
 test/python/test_numerical_differential.py, which is in turn the same
 shape as `buildModule()` in test/mlir/pipeline_e2e_test.cpp. That shape is
 the one the entire eight-pass pipeline is tested against, and two details
@@ -80,44 +80,53 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header=""):
     onnx_import.py, so exactly one place in the front end can get it
     wrong and exactly one test has to guard it.
 
-    `activation` is a length-K int8 vector.
+    `activation` is a length-K int8 vector (M == 1, the common case), or
+    an [M, K] int8 array for a batched (M > 1) matmul -- cim-partition
+    tiles a real M > 1 candidate the same way it tiles M == 1, generating
+    a real scf.for over the rows itself (docs/roadmap.md's M4 entry), so
+    this front end no longer has to refuse anything but [1, K]/[K].
 
-    With the default symbol names and no header this returns text
-    byte-identical to test/python/test_numerical_differential.py's
-    `build_module()`.
+    With the default symbol names, no header, and a 1-D (or [1, K])
+    activation, this returns text byte-identical to
+    test/python/test_numerical_differential.py's `build_module()` -- M > 1
+    is additive, not a rewrite of the M == 1 shape.
     """
     weight = np.asarray(weight)
     activation = np.asarray(activation)
     if weight.ndim != 2:
         raise ValueError(f"weight must be 2-D [N, K], got shape {weight.shape}")
-    if activation.ndim != 1:
+    if activation.ndim == 1:
+        activation = activation.reshape(1, -1)
+    elif activation.ndim != 2:
         raise ValueError(
-            f"activation must be 1-D [K], got shape {activation.shape}")
+            f"activation must be 1-D [K] or 2-D [M, K], got shape "
+            f"{activation.shape}")
 
     n, k = weight.shape
-    if activation.shape[0] != k:
+    m = activation.shape[0]
+    if activation.shape[1] != k:
         raise ValueError(
-            f"activation length {activation.shape[0]} does not match the "
+            f"activation's K of {activation.shape[1]} does not match the "
             f"weight's K of {k}")
 
     rows = _dense_2d(weight)
-    acts = ", ".join(str(int(v)) for v in activation)
+    acts = _dense_2d(activation)
     return f"""\
 {header}memref.global "private" constant @{weight_sym} : memref<{n}x{k}xi8> = dense<{rows}>
-memref.global "private" constant @{act_sym} : memref<1x{k}xi8> = dense<[[{acts}]]>
+memref.global "private" constant @{act_sym} : memref<{m}x{k}xi8> = dense<{acts}>
 func.func private @cim_print_i32(memref<*xi32>)
 func.func @main() {{
   %w = memref.get_global @{weight_sym} : memref<{n}x{k}xi8>
-  %aInit = memref.get_global @{act_sym} : memref<1x{k}xi8>
-  %a = memref.alloc() : memref<1x{k}xi8>
-  memref.copy %aInit, %a : memref<1x{k}xi8> to memref<1x{k}xi8>
-  %out = memref.alloc() : memref<1x{n}xi32>
-  linalg.matmul_transpose_b ins(%a, %w : memref<1x{k}xi8>, memref<{n}x{k}xi8>)
-    outs(%out : memref<1x{n}xi32>)
-  %u = memref.cast %out : memref<1x{n}xi32> to memref<*xi32>
+  %aInit = memref.get_global @{act_sym} : memref<{m}x{k}xi8>
+  %a = memref.alloc() : memref<{m}x{k}xi8>
+  memref.copy %aInit, %a : memref<{m}x{k}xi8> to memref<{m}x{k}xi8>
+  %out = memref.alloc() : memref<{m}x{n}xi32>
+  linalg.matmul_transpose_b ins(%a, %w : memref<{m}x{k}xi8>, memref<{n}x{k}xi8>)
+    outs(%out : memref<{m}x{n}xi32>)
+  %u = memref.cast %out : memref<{m}x{n}xi32> to memref<*xi32>
   func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
-  memref.dealloc %a : memref<1x{k}xi8>
-  memref.dealloc %out : memref<1x{n}xi32>
+  memref.dealloc %a : memref<{m}x{k}xi8>
+  memref.dealloc %out : memref<{m}x{n}xi32>
   return
 }}
 """
@@ -151,8 +160,15 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     127).astype(np.int8)` fed into layer 1, exactly.
 
     `weights` is a list of already-transposed [N_i, K_i] int8 arrays, with
-    K_i == N_(i-1) for i > 0. `activation` is a length-K_0 int8 vector.
-    `weight_syms`, if given, must have one entry per layer.
+    K_i == N_(i-1) for i > 0. `activation` is a length-K_0 int8 vector
+    (M == 1), or an [M, K_0] int8 array for a batched (M > 1) chain -- see
+    `emit_module`'s own note on why this is additive, not a rewrite, for
+    M == 1. `weight_syms`, if given, must have one entry per layer.
+
+    M threads through every layer unchanged: cim.requantize does not
+    change shape (its own verifier enforces exactly that), so a batched
+    layer 0 activation makes every later layer's matmul and requantize
+    genuinely [M, ...] too, with no per-layer M bookkeeping needed here.
     """
     weights = [np.asarray(w) for w in weights]
     activation = np.asarray(activation)
@@ -172,10 +188,17 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
             raise ValueError(
                 f"layer {i}'s K ({weights[i].shape[1]}) does not match "
                 f"layer {i - 1}'s N ({weights[i - 1].shape[0]})")
-    if activation.ndim != 1 or activation.shape[0] != weights[0].shape[1]:
+    if activation.ndim == 1:
+        activation = activation.reshape(1, -1)
+    elif activation.ndim != 2:
         raise ValueError(
-            f"activation must be 1-D of length {weights[0].shape[1]} "
-            f"(layer 0's K), got shape {activation.shape}")
+            f"activation must be 1-D [K] or 2-D [M, K], got shape "
+            f"{activation.shape}")
+    if activation.shape[1] != weights[0].shape[1]:
+        raise ValueError(
+            f"activation's K of {activation.shape[1]} does not match layer "
+            f"0's K of {weights[0].shape[1]}")
+    m = activation.shape[0]
 
     lines = [header.rstrip("\n")] if header else []
     for sym, w in zip(weight_syms, weights):
@@ -183,46 +206,45 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
         lines.append(
             f'memref.global "private" constant @{sym} : memref<{n}x{k}xi8> '
             f"= dense<{_dense_2d(w)}>")
-    acts = ", ".join(str(int(v)) for v in activation)
     k0 = weights[0].shape[1]
     lines.append(
-        f'memref.global "private" constant @{act_sym} : memref<1x{k0}xi8> '
-        f"= dense<[[{acts}]]>")
+        f'memref.global "private" constant @{act_sym} : memref<{m}x{k0}xi8> '
+        f"= dense<{_dense_2d(activation)}>")
     lines.append("func.func private @cim_print_i32(memref<*xi32>)")
     lines.append("func.func @main() {")
 
     for sym, w in zip(weight_syms, weights):
         n, k = w.shape
         lines.append(f"  %{sym} = memref.get_global @{sym} : memref<{n}x{k}xi8>")
-    lines.append(f"  %aInit = memref.get_global @{act_sym} : memref<1x{k0}xi8>")
-    lines.append("  %a0 = memref.alloc() : memref<1x" + str(k0) + "xi8>")
+    lines.append(f"  %aInit = memref.get_global @{act_sym} : memref<{m}x{k0}xi8>")
+    lines.append(f"  %a0 = memref.alloc() : memref<{m}x{k0}xi8>")
     lines.append(
-        f"  memref.copy %aInit, %a0 : memref<1x{k0}xi8> to memref<1x{k0}xi8>")
+        f"  memref.copy %aInit, %a0 : memref<{m}x{k0}xi8> to memref<{m}x{k0}xi8>")
 
     act_val = "%a0"
     for i, (sym, w) in enumerate(zip(weight_syms, weights)):
         n, k = w.shape
         out_val = f"%out{i}"
-        lines.append(f"  {out_val} = memref.alloc() : memref<1x{n}xi32>")
+        lines.append(f"  {out_val} = memref.alloc() : memref<{m}x{n}xi32>")
         lines.append(
             f"  linalg.matmul_transpose_b ins({act_val}, %{sym} : "
-            f"memref<1x{k}xi8>, memref<{n}x{k}xi8>)")
-        lines.append(f"    outs({out_val} : memref<1x{n}xi32>)")
+            f"memref<{m}x{k}xi8>, memref<{n}x{k}xi8>)")
+        lines.append(f"    outs({out_val} : memref<{m}x{n}xi32>)")
         if i < len(weights) - 1:
             act_val = f"%act{i + 1}"
             lines.append(
                 f"  {act_val} = cim.requantize {out_val} {{scale = 1.0 : f32, "
                 f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
-            lines.append(f"    : memref<1x{n}xi32> -> memref<1x{n}xi8>")
+            lines.append(f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}xi8>")
 
     last_n = weights[-1].shape[0]
     lines.append(
-        f"  %u = memref.cast %out{len(weights) - 1} : memref<1x{last_n}xi32> "
+        f"  %u = memref.cast %out{len(weights) - 1} : memref<{m}x{last_n}xi32> "
         f"to memref<*xi32>")
     lines.append("  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()")
-    lines.append(f"  memref.dealloc %a0 : memref<1x{k0}xi8>")
+    lines.append(f"  memref.dealloc %a0 : memref<{m}x{k0}xi8>")
     lines.append(
-        f"  memref.dealloc %out{len(weights) - 1} : memref<1x{last_n}xi32>")
+        f"  memref.dealloc %out{len(weights) - 1} : memref<{m}x{last_n}xi32>")
     lines.append("  return")
     lines.append("}")
     lines.append("")

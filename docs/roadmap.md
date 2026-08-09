@@ -1247,20 +1247,34 @@ out of scope for v0.1 across the board, not just here.
   `cim-placement`'s hoisting still applies (verified separately against
   real `cim-opt` output, not just asserted).
 
-  **Still open, and the natural next step**: the ONNX front end
-  (`python/cim_frontend/onnx_import.py`) still refuses any activation with
-  more than one row, and `emit.py`'s module-emission templates hardcode a
-  `memref<1x{k}xi8>` activation shape throughout (the exact IR shape
-  `test/python/test_numerical_differential.py`'s `build_module()` and
-  `test/mlir/pipeline_e2e_test.cpp`'s `buildModule()` are pinned against,
-  and which must stay byte-identical for the M == 1 case). Generalizing
-  the emitter to a real `[M, K]` activation, lifting `onnx_import.py`'s two
-  M != 1 refusal sites (single-layer and a chain's first layer), and a new
-  M > 1 differential against `onnx.reference`/`onnxruntime` is real,
-  separate work -- deliberately not rushed into the same change as the
-  compiler-side support above, so the numerical-fidelity front door gets
-  the same full verification (real oracle differential, not just a
-  structural check) every other front-end change in this project has had.
+  ~~Still open: the ONNX front end still refuses any activation with more
+  than one row~~ -- **closed**. `emit.py`'s `emit_module`/`emit_chain_module`
+  now accept a real `[M, K]` activation array (a 1-D `[K]` vector still
+  works, reshaped to `[1, K]` internally, so the M == 1 output stays
+  byte-identical to `test/python/test_numerical_differential.py`'s
+  `build_module()` and `test/mlir/pipeline_e2e_test.cpp`'s `buildModule()`
+  -- confirmed by every pre-existing emitter test, unchanged). Both of
+  `onnx_import.py`'s M != 1 refusal sites (single-layer and a chain's
+  first layer) are lifted; `_validate_activation` normalizes a `[K]` or
+  real `[M, K]` supplied activation the same way. M threads through a
+  chain unchanged, with no chain-specific code needed: `cim.requantize`'s
+  own verifier already enforces "must not change shape", so a batched
+  layer 0 makes every later layer's matmul and requantize genuinely
+  `[M, ...]` too.
+
+  Verified with the same rigor as every other front-end change here, not
+  a lighter pass: a new batched differential in `test_onnx_frontend.py`
+  (3 shapes x 2 placement settings, independently-sampled per-row values
+  so a cross-row mix-up would be a wrong, checkable number) against
+  `onnx.reference`, a batched 3-layer chain differential in
+  `test_onnx_frontend_chain.py`, and two `test_onnx_emitter.py` cases
+  pinning the emitted shape without needing `onnx` installed at all.
+  `test_onnx_frontend_refusals.py`'s old `test_refuses_more_than_one_
+  output_row` is replaced by `test_accepts_more_than_one_output_row`,
+  matching the "prove it doesn't refuse everything" discipline the rest of
+  that file already follows. Mutation-tested: forcing `emit_module`'s `m`
+  to a hardcoded `1` was caught immediately, by MLIR's own elements-literal
+  shape check before ever reaching a numerical comparison.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

@@ -85,6 +85,38 @@ def test_a_three_layer_chain_compiles_and_matches_the_reference(cim_opt,
         f"{want.tolist()}")
 
 
+def test_a_batched_three_layer_chain_compiles_and_matches_the_reference(
+        cim_opt, cim_run):
+    # M > 1 threads through every layer unchanged: cim.requantize does not
+    # change shape (its own verifier enforces exactly that), so a batched
+    # layer-0 activation makes every later layer's matmul and requantize
+    # genuinely [M, ...] too, with no chain-specific code needed to make
+    # this work -- see emit_chain_module's own note. Each row gets
+    # independently-sampled values so a bug that mixed up rows across the
+    # chain's three matmuls would produce a wrong, checkable number.
+    m = 3
+    weights = _chain_weights(THREE_LAYER_SHAPES, SEED + 3)
+    model = matmul_chain_model(weights, act_shape=[m, THREE_LAYER_SHAPES[0][0]])
+    act = np.random.default_rng(SEED + 4).integers(
+        -127, 128, size=(m, THREE_LAYER_SHAPES[0][0]),
+        dtype=np.int64).astype(np.int8)
+
+    want = onnx_reference_eval(model, act)
+    assert np.abs(want).max() < 2 ** 24, (
+        "test magnitudes must stay exact through Cast(int32->float32); see "
+        "onnx_import.py's module docstring on the bridge")
+
+    text = import_model(model, act)
+    try:
+        outputs, _ = compile_and_run(cim_opt, cim_run, None, None, source=text)
+    except PipelineError as err:
+        pytest.fail(f"the imported batched chain failed to compile or run: {err}")
+
+    assert np.array_equal(np.asarray(outputs), want), (
+        f"compiled batched chain output {list(outputs)} != ONNX reference "
+        f"{want.tolist()}")
+
+
 def test_a_two_layer_chain_where_an_accumulator_actually_saturates(cim_opt,
                                                                    cim_run):
     # The bridge's clamp only matters if something actually reaches it.

@@ -175,6 +175,38 @@ def test_onnxruntime_agrees_with_the_onnx_reference(cim_opt, cim_run):
     assert np.array_equal(np.asarray(outputs), want)
 
 
+@pytest.mark.parametrize("m,k,n", [(3, 4, 8), (2, 8, 4), (4, 4, 4)])
+@pytest.mark.parametrize("placement", [False, True])
+def test_batched_activation_compiles_and_matches_the_reference(
+        cim_opt, cim_run, m, k, n, placement):
+    # M > 1: cim-partition tiles a real multi-row matmul into a generated
+    # scf.for over the rows (docs/roadmap.md's M4 entry) instead of
+    # refusing it, as it used to. Each row gets independently-sampled
+    # values (not a broadcast constant) so a bug that let one row's
+    # buffer leak into another's -- exactly the class of bug found and
+    # fixed alongside this support, see CIMLowerToTarget.cpp's
+    # hostPointer -- would produce a wrong, checkable number instead of a
+    # lucky match.
+    rng = np.random.default_rng(SEED + m * 10000 + k * 100 + n)
+    weight = rng.integers(-127, 128, size=(k, n), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-127, 128, size=(m, k), dtype=np.int64).astype(np.int8)
+    model = matmul_integer_model(weight, act_shape=[m, k])
+
+    want = onnx_reference_eval(model, act)
+    assert np.abs(want).max() < 2 ** 31
+
+    text = import_model(model, act)
+    try:
+        outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                     placement=placement, source=text)
+    except PipelineError as err:
+        pytest.fail(f"the imported batched model failed to compile or run: {err}")
+
+    assert np.array_equal(np.asarray(outputs), want), (
+        f"compiled output {list(outputs)} != ONNX reference {want.tolist()} "
+        f"for M={m} K={k} N={n} placement={placement}")
+
+
 def test_a_wrong_weight_would_actually_be_caught(cim_opt, cim_run):
     # Anti-vacuity, mirroring test_numerical_differential.py's own
     # test_a_wrong_answer_would_actually_fail: if the comparison above
