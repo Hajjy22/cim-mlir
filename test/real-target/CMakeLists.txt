@@ -170,6 +170,13 @@ add_real_target_object(multi-k-tile-wrong check-multi-k-tile.mlir.in 999)
 # correct per-row result.
 add_real_target_object(loop-correct check-loop.mlir.in 951)
 add_real_target_object(loop-wrong check-loop.mlir.in 999)
+# A genuine multi-ROW linalg.matmul_transpose_b, same checksum scheme as
+# loop-correct/-wrong above, but through cim-partition's OWN generated
+# scf.for this time -- see check-batch.mlir.in's own header for why 951 is
+# the checksum that proves the loop this pass wrote, not one a caller
+# hand-wrote for it, keeps each row's result independent and correct.
+add_real_target_object(batch-correct check-batch.mlir.in 951)
+add_real_target_object(batch-wrong check-batch.mlir.in 999)
 # A doubly-nested, hand-written PLAIN scf.for (no iter_args at either
 # level) -- cim-lower-to-target's newest lowering capability, one level
 # deeper than check-loop.mlir.in's single-level, cim-placement-produced
@@ -196,6 +203,7 @@ foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
                 multi-k-tile-correct multi-k-tile-wrong
                 loop-correct loop-wrong
+                batch-correct batch-wrong
                 nested-loop-correct nested-loop-wrong
                 digital-cim-volatile-correct digital-cim-volatile-wrong)
   add_executable(real-target-e2e-${variant}
@@ -234,6 +242,11 @@ add_test(NAME real-target-e2e-multi-k-tile-correct-value-passes
 add_test(NAME real-target-e2e-loop-correct-value-passes
          COMMAND real-target-e2e-loop-correct
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+# Same WORKING_DIRECTORY reason as loop above: check-batch.mlir.in also has
+# no cim.device_open of its own -- cim-partition inserts one.
+add_test(NAME real-target-e2e-batch-correct-value-passes
+         COMMAND real-target-e2e-batch-correct
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
 # check-nested-loop.mlir.in hand-writes cim.device_open with the absolute
 # path substituted in directly (see check.mlir.in's own correct/wrong
 # above), so this needs no WORKING_DIRECTORY either.
@@ -266,6 +279,9 @@ add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
 add_test(NAME real-target-e2e-loop-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-loop-wrong>"
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME real-target-e2e-batch-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-batch-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)
 add_test(NAME real-target-e2e-nested-loop-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-nested-loop-wrong>")

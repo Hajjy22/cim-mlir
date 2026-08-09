@@ -616,11 +616,43 @@ private:
   /// A raw !llvm.ptr into `memrefValue`'s own storage. Only ever called on a
   /// value whose type is still a real MemRefType (see file header point 3);
   /// an already-staged device buffer has no raw pointer to extract.
+  ///
+  /// memref.extract_aligned_pointer_as_index deliberately returns ONLY the
+  /// underlying allocation's base pointer -- verified directly against real
+  /// --expand-strided-metadata/--finalize-memref-to-llvm output, which
+  /// lowers it to a bare `llvm.extractvalue` of the descriptor's aligned-
+  /// pointer field and NEVER adds the descriptor's separate offset field,
+  /// static or dynamic. Every subview this pass or cim-partition ever
+  /// builds is unit-stride (subView/subView1D/rowSubView all pass
+  /// stride 1), so extract_strided_metadata's `offset` result, in
+  /// elements, times the element width in bytes is exactly the missing
+  /// displacement -- added here by hand so this function's callers can
+  /// keep treating ANY host memref uniformly, offset or not.
+  ///
+  /// This closes a real, PRE-EXISTING gap: every caller of this function
+  /// got away with the missing offset before M > 1 batching, because
+  /// every activation subview reaching cim.copy had a literal, always-zero
+  /// offset (m == 1 only), and no real-target-e2e binary happened to give
+  /// cim.program's 2nd-or-later N/K-tile weightBlock (a genuinely nonzero
+  /// static offset already) numerically distinguishable data (every such
+  /// test's weight is uniform -- see e.g. check-multi-k-tile.mlir.in's
+  /// all-ones weight). A batched matmul with a real, distinguishable
+  /// per-row activation is what finally made a wrong address produce a
+  /// wrong, checkable number instead of a lucky match.
   Value hostPointer(OpBuilder &b, Location loc, Value memrefValue) {
-    Value idx =
-        b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, memrefValue);
-    Value asI64 = b.create<arith::IndexCastOp>(loc, i64Ty, idx);
-    return b.create<LLVM::IntToPtrOp>(loc, ptrTy, asI64);
+    auto memrefType = cast<MemRefType>(memrefValue.getType());
+    auto metadata =
+        b.create<memref::ExtractStridedMetadataOp>(loc, memrefValue);
+    Value baseIdx = b.create<memref::ExtractAlignedPointerAsIndexOp>(
+        loc, metadata.getBaseBuffer());
+    Value baseI64 = b.create<arith::IndexCastOp>(loc, i64Ty, baseIdx);
+    const int64_t elemBytes = memrefType.getElementTypeBitWidth() / 8;
+    Value elemBytesVal = b.create<arith::ConstantIndexOp>(loc, elemBytes);
+    Value offsetBytes =
+        b.create<arith::MulIOp>(loc, metadata.getOffset(), elemBytesVal);
+    Value offsetBytesI64 = b.create<arith::IndexCastOp>(loc, i64Ty, offsetBytes);
+    Value addr = b.create<arith::AddIOp>(loc, baseI64, offsetBytesI64);
+    return b.create<LLVM::IntToPtrOp>(loc, ptrTy, addr);
   }
 
   /// %status == CIMRT_OK, or trap with `what`. Every cimrt_* call's result
