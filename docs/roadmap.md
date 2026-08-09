@@ -1077,8 +1077,21 @@ out of scope for v0.1 across the board, not just here.
   would have to either misrepresent what actually ran or require an
   honest-to-goodness async execution model -- exactly the v0.2 scheduling
   work this capability is gated on, not a cost-model change.
-  `autonomous_control` remains fully unread -- v0.1's execution model has
-  nothing host-less to drive at all.
+  ~~`autonomous_control` remains fully unread -- v0.1's execution model
+  has nothing host-less to drive at all.~~ -- documented as reserved, and
+  now **pinned rather than merely claimed**: new fixture
+  `test/targets/tiny-4x4-autonomous.yaml` is byte-identical to
+  `tiny-4x4.yaml` except this one flag (true instead of false), and
+  `test/Transforms/cim-autonomous-control-is-unread.mlir` runs the same
+  real matmul through the full eight-pass-reachable chain
+  (detect/partition/placement/schedule/insert-transfers/legalize-
+  precision/lower-to-target) against both and diffs the two outputs byte
+  for byte -- the strongest available claim that a flag is unread: not
+  that one hand-picked pass ignores it, but that every pass's combined
+  output is unaffected, character for character. Mutation-tested: an
+  artificial one-character branch on the flag in
+  `CIMLowerToTarget.cpp`'s `lowerDeviceOpen` was caught immediately by the
+  diff, then reverted.
 
 - ~~`partial_sum_in_place` remains fully unread.~~ -- **closed**: read by
   both `cim-lower-to-target` (`lowerReducePartial`) and the interpreter's
