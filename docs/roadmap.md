@@ -665,10 +665,16 @@ wrong.
   -- see M4 below.
 
 ### Known limits of cim-partition
-Everything genuinely out of v0.1's scope (a convolution, a batched matmul's
-3rd dimension, dynamic shapes) is still refused with a warning and the
-`linalg` op left intact, so the module stays correct and is simply not
-offloaded. Both weight-layout and row-count limits below are now closed:
+Everything genuinely out of v0.1's scope (a `linalg.conv_2d`-shaped op, a
+batched matmul's 3rd dimension, dynamic shapes) is still refused with a
+warning and the `linalg` op left intact, so the module stays correct and is
+simply not offloaded -- this pass itself still has no convolution support,
+and still should not. A *2-D convolution over a constant activation* is a
+different claim, closed one layer up instead: see M4 below's ONNX
+`QLinearConv` entry, which never emits a `linalg.conv_2d` at all -- it
+reshapes the convolution into the SAME `linalg.matmul_transpose_b` this
+pass already accepts, entirely in Python, before cim-detect ever runs. Both
+weight-layout and row-count limits below are now closed:
 
 ~~Only `linalg.matmul_transpose_b` (weights `[N x K]`, matching `cim.mvm`'s
 output-major convention). A plain `linalg.matmul` needs a transpose
@@ -1409,6 +1415,93 @@ out of scope for v0.1 across the board, not just here.
   instance. Mutation-tested by reverting the fix and confirming the
   ASan build reproduces the original heap-use-after-free before
   restoring it.
+- **A single 2-D convolution (`QLinearConv`) is importable, via im2col --
+  no dialect, pass, or interpreter change.** The commercial gap-analysis
+  review that opened this milestone flagged "Model Generality" as v0.1's
+  headline limitation and specifically named convolution support as
+  quarters-of-work item, alongside transformer attention and dynamic
+  shapes -- true in general, but this project's execution model is not
+  general. onnx_import.py's own module docstring already establishes that
+  every emitted module bakes ONE inference: cim-run has no mechanism to
+  pass data in, so the activation is always a compile-time constant. That
+  single fact removes im2col's usual cost (materializing every
+  overlapping window redundantly, at every inference) entirely -- it
+  happens exactly once, in Python, at import time, before any MLIR
+  exists. So a 2-D convolution over a constant activation and a constant
+  kernel reduces to exactly the (weight `[N, K]`, activation `[M, K]`)
+  shape `emit.emit_module` already emits for a plain matmul: reshape the
+  kernel `[Cout, Cin, Kh, Kw] -> [Cout, Cin*Kh*Kw]` (already Cout-major,
+  unlike MatMulInteger's own weight -- no transpose needed, see
+  `im2col.py`'s own module docstring), im2col the activation into
+  `[N*OutH*OutW, Cin*Kh*Kw]` (`python/cim_frontend/im2col.py`, free of any
+  `onnx` dependency, same reason `emit.py` is), and emit the same
+  `linalg.matmul_transpose_b` `cim-detect`/`cim-partition`/the interpreter
+  already fully verify. `N*OutH*OutW` flattens straight into the
+  already-existing M > 1 batching machinery above -- no new code needed
+  for a batched conv either.
+
+  `QLinearConv`, unlike `MatMulInteger`, always quantizes its own output
+  in one node (`x_scale`/`w_scale`/`y_scale`), so `emit.emit_module`
+  gained an optional `trailing_requantize` parameter: a single,
+  unconditional `cim.requantize` after the layer this function ever
+  emits (as opposed to `emit_chain_module`'s 0-or-1-per-BRIDGE one).
+  Backward compatible by construction -- `trailing_requantize=None`'s
+  output is still byte-identical to `build_module()`. The single scalar
+  `cim.requantize` needs is derived as
+  `y_scale / (x_scale * w_scale)`, which QLinearConv's own reference
+  formula makes equivalent to `round(res * (x_scale * w_scale /
+  y_scale))` for `res` an integer accumulator.
+
+  Deliberately refused, each named and reasoned about rather than
+  silently approximated (`onnx_import.py`'s `load_qlinear_conv` module
+  section header has the full list): grouped/depthwise convolution (each
+  group is a genuinely separate matmul, not one reshape), dilation (a
+  dilated tap reads a non-contiguous patch, which this im2col's
+  contiguous-slice implementation does not express), per-output-channel
+  (per-axis) quantization (a single `cim.requantize` call takes exactly
+  one scalar scale), a non-zero `x_zero_point`/`w_zero_point`/
+  `y_zero_point` (same "needs a per-output bias term this dialect cannot
+  express" reason `MatMulInteger`'s own zero points are refused for), a
+  bias operand (added directly to the raw int32 accumulator per output
+  channel -- there is no cim op for that at this point in the pipeline
+  without risking an unverified interaction with `cim-partition`'s own,
+  unrelated use of `cim.reduce_partial` for K-tiling, the same discipline
+  `Gemm`'s bias is refused for), and any `auto_pad` other than `NOTSET`
+  (including `VALID`, despite `VALID` being definitionally just
+  `pads=[0, 0, 0, 0]` -- found while testing: `onnx.reference`'s own Conv
+  implementation computes `VALID`'s padding with the same shape-dependent
+  formula as `SAME_UPPER`/`SAME_LOWER`, and that formula indexes
+  `X.shape[i]` for a spatial dimension without skipping the leading N/C
+  axes, so it is wrong for any model with `N != 1` or `Cin != 1` -- a bug
+  in the oracle, not a reason to special-case `VALID` on this side, since
+  `NOTSET` with `pads=[0, 0, 0, 0]` -- this function's own default -- is
+  already exactly `VALID`'s defined behavior).
+
+  Verified: `test/python/test_onnx_frontend_conv.py` --
+  a strided, padded, non-saturating differential against
+  `onnx.reference`'s own quantized `QLinearConv` evaluation; a batched
+  (N > 1) case proving im2col's batch flattening composes with the M > 1
+  machinery; a full-int8-range 1x1-kernel case at an odd derived scale
+  (mathematically guaranteed no rounding tie, the same v = scale*(n+0.5)
+  argument the chain bridge's own odd-scale test relies on); a
+  hand-constructed exact-tie case documenting the same
+  half-away-from-zero-vs-half-to-even divergence the chain bridge's own
+  tie test documents; one refusal test per restriction above; and a
+  direct, `onnx`-free unit test of `im2col_nchw` against an independent,
+  non-im2col-based hand-written convolution loop. Mutation-tested twice:
+  inverting the derived-scale formula (`x_scale*w_scale/y_scale` instead
+  of `y_scale/(x_scale*w_scale)`) was caught by every correctness test;
+  swapping im2col's height/width slice indices was caught by every
+  correctness test AND the onnx-free `im2col_nchw` unit test. Also caught
+  a real test-quality issue while writing it, not a hypothetical one:
+  the first version of the batched test used an even `y_scale=4`, which
+  hit a genuine rounding tie at one output element -- fixed by switching
+  to the odd `y_scale=5`, the same odd-scale-avoids-ties reasoning used
+  throughout this front end.
+
+  Deliberately not in scope for this entry: a *chain* of convolutions (or
+  a convolution feeding a matmul), matching how single-layer matmul
+  import preceded chained matmul import.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

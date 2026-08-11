@@ -126,15 +126,23 @@ def parse_output(text):
 
 def parse_all_outputs(text):
     """Every printed result, in order. A two-matmul module prints twice, and
-    checking only the first would let a bug in the second go unnoticed."""
+    checking only the first would let a bug in the second go unnoticed.
+
+    Matches any `cim_print_*` line, not only `cim_print_i32`: the
+    interpreter itself dispatches on the same prefix, generically, for any
+    result element width (Interpreter.cpp's runCall) -- `cim_print_i8` is
+    what a module ending in a trailing cim.requantize prints (e.g. a
+    standalone QLinearConv import; see test_onnx_frontend_conv.py), and
+    both element widths encode a plain comma-separated int list the same
+    way, so one parser already covers both without caring which."""
     outputs = []
     for line in text.splitlines():
-        if line.startswith("cim_print_i32"):
+        if line.startswith("cim_print_"):
             data = line.split("data=[", 1)[1].rstrip("]")
             outputs.append(np.array([int(t) for t in data.split(",") if t],
                                     dtype=np.int64))
     if not outputs:
-        raise PipelineError(f"no cim_print_i32 line in cim-run output:\n{text}")
+        raise PipelineError(f"no cim_print_* line in cim-run output:\n{text}")
     return outputs
 
 

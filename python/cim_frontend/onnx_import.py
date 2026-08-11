@@ -51,12 +51,16 @@ import hashlib
 import numpy as np
 
 from .emit import emit_chain_module, emit_module, sanitize_symbol
+from .im2col import im2col_nchw
 from .refusal import Refusal
 
 # MatMulInteger was introduced at opset 10.
 MIN_OPSET = 10
 
 ACCEPTED_OP = "MatMulInteger"
+
+# QLinearConv was introduced at the same opset.
+ACCEPTED_CONV_OP = "QLinearConv"
 
 
 def _tensor_names(model):
@@ -522,6 +526,348 @@ def load_matmul_chain(model):
     return matmul_nodes, weights, first_act_name, scales
 
 
+# ---------------------------------------------------------------------------
+# A single QLinearConv node -- a 2-D convolution IS a matmul, once
+#
+# WHY THIS IS TRACTABLE AT ALL
+# =============================
+# A general convolution is genuinely a different primitive than a
+# matrix-vector multiply, and turning one into the other (im2col) is
+# usually considered expensive: it materializes every overlapping window
+# of the activation, redundantly, at every inference. That cost does not
+# apply here. This file's own module docstring already establishes that
+# every emitted module is ONE BAKED INFERENCE -- cim-run has no mechanism
+# to pass data in, so the activation is always a compile-time constant.
+# im2col over a constant, at import time, in Python, happens exactly once,
+# ever, for a given (model, activation) pair -- there is no redundant
+# per-inference cost to worry about, because there is no per-inference
+# cost at all in this project's execution model. See im2col.py's own
+# module docstring for the reshape that makes this work with NO new MLIR
+# op and NO change to cim-detect/cim-partition/the interpreter: this
+# function's whole job is producing the same (weight[N, K], activation
+# [M, K]) shape load_matmul_integer already does, so emit.emit_module can
+# be reused completely unchanged.
+#
+# WHAT IS DELIBERATELY REFUSED, AND WHY
+# =======================================
+# QLinearConv is a much larger op than MatMulInteger -- grouped/depthwise
+# convolution, dilation, per-output-channel (per-axis) quantization, and a
+# fused int32 bias are all real, common features of quantized conv models
+# that a production quantization toolchain routinely produces. Each is
+# refused explicitly rather than approximated:
+#
+#   * group != 1: each group is really an independent matmul over a slice
+#     of channels, not one reshape. Silently computing group=1's answer
+#     for a grouped (e.g. depthwise) conv would be a confident wrong
+#     number, not a shape error.
+#   * dilations != (1, 1): a dilated kernel tap reads a non-contiguous
+#     patch; im2col_nchw's contiguous-slice implementation does not
+#     express that, and pretending stride covers it would too.
+#   * a non-scalar w_scale (per-output-channel quantization): a real
+#     `cim.requantize` call takes exactly one scalar `scale` attribute, so
+#     per-channel scales cannot be expressed as one op. Averaging or
+#     picking one channel's scale would silently change the arithmetic
+#     for every other channel.
+#   * a non-zero x_zero_point, w_zero_point, or y_zero_point: the same
+#     "needs a per-output bias term this dialect cannot express" reason
+#     load_matmul_integer's own _zero_point_is_zero refuses it for.
+#   * a bias operand B: QLinearConv adds B directly to the raw int32
+#     accumulator, per-output-channel, before scaling. There is no cim op
+#     that adds two same-shape int32 buffers at THIS point in the
+#     pipeline (cim.reduce_partial exists, but only as an implementation
+#     detail cim-partition inserts for its own K-tiling, after this
+#     import-time code has already run) without risking an interaction
+#     with that pass this code has not verified -- the same discipline
+#     `Gemm`'s bias operand is refused for above.
+#   * `auto_pad` other than "NOTSET" (explicit `pads`): SAME_UPPER/
+#     SAME_LOWER/VALID all need shape-dependent padding math to replicate
+#     exactly, and getting that arithmetic wrong is a silent one-pixel
+#     offset, not a crash. VALID specifically (which the ONNX spec defines
+#     as simply "no padding") is refused too, rather than special-cased as
+#     the trivial pads=[0, 0, 0, 0] it should be: onnx.reference's own
+#     Conv implementation (op_conv._conv_implementation) computes VALID's
+#     padding with the same shape-dependent formula as SAME_UPPER/
+#     SAME_LOWER, and that formula indexes `X.shape[i]` for the spatial
+#     dims without skipping the leading N/C axes -- so it is wrong for any
+#     model with N != 1 or C != 1, which is most of them. That is a bug in
+#     the oracle, not something this front end should route around
+#     silently; refusing all `auto_pad` but NOTSET sidesteps it entirely,
+#     and costs nothing real, since NOTSET with `pads=[0, 0, 0, 0]`
+#     (also this function's own default) is already exactly VALID's
+#     defined behavior.
+# ---------------------------------------------------------------------------
+
+_INT8 = 3  # TensorProto.INT8
+
+
+def _initializer_or_refuse(graph, name, node_name, which):
+    arr = _initializer_array(graph, name)
+    if arr is None:
+        raise Refusal(
+            f"{which} '{name}' is not a constant initializer, so its value "
+            f"cannot be checked at compile time. Nothing emitted.",
+            where=f"node '{node_name}'")
+    return arr
+
+
+def _positive_scalar_scale(graph, name, node_name, which):
+    arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
+    if arr.size != 1:
+        raise Refusal(
+            f"{which} has {arr.size} elements -- per-output-channel "
+            f"(per-axis) quantization. A single cim.requantize call takes "
+            f"exactly one scalar scale; picking or averaging one channel's "
+            f"scale would silently change the arithmetic for every other "
+            f"channel. Nothing emitted.", where=f"node '{node_name}'")
+    value = float(arr.reshape(-1)[0])
+    if not (value > 0.0):
+        raise Refusal(f"{which} must be a positive constant, got {value}. "
+                      f"Nothing emitted.", where=f"node '{node_name}'")
+    return value
+
+
+def _zero_int8_zero_point(graph, name, node_name, which):
+    arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
+    if arr.dtype != np.int8:
+        raise Refusal(
+            f"{which} is {arr.dtype}; cim.mvm and the simulator are signed "
+            f"throughout. Nothing emitted.", where=f"node '{node_name}'")
+    if np.any(arr != 0):
+        raise Refusal(
+            f"{which} is {arr.ravel().tolist()}, but only symmetric "
+            f"(zero_point 0) quantization is supported -- a non-zero zero "
+            f"point needs a per-output bias term this dialect has no op "
+            f"for. Nothing emitted.", where=f"node '{node_name}'")
+
+
+def _int_attr(node, name, default):
+    attr = next((a for a in node.attribute if a.name == name), None)
+    if attr is None:
+        return default
+    return int(attr.i)
+
+
+def _int_list_attr(node, name, default):
+    attr = next((a for a in node.attribute if a.name == name), None)
+    if attr is None:
+        return list(default)
+    return [int(v) for v in attr.ints]
+
+
+def _str_attr(node, name, default):
+    attr = next((a for a in node.attribute if a.name == name), None)
+    if attr is None:
+        return default
+    return attr.s.decode("utf-8")
+
+
+def load_qlinear_conv(model):
+    """The single accepted QLinearConv node.
+
+    Returns (node, weight2d[Cout, Cin*Kh*Kw], x_name, x_shape[N,Cin,H,W],
+    conv_params, derived_scale) where `conv_params` is (kh, kw, stride_h,
+    stride_w, pad_top, pad_bottom, pad_left, pad_right) -- exactly
+    im2col_nchw's own trailing arguments, so callers pass it straight
+    through -- and `derived_scale` is the single positive float that makes
+    `cim.requantize(scale=derived_scale, zero_point=0, effective_bits=8)`
+    compute the same `round(res * (x_scale * w_scale / y_scale))`
+    QLinearConv's own reference semantics define, given `res` is the raw
+    (pre-scale) accumulator: `round(res / (y_scale / (x_scale * w_scale)))
+    == round(res * (x_scale * w_scale / y_scale))`.
+
+    Raises Refusal for anything outside the scope this module's own header
+    comment names (grouped/dilated convolution, per-channel quantization,
+    a non-zero zero point, a bias operand, non-explicit padding).
+    """
+    from onnx import numpy_helper
+
+    _check_opset(model)
+    graph = model.graph
+
+    convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
+    if not convs:
+        seen = sorted({n.op_type for n in graph.node})
+        raise Refusal(
+            f"no {ACCEPTED_CONV_OP} node in the graph (found: "
+            f"{', '.join(seen) if seen else 'no nodes at all'}). Nothing "
+            f"emitted.")
+    if len(convs) > 1:
+        raise Refusal(
+            f"found {len(convs)} {ACCEPTED_CONV_OP} nodes; only a single "
+            f"standalone convolution is imported today, not a chain of "
+            f"them. Nothing emitted.")
+
+    node = convs[0]
+    where = f"node '{node.name or ACCEPTED_CONV_OP}'"
+
+    others = [n for n in graph.node if n is not node]
+    if others:
+        kinds = sorted({n.op_type for n in others})
+        raise Refusal(
+            f"graph also contains {', '.join(kinds)}. This front end imports "
+            f"a graph consisting of one {ACCEPTED_CONV_OP} and nothing else. "
+            f"Nothing emitted.")
+
+    initializers = _tensor_names(model)
+    if len(node.input) < 8:
+        raise Refusal(
+            f"{ACCEPTED_CONV_OP} has {len(node.input)} inputs; x, x_scale, "
+            f"x_zero_point, w, w_scale, w_zero_point, y_scale and "
+            f"y_zero_point are all mandatory per the ONNX spec. Nothing "
+            f"emitted.", where=where)
+    (x_name, x_scale_name, x_zp_name, w_name, w_scale_name, w_zp_name,
+     y_scale_name, y_zp_name) = node.input[:8]
+    if len(node.input) > 8 and node.input[8]:
+        raise Refusal(
+            f"has a bias operand '{node.input[8]}'. QLinearConv adds it "
+            f"directly to the raw int32 accumulator, per output channel, "
+            f"before scaling -- there is no cim op that does that at this "
+            f"point in the pipeline without risking an interaction with "
+            f"cim-partition's own (unrelated) use of cim.reduce_partial "
+            f"for K-tiling, which this front end has not verified composes "
+            f"correctly. Nothing emitted.", where=where)
+
+    if w_name not in initializers:
+        raise Refusal(
+            f"the weight operand '{w_name}' is not a constant initializer. "
+            f"Weight-stationary hardware has nothing to make resident if "
+            f"the weights are computed at runtime. Nothing emitted.",
+            where=where)
+    if x_name in initializers:
+        raise Refusal(
+            f"both operands are constant initializers. Nothing emitted.",
+            where=where)
+
+    x_scale = _positive_scalar_scale(graph, x_scale_name, node.name, "x_scale")
+    w_scale = _positive_scalar_scale(graph, w_scale_name, node.name, "w_scale")
+    y_scale = _positive_scalar_scale(graph, y_scale_name, node.name, "y_scale")
+    _zero_int8_zero_point(graph, x_zp_name, node.name, "x_zero_point")
+    _zero_int8_zero_point(graph, w_zp_name, node.name, "w_zero_point")
+    _zero_int8_zero_point(graph, y_zp_name, node.name, "y_zero_point")
+
+    group = _int_attr(node, "group", 1)
+    if group != 1:
+        raise Refusal(
+            f"group={group}; only group=1 (a plain, non-grouped "
+            f"convolution) is imported. Each group is really an "
+            f"independent matmul over a slice of channels, not one "
+            f"reshape. Nothing emitted.", where=where)
+
+    dilations = _int_list_attr(node, "dilations", [1, 1])
+    if dilations != [1, 1]:
+        raise Refusal(
+            f"dilations={dilations}; only dilation (1, 1) is imported. A "
+            f"dilated kernel tap reads a non-contiguous patch, which this "
+            f"front end's im2col does not express. Nothing emitted.",
+            where=where)
+
+    auto_pad = _str_attr(node, "auto_pad", "NOTSET")
+    if auto_pad != "NOTSET":
+        raise Refusal(
+            f"auto_pad='{auto_pad}'; only 'NOTSET' (explicit `pads`, "
+            f"defaulting to no padding) is imported. SAME_UPPER/SAME_LOWER/"
+            f"VALID all need shape-dependent padding math this front end "
+            f"does not replicate -- see this module's own 'WHAT IS "
+            f"DELIBERATELY REFUSED' note on why VALID specifically is not "
+            f"special-cased despite being definitionally just "
+            f"pads=[0, 0, 0, 0] (an onnx.reference bug in exactly that "
+            f"computation, not a limitation on this front end's side).  "
+            f"Pass pads=[0, 0, 0, 0] explicitly (already this function's "
+            f"own default) for the same effect. Nothing emitted.",
+            where=where)
+
+    w_init = next(i for i in graph.initializer if i.name == w_name)
+    weight = numpy_helper.to_array(w_init)
+    if weight.dtype != np.int8:
+        raise Refusal(
+            f"the weight operand '{w_name}' has dtype {weight.dtype}. "
+            f"Nothing emitted.", where=where)
+    if weight.ndim != 4:
+        raise Refusal(
+            f"the weight operand '{w_name}' has rank {weight.ndim}; a 2-D "
+            f"convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. Nothing "
+            f"emitted.", where=where)
+    cout, cin, kh, kw = weight.shape
+
+    kernel_shape = _int_list_attr(node, "kernel_shape", [kh, kw])
+    if kernel_shape != [kh, kw]:
+        raise Refusal(
+            f"kernel_shape={kernel_shape} does not match the weight's own "
+            f"({kh}, {kw}). Nothing emitted.", where=where)
+
+    # auto_pad == "NOTSET" always, checked above.
+    pads = _int_list_attr(node, "pads", [0, 0, 0, 0])
+    if len(pads) != 4:
+        raise Refusal(
+            f"pads={pads} has {len(pads)} entries; a 2-D convolution needs "
+            f"exactly 4 (pad_top, pad_left, pad_bottom, pad_right). Nothing "
+            f"emitted.", where=where)
+    pad_top, pad_left, pad_bottom, pad_right = pads
+
+    strides = _int_list_attr(node, "strides", [1, 1])
+    if len(strides) != 2:
+        raise Refusal(
+            f"strides={strides} has {len(strides)} entries; a 2-D "
+            f"convolution needs exactly 2. Nothing emitted.", where=where)
+    stride_h, stride_w = strides
+
+    x_info = next((v for v in graph.input if v.name == x_name), None)
+    if x_info is None:
+        raise Refusal(
+            f"the activation operand '{x_name}' is neither a graph input "
+            f"nor a constant. Nothing emitted.", where=where)
+    if x_info.type.tensor_type.elem_type != _INT8:
+        raise Refusal(
+            f"the activation operand '{x_name}' is not int8. Nothing "
+            f"emitted.", where=where)
+    x_shape = _shape_of(x_info)
+    if x_shape is None:
+        raise Refusal(
+            f"the activation operand '{x_name}' has a symbolic or unknown "
+            f"shape. Nothing emitted.", where=where)
+    if len(x_shape) != 4:
+        raise Refusal(
+            f"the activation operand '{x_name}' has rank {len(x_shape)}; a "
+            f"2-D convolution's input is rank 4 [N, Cin, H, W]. Nothing "
+            f"emitted.", where=where)
+    if x_shape[1] != cin:
+        raise Refusal(
+            f"activation has Cin={x_shape[1]} but the weight is "
+            f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+            where=where)
+
+    # Cout-major already -- see im2col.py's own note on why, unlike
+    # MatMulInteger's B, this weight needs no transpose.
+    weight2d = np.ascontiguousarray(weight.reshape(cout, cin * kh * kw))
+
+    # round(res / derived_scale) == round(res * (x_scale * w_scale /
+    # y_scale)), QLinearConv's own reference formula for `res` an integer
+    # (raw, pre-scale) accumulator -- see this function's own docstring.
+    derived_scale = y_scale / (x_scale * w_scale)
+
+    conv_params = (kh, kw, stride_h, stride_w,
+                  pad_top, pad_bottom, pad_left, pad_right)
+    return node, weight2d, x_name, tuple(x_shape), conv_params, derived_scale
+
+
+def _validate_conv_activation(activation, x_shape):
+    """The supplied activation must be exactly `x_shape` ([N, Cin, H, W])."""
+    activation = np.asarray(activation)
+    if tuple(activation.shape) != tuple(x_shape):
+        raise Refusal(
+            f"the supplied activation has shape {list(activation.shape)}; "
+            f"the model's convolution input is {list(x_shape)}. Nothing "
+            f"emitted.")
+    if activation.dtype != np.int8:
+        lo, hi = int(activation.min()), int(activation.max())
+        if lo < -128 or hi > 127:
+            raise Refusal(
+                f"the supplied activation has values in [{lo}, {hi}], which "
+                f"does not fit int8. Nothing emitted.")
+        activation = activation.astype(np.int8)
+    return activation
+
+
 def provenance(model_path, model_bytes, activation_source):
     """MLIR comments recording where this module came from.
 
@@ -578,15 +924,42 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     Dispatches on how many MatMulInteger nodes the graph has: exactly one
     goes through the single-layer path (load_matmul_integer, unchanged
     since before chains existed); two or more go through load_matmul_chain.
-    A model with zero, or with stray Cast/QuantizeLinear nodes around a
-    single MatMulInteger, is refused by load_matmul_integer's own "graph
-    also contains ..." check, which already says the right thing for that
-    case.
+    A model with zero MatMulInteger nodes but a single QLinearConv goes
+    through load_qlinear_conv instead (see that function's own module
+    section header for scope and rationale). A model with zero of either,
+    or with stray Cast/QuantizeLinear nodes around a single MatMulInteger,
+    is refused by load_matmul_integer's own "graph also contains ..."
+    check, which already says the right thing for that case.
     """
     from onnx import TensorProto  # noqa: F401 (documents op_type below)
 
     matmul_count = sum(1 for n in model.graph.node
                        if n.op_type == ACCEPTED_OP)
+    conv_count = sum(1 for n in model.graph.node
+                     if n.op_type == ACCEPTED_CONV_OP)
+
+    if matmul_count == 0 and conv_count >= 1:
+        (node, weight2d, x_name, x_shape, conv_params,
+         derived_scale) = load_qlinear_conv(model)
+        activation = _validate_conv_activation(activation, x_shape)
+
+        patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
+                                                        *conv_params)
+
+        taken = set()
+        weight_sym = sanitize_symbol(node.input[3], taken)  # w
+        act_sym = sanitize_symbol(x_name, taken)
+
+        header = provenance(model_path, model_bytes, activation_source)
+        header += (
+            f"//   conv im2col: N={n_batch} OutH={out_h} OutW={out_w} -- "
+            f"raw matmul output rows are in (n, oh, ow) row-major order, "
+            f"reshape to [N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) "
+            f"for ONNX's own [N, Cout, OutH, OutW] layout.\n")
+        return emit_module(
+            weight2d, patches, weight_sym=weight_sym, act_sym=act_sym,
+            header=header,
+            trailing_requantize=(derived_scale, 0, 8))
 
     if matmul_count >= 2:
         nodes, weights, first_act_name, scales = load_matmul_chain(model)

@@ -71,7 +71,8 @@ def _dense_2d(arr):
     return f"[{rows}]"
 
 
-def emit_module(weight, activation, weight_sym="w", act_sym="a", header=""):
+def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
+                trailing_requantize=None):
     """A self-contained module computing `activation @ weight.T`.
 
     `weight` is [N, K] int8 -- ALREADY TRANSPOSED into cim.mvm's
@@ -86,10 +87,22 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header=""):
     a real scf.for over the rows itself (docs/roadmap.md's M4 entry), so
     this front end no longer has to refuse anything but [1, K]/[K].
 
-    With the default symbol names, no header, and a 1-D (or [1, K])
-    activation, this returns text byte-identical to
-    test/python/test_numerical_differential.py's `build_module()` -- M > 1
-    is additive, not a rewrite of the M == 1 shape.
+    `trailing_requantize`, if given, is a `(scale, zero_point,
+    effective_bits)` tuple: a `cim.requantize` is emitted after the matmul
+    and its int8 result is what gets printed, instead of the raw int32
+    accumulator. This is for callers whose ONNX op ALWAYS quantizes its
+    own output in one node -- QLinearConv, unlike MatMulInteger, has no
+    "raw int32" variant to import -- so unlike emit_chain_module's
+    per-BRIDGE requantize (0 or 1 per adjacent layer pair), this is a
+    single, unconditional one attached to the only layer this function
+    ever emits. Default `None` preserves this function's original
+    raw-int32-output behavior exactly, including byte-identical text
+    against test/python/test_numerical_differential.py's `build_module()`.
+
+    With the default symbol names, no header, no trailing_requantize, and
+    a 1-D (or [1, K]) activation, this returns text byte-identical to
+    `build_module()` -- M > 1 and trailing_requantize are both additive,
+    not a rewrite of the base M == 1 shape.
     """
     weight = np.asarray(weight)
     activation = np.asarray(activation)
@@ -111,22 +124,49 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header=""):
 
     rows = _dense_2d(weight)
     acts = _dense_2d(activation)
+
+    matmul_lines = [
+        f"  %out = memref.alloc() : memref<{m}x{n}xi32>",
+        f"  linalg.matmul_transpose_b ins(%a, %w : memref<{m}x{k}xi8>, "
+        f"memref<{n}x{k}xi8>)",
+        f"    outs(%out : memref<{m}x{n}xi32>)",
+    ]
+    if trailing_requantize is None:
+        result_val = "%out"
+        result_elem, result_lines = "i32", matmul_lines
+    else:
+        scale, zero_point, effective_bits = trailing_requantize
+        if not (float(scale) > 0.0):
+            raise ValueError(
+                f"trailing_requantize's scale must be positive, got {scale}")
+        result_val = "%q"
+        result_elem = "i8"
+        result_lines = matmul_lines + [
+            f"  %q = cim.requantize %out {{scale = {float(scale)!r} : f32, "
+            f"zero_point = {int(zero_point)} : i32, "
+            f"effective_bits = {int(effective_bits)} : i32}}",
+            f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}x{result_elem}>",
+        ]
+
+    print_call = "cim_print_i32" if trailing_requantize is None else "cim_print_i8"
+    result_type = f"memref<{m}x{n}x{result_elem}>"
+    unranked_type = f"memref<*x{result_elem}>"
+    dealloc_result = f"  memref.dealloc {result_val} : {result_type}"
+    body = "\n".join(result_lines)
     return f"""\
 {header}memref.global "private" constant @{weight_sym} : memref<{n}x{k}xi8> = dense<{rows}>
 memref.global "private" constant @{act_sym} : memref<{m}x{k}xi8> = dense<{acts}>
-func.func private @cim_print_i32(memref<*xi32>)
+func.func private @{print_call}({unranked_type})
 func.func @main() {{
   %w = memref.get_global @{weight_sym} : memref<{n}x{k}xi8>
   %aInit = memref.get_global @{act_sym} : memref<{m}x{k}xi8>
   %a = memref.alloc() : memref<{m}x{k}xi8>
   memref.copy %aInit, %a : memref<{m}x{k}xi8> to memref<{m}x{k}xi8>
-  %out = memref.alloc() : memref<{m}x{n}xi32>
-  linalg.matmul_transpose_b ins(%a, %w : memref<{m}x{k}xi8>, memref<{n}x{k}xi8>)
-    outs(%out : memref<{m}x{n}xi32>)
-  %u = memref.cast %out : memref<{m}x{n}xi32> to memref<*xi32>
-  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+{body}
+  %u = memref.cast {result_val} : {result_type} to {unranked_type}
+  func.call @{print_call}(%u) : ({unranked_type}) -> ()
   memref.dealloc %a : memref<{m}x{k}xi8>
-  memref.dealloc %out : memref<{m}x{n}xi32>
+{dealloc_result}
   return
 }}
 """
