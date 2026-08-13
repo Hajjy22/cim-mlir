@@ -167,19 +167,57 @@ single "layer" — the scale it needs is derived as
 `y_scale / (x_scale * w_scale)`, matching `QLinearConv`'s own reference
 semantics for an integer accumulator.
 
-Only a plain, non-grouped, non-dilated, symmetric-quantization,
-no-bias, explicit-padding convolution is accepted — see `onnx_import.py`'s
-`load_qlinear_conv` module section header for the full list of what is
-refused and why (each is a real scope boundary, not an oversight; the
-refusal table below has an entry for the exact-padding requirement, which
-is the one surprise: `auto_pad=VALID` is refused too, despite being
-definitionally just zero padding, because `onnx.reference`'s own `Conv`
-implementation computes it with a padding formula that is wrong for any
-model with more than one image or input channel — an oracle bug this
-front end sidesteps by refusing it, rather than a limitation of its own).
-A chain of convolutions, or a convolution feeding a matmul, is not
-supported — only a single, standalone `QLinearConv`, matching how
-single-layer `MatMulInteger` import preceded chained import.
+Only a plain (non-grouped, non-dilated), explicit-padding convolution is
+accepted — see `onnx_import.py`'s `load_qlinear_conv` module section
+header for the full list of what is refused and why (each is a real scope
+boundary, not an oversight; the refusal table below has an entry for the
+exact-padding requirement, which is the one surprise: `auto_pad=VALID` is
+refused too, despite being definitionally just zero padding, because
+`onnx.reference`'s own `Conv` implementation computes it with a padding
+formula that is wrong for any model with more than one image or input
+channel — an oracle bug this front end sidesteps by refusing it, rather
+than a limitation of its own). A chain of convolutions, or a convolution
+feeding a matmul, is not supported — only a single, standalone
+`QLinearConv`, matching how single-layer `MatMulInteger` import preceded
+chained import.
+
+**Per-channel scale, a real bias, and asymmetric zero points are also
+accepted** — found necessary, not merely nice-to-have, by importing a real
+model (`squeezenet1.0-12-int8` from the ONNX model zoo): every layer of a
+real, ONNX-Runtime-quantized model uses a per-output-channel `w_scale`, a
+real int32 bias, and an asymmetric `x_zero_point`, none of which the first
+version of this front end accepted. All three (plus a real
+`y_zero_point`) turned out to be expressible with existing,
+already-verified machinery rather than a dialect change:
+
+- **Per-channel `w_scale`**: N `cim.requantize` calls, one per output
+  channel, each against a `memref.subview` of that column.
+- **A bias operand**: one `cim.reduce_partial(matmul_output,
+  bias_broadcast)` between the matmul and the eventual requantize —
+  composes cleanly with `cim-partition`'s own rewrite because that pass
+  treats a matmul's output buffer as an opaque destination it fills in
+  place, regardless of what reads it afterward.
+- **A non-zero `x_zero_point`**: subtracted from the constant activation
+  in Python before im2col ever runs — exact whenever `w_zero_point == 0`
+  (still required), refused if the shifted result does not fit signed
+  int8.
+- **A non-zero `y_zero_point`**: `cim.requantize` already had a real
+  `zero_point` parameter; this front end just stopped hard-coding it to
+  0.
+
+Still refused: a non-zero `w_zero_point` (the correction term it would
+need is per-row, activation-dependent — not a fixed per-channel bias, so
+it is not a reshape of anything above), and a non-scalar `x_zero_point`/
+`y_zero_point` (per-tensor activation/output quantization is the
+near-universal convention, unlike per-channel weight scale).
+`squeezenet1.0-12-int8`'s own first layer was extracted standalone and run
+through the real compiled pipeline as a capstone check: all 14,400 output
+elements matched `onnx.reference` exactly, using its actual per-channel
+scales, actual bias, and actual asymmetric input — the one thing that
+layer could not be imported with unmodified is its declared `uint8`
+output (`y_zero_point` dtype), since `cim.requantize`'s clamp is a signed
+range and cannot represent uint8's full span; a real, still-open gap, not
+a re-hidden version of the zero-point restriction above.
 
 ## What it refuses, and why refusing is the point
 
@@ -205,8 +243,9 @@ is worse than a refusal.
 | a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
 | a grouped/depthwise `QLinearConv` (`group != 1`) | each group is really an independent matmul over a slice of channels, not one reshape |
 | a dilated `QLinearConv` (`dilations != (1, 1)`) | a dilated kernel tap reads a non-contiguous patch, which this front end's im2col does not express |
-| a `QLinearConv` with a non-scalar `w_scale` | per-output-channel quantization; a single `cim.requantize` call takes exactly one scalar scale |
-| a `QLinearConv` bias operand | added directly to the raw int32 accumulator per output channel; there is no cim op for that at this point in the pipeline without risking an unverified interaction with `cim-partition`'s own use of `cim.reduce_partial` for K-tiling |
+| a `QLinearConv` with a non-zero `w_zero_point` | its correction term is per-row (activation-dependent), not a fixed per-channel bias, so it is not one of the reshapes above |
+| a `QLinearConv` with a non-scalar `x_zero_point` or `y_zero_point` | per-tensor activation/output quantization is the near-universal convention, unlike per-channel weight scale |
+| a `QLinearConv` with a uint8 `y_zero_point` | `cim.requantize`'s clamp is a signed `effective_bits` range; it cannot represent a uint8 output's full `[0, 255]` span |
 | a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
 | more than one `QLinearConv` node | only a single, standalone convolution is imported; not a chain of them, and not one feeding a matmul |
 
@@ -267,9 +306,14 @@ any accumulator leaves `[-128, 127]`.
   `QLinearConv` evaluation, a batched (N > 1) case proving im2col's batch
   flattening composes with M > 1, a full-int8-range 1x1-kernel case at an
   odd derived scale (guaranteed no rounding tie), a hand-built exact-tie
-  case documenting the known rounding-mode divergence, one refusal test
-  per convolution-specific row above, and a direct, `onnx`-free unit test
+  case documenting the known rounding-mode divergence, a per-channel-scale
+  differential, a bias differential, asymmetric `x_zero_point` and
+  `y_zero_point` differentials, one refusal test per convolution-specific
+  row above (including the all-zero-but-per-channel-shaped
+  `w_zero_point` a real model ships), and a direct, `onnx`-free unit test
   of `im2col_nchw` against an independent hand-written convolution loop.
+  Also validated, outside CI, against `squeezenet1.0-12-int8` (ONNX model
+  zoo) itself — see `docs/roadmap.md`'s M4 entry for the exact result.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 

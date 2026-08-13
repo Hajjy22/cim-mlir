@@ -1502,6 +1502,95 @@ out of scope for v0.1 across the board, not just here.
   Deliberately not in scope for this entry: a *chain* of convolutions (or
   a convolution feeding a matmul), matching how single-layer matmul
   import preceded chained matmul import.
+- **Per-channel scale, a real bias, and asymmetric zero points -- also
+  reshapes, found by testing against a real model, not by inspection.**
+  The convolution entry above was validated only against hand-built
+  synthetic fixtures. Importing `squeezenet1.0-12-int8` from the ONNX
+  model zoo -- a real, ONNX-Runtime-quantized model -- immediately
+  refused on the very first layer, three separate times: a
+  per-output-channel `w_scale` (64 distinct values), a real int32 bias,
+  and an asymmetric (`x_zero_point=115`, uint8) input. None of these are
+  exotic; they are the *default* output of a real quantization
+  toolchain. Investigated each by hand-building a probe module and
+  running it through a real `cim-opt`/`cim-run` round trip before writing
+  any of `onnx_import.py`'s new code, exactly the discipline the plain-
+  convolution entry above already used -- and found all three (plus a
+  fourth, `y_zero_point`) are expressible with existing, already-verified
+  machinery, not a dialect change:
+  - **Per-channel scale**: N `cim.requantize` calls, one per output
+    channel, each against a `memref.subview` of that column.
+    `AnyMemRef` accepts a strided view, and the interpreter's gather/
+    scatter already handle strides generically (the same machinery
+    `cim-partition`'s own ragged-tile padding relies on).
+  - **Bias**: a single `cim.reduce_partial(matmul_output, bias_broadcast)`
+    between the matmul and the eventual requantize. `cim.reduce_partial`'s
+    verifier constrains operand shape and element type only, never
+    producer, and `cim-partition` treats a matmul's `outs` buffer as an
+    opaque, pre-allocated destination it fills in place -- erasing the
+    matmul op once the tiled sequence has written the real answer back
+    into that SAME buffer. A hand-emitted `cim.reduce_partial` reading
+    that buffer therefore composes with `cim-partition`'s rewrite with no
+    special-casing on either side. This closes the "unverified
+    interaction" the plain-convolution entry's bias refusal named as its
+    reason -- it turned out to compose cleanly the first time it was
+    actually tried.
+  - **Asymmetric `x_zero_point`**: this project's "one baked inference"
+    contract makes the activation a compile-time constant, so
+    `X - x_zero_point` is computed once, in Python, before any MLIR is
+    emitted -- exactly like im2col itself. Exact whenever
+    `w_zero_point == 0` (still required; see below), and refused, naming
+    the actual out-of-range values, if the shifted result does not fit
+    signed int8.
+  - **Asymmetric `y_zero_point`**: `cim.requantize` already carries a real
+    `zero_point : i32` attribute (`legalize_precision_e2e_test.cpp`
+    proves it at `zero_point=3`), and `cimrt_requantize`'s order of
+    operations -- round, THEN add zero_point, THEN clamp -- already
+    matches QLinearConv's own reference formula exactly. The only change
+    was to stop hard-coding it to 0.
+
+  Still refused, and for a real (not merely unexplored) reason:
+  `w_zero_point != 0` -- the `w_zp * X` cross term in QLinearConv's true
+  accumulator is per-ROW (activation-dependent), not a fixed per-channel
+  correction the way a bias is, so it is not a reshape of anything that
+  already exists. In practice this costs little: real toolchains commonly
+  keep weights symmetric even when activations are asymmetric, exactly as
+  `squeezenet1.0-12-int8` itself does (whose own `w_zero_point`, checked
+  by hand, ships as a length-64 array where every entry happens to be 0 --
+  itself a small, real finding: `w_zero_point` needed the same
+  scalar-or-per-channel-*shape* handling as `w_scale`, even though its
+  *value* must stay entirely zero either way). A non-scalar
+  `x_zero_point`/`y_zero_point` also stays refused: per-tensor activation/
+  output quantization is the near-universal convention, unlike per-channel
+  *weight* scale.
+
+  **Capstone verification, beyond the fixture-based tests below**: the
+  real `squeezenet1.0-12-int8` first layer -- its actual per-channel
+  weight scales, its actual bias, its actual `x_zero_point=115` -- was
+  extracted into a standalone single-node model and run through the real
+  `cim-opt`/`cim-run` pipeline. Every one of the 14,400 output elements
+  (a 15x15x64 feature map) matched `onnx.reference`'s own evaluation of
+  the same real model exactly. The one remaining gap this exposed: that
+  layer's `y_zero_point` is declared `uint8`, and `cim.requantize`'s
+  clamp is a signed `effective_bits` range that cannot represent a uint8
+  output's full `[0, 255]` span -- refused explicitly (not silently
+  wrapped) rather than forced through. This is a real, currently
+  uninvestigated gap, not the earlier "y_zero_point unsupported"
+  restriction reappearing under a new name.
+
+  Verified: `test/python/test_onnx_frontend_conv.py` -- a bias
+  differential with three distinct, non-symmetric channel values (so a
+  row/column mix-up in the broadcast reads as a loud wrong number), a
+  per-channel-scale differential with three deliberately different
+  scales, an asymmetric-`x_zero_point` differential (uint8 input,
+  zero_point=120), an asymmetric-`y_zero_point` differential, one
+  refusal test per restriction above (including the all-zero-but-
+  per-channel-shaped `w_zero_point` acceptance found via the real model),
+  and a "prove it doesn't refuse everything" test for that exact shape.
+  Mutation-tested: inverting the per-channel derived-scale formula,
+  flipping the sign of the `x_zero_point` subtraction, reversing the
+  bias array's channel order, and disabling the `w_zero_point`-must-be-
+  zero check were each caught by the correctness or refusal tests built
+  for that specific capability.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`

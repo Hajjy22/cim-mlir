@@ -12,9 +12,21 @@ is reshaped into the SAME (weight[N, K], activation[M, K]) shape a plain
 MatMulInteger already produces -- see im2col.py's own module docstring for
 the exact reshape, and load_qlinear_conv's module section header
 (onnx_import.py) for what is deliberately still refused (grouped
-convolution, dilation, per-channel quantization, a bias operand,
-non-explicit padding) and why each is a real scope boundary rather than an
-oversight.
+convolution, dilation, a non-zero w_zero_point, non-explicit padding) and
+why each is a real scope boundary rather than an oversight.
+
+PER-CHANNEL SCALE, BIAS, AND ASYMMETRIC ZERO POINTS ARE ALSO RESHAPES
+------------------------------------------------------------------------
+A real quantized model (squeezenet1.0-12-int8, pulled from the ONNX model
+zoo while researching what to build next) uses per-channel `w_scale`, a
+real int32 bias, and an asymmetric `x_zero_point` on every single layer --
+none of which the first version of this front end accepted. All three
+turned out to be expressible with existing, already-verified machinery
+(N `cim.requantize` calls over column subviews for per-channel scale, a
+`cim.reduce_partial` for the bias, a Python-side constant shift for
+x_zero_point), not a dialect change -- see load_qlinear_conv's own module
+section header for the full reasoning and the real round trips that
+confirmed each one before this file's own tests were written.
 
 THE SCALE ARITHMETIC IS DIFFERENT FROM THE CHAIN BRIDGE'S
 ------------------------------------------------------------
@@ -55,6 +67,8 @@ sys.path.insert(0, os.path.join(
     "python"))
 
 pytest.importorskip("onnx", reason="the ONNX front end's oracle")
+
+import onnx  # noqa: E402
 
 from cim_frontend.im2col import im2col_nchw  # noqa: E402
 from cim_frontend.onnx_import import import_model  # noqa: E402
@@ -208,6 +222,107 @@ def test_a_conv_at_an_exact_rounding_tie_documents_the_known_divergence(
         "hand-picked tie")
 
 
+def test_a_conv_with_a_bias_matches_the_quantized_reference(cim_opt, cim_run):
+    # A real int32 bias, per output channel, distinct values (50, -30, 10)
+    # so a row/column mix-up in the cim.reduce_partial broadcast reads as
+    # a loud, wrong number rather than a suspiciously-plausible one.
+    rng = np.random.default_rng(SEED + 40)
+    cout, cin = 3, 2
+    weight = rng.integers(-6, 7, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+    bias = np.array([50, -30, 10], dtype=np.int32)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=3.0, bias=bias)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 3, 3)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_a_per_channel_scale_conv_matches_the_quantized_reference(cim_opt,
+                                                                   cim_run):
+    # Three deliberately different w_scale values (1.0, 3.0, 7.0) -- a
+    # bug that applied one channel's scale (or an average) to every
+    # channel would compute plausible-looking but wrong numbers for at
+    # least two of the three, not a shape error.
+    rng = np.random.default_rng(SEED + 41)
+    cout, cin = 3, 2
+    weight = rng.integers(-3, 4, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(-3, 4, size=x_shape, dtype=np.int64).astype(np.int8)
+    w_scale = np.array([1.0, 3.0, 7.0], dtype=np.float32)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=w_scale,
+                               y_scale=1.0)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 127
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 3, 3)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_an_asymmetric_x_zero_point_matches_the_quantized_reference(cim_opt,
+                                                                     cim_run):
+    # X declared uint8 with x_zero_point=120 -- the real, common
+    # convention this front end's own investigation found in a real
+    # quantized model. Activation values cluster near 120 (uint8
+    # [115, 125]) so the shifted, signed result stays small and
+    # non-saturating, isolating the zero-point-subtraction correctness
+    # question from the earlier saturation-masks-everything lesson.
+    rng = np.random.default_rng(SEED + 42)
+    cout, cin = 2, 2
+    weight = rng.integers(-5, 6, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(115, 126, size=x_shape, dtype=np.int64).astype(np.uint8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=3.0, x_zero_point=120,
+                               x_dtype=onnx.TensorProto.UINT8)
+    want = onnx_reference_eval(model, act, act_name="X",
+                               activation_dtype=np.uint8)
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 3, 3)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_an_asymmetric_y_zero_point_matches_the_quantized_reference(cim_opt,
+                                                                     cim_run):
+    # A real (non-zero, negative) output zero point -- proves
+    # cim.requantize's own zero_point attribute (already exercised at a
+    # different value in test/mlir/legalize_precision_e2e_test.cpp) is
+    # correctly threaded through from a real ONNX model's y_zero_point,
+    # not just hard-coded to 0 as the first version of this front end did.
+    rng = np.random.default_rng(SEED + 43)
+    cout, cin = 2, 2
+    weight = rng.integers(-6, 7, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=3.0, y_zero_point=-20)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 3, 3)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
 # --- refusals ------------------------------------------------------------
 
 def _base_model(cout=2, cin=2, kh=2, kw=2, h=4, w=4, **kwargs):
@@ -221,7 +336,7 @@ def _base_model(cout=2, cin=2, kh=2, kw=2, h=4, w=4, **kwargs):
 def test_refuses_a_grouped_convolution():
     weight, x_shape, model = _base_model()
     model.graph.node[0].attribute.append(
-        __import__("onnx").helper.make_attribute("group", 2))
+        onnx.helper.make_attribute("group", 2))
     act = np.zeros(x_shape, dtype=np.int8)
     with pytest.raises(Refusal, match="group"):
         import_model(model, act)
@@ -230,52 +345,97 @@ def test_refuses_a_grouped_convolution():
 def test_refuses_a_dilated_convolution():
     weight, x_shape, model = _base_model()
     model.graph.node[0].attribute.append(
-        __import__("onnx").helper.make_attribute("dilations", [2, 2]))
+        onnx.helper.make_attribute("dilations", [2, 2]))
     act = np.zeros(x_shape, dtype=np.int8)
     with pytest.raises(Refusal, match="dilation"):
         import_model(model, act)
 
 
-def test_refuses_a_bias_operand():
-    import onnx
+def test_refuses_a_non_zero_w_zero_point():
+    # The one zero point still refused -- see load_qlinear_conv's own
+    # module section header on why w_zero_point specifically does not
+    # reduce to an existing reshape the way x_zero_point/y_zero_point do.
     weight, x_shape, model = _base_model()
-    cout = weight.shape[0]
-    bias = np.zeros(cout, dtype=np.int32)
-    model.graph.initializer.append(
-        onnx.numpy_helper.from_array(bias, name="B"))
-    model.graph.node[0].input.append("B")
-    act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="bias"):
-        import_model(model, act)
-
-
-def test_refuses_a_non_scalar_w_scale():
-    import onnx
-    weight, x_shape, model = _base_model()
-    cout = weight.shape[0]
     for init in model.graph.initializer:
-        if init.name == "w_scale":
+        if init.name == "w_zp":
             model.graph.initializer.remove(init)
             break
     model.graph.initializer.append(onnx.numpy_helper.from_array(
-        np.ones(cout, dtype=np.float32), name="w_scale"))
-    act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="per-output-channel"):
-        import_model(model, act)
-
-
-@pytest.mark.parametrize("which", ["x_zp", "w_zp", "y_zp"])
-def test_refuses_a_non_zero_zero_point(which):
-    import onnx
-    weight, x_shape, model = _base_model()
-    for init in model.graph.initializer:
-        if init.name == which:
-            model.graph.initializer.remove(init)
-            break
-    model.graph.initializer.append(onnx.numpy_helper.from_array(
-        np.array(1, dtype=np.int8), name=which))
+        np.array(1, dtype=np.int8), name="w_zp"))
     act = np.zeros(x_shape, dtype=np.int8)
     with pytest.raises(Refusal, match="symmetric"):
+        import_model(model, act)
+
+
+def test_refuses_a_non_zero_per_channel_w_zero_point():
+    # Same restriction, but at the per-channel shape a real quantization
+    # tool actually emits -- see test_accepts_an_all_zero_per_channel_
+    # w_zero_point below for why the all-zero case of this exact shape
+    # must NOT be refused (found via a real model: squeezenet1.0-12-int8's
+    # own first layer ships a length-64, all-zero w_zero_point, not a
+    # true scalar).
+    weight, x_shape, model = _base_model()
+    cout = weight.shape[0]
+    for init in model.graph.initializer:
+        if init.name == "w_zp":
+            model.graph.initializer.remove(init)
+            break
+    per_channel = np.zeros(cout, dtype=np.int8)
+    per_channel[-1] = 1
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(per_channel, name="w_zp"))
+    act = np.zeros(x_shape, dtype=np.int8)
+    with pytest.raises(Refusal, match="symmetric"):
+        import_model(model, act)
+
+
+def test_accepts_an_all_zero_per_channel_w_zero_point(cim_opt, cim_run):
+    # "prove it doesn't refuse everything" -- found while validating this
+    # front end against a real model (squeezenet1.0-12-int8's first
+    # layer): w_zero_point is commonly a length-Cout array even when
+    # every entry is trivially 0, not always a true scalar the way
+    # x_zero_point/y_zero_point are. All-zero is still symmetric
+    # regardless of shape, so it must be accepted.
+    rng = np.random.default_rng(SEED + 44)
+    cout, cin = 3, 2
+    weight = rng.integers(-6, 7, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=3.0)
+    for init in model.graph.initializer:
+        if init.name == "w_zp":
+            model.graph.initializer.remove(init)
+            break
+    model.graph.initializer.append(onnx.numpy_helper.from_array(
+        np.zeros(cout, dtype=np.int8), name="w_zp"))
+    onnx.checker.check_model(model)
+
+    want = onnx_reference_eval(model, act, act_name="X")
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 3, 3))
+
+
+def test_refuses_a_uint8_y_zero_point():
+    # Even at a value (0) that would be harmless either way -- the dtype
+    # alone is refused, because cim.requantize's clamp is a signed
+    # effective_bits range and cannot represent uint8's full [0, 255].
+    weight, x_shape, model = _base_model(
+        y_dtype=onnx.TensorProto.UINT8)
+    act = np.zeros(x_shape, dtype=np.int8)
+    with pytest.raises(Refusal, match="SIGNED"):
+        import_model(model, act)
+
+
+def test_refuses_an_x_zero_point_that_overflows_int8_after_shift():
+    # x=0 (uint8) minus x_zero_point=200 is -200 -- outside signed int8's
+    # [-128, 127] no matter what w_zero_point does, so this must be
+    # refused rather than silently wrapped.
+    weight, x_shape, model = _base_model(
+        x_zero_point=200, x_dtype=onnx.TensorProto.UINT8)
+    act = np.zeros(x_shape, dtype=np.uint8)
+    with pytest.raises(Refusal, match="does not fit signed int8"):
         import_model(model, act)
 
 

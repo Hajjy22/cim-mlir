@@ -72,7 +72,8 @@ def _dense_2d(arr):
 
 
 def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
-                trailing_requantize=None):
+                trailing_requantize=None, bias=None,
+                per_channel_requantize=None, effective_bits=8):
     """A self-contained module computing `activation @ weight.T`.
 
     `weight` is [N, K] int8 -- ALREADY TRANSPOSED into cim.mvm's
@@ -89,20 +90,51 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
 
     `trailing_requantize`, if given, is a `(scale, zero_point,
     effective_bits)` tuple: a `cim.requantize` is emitted after the matmul
-    and its int8 result is what gets printed, instead of the raw int32
-    accumulator. This is for callers whose ONNX op ALWAYS quantizes its
-    own output in one node -- QLinearConv, unlike MatMulInteger, has no
-    "raw int32" variant to import -- so unlike emit_chain_module's
-    per-BRIDGE requantize (0 or 1 per adjacent layer pair), this is a
-    single, unconditional one attached to the only layer this function
-    ever emits. Default `None` preserves this function's original
-    raw-int32-output behavior exactly, including byte-identical text
-    against test/python/test_numerical_differential.py's `build_module()`.
+    (and after `bias`, if also given) and its int8 result is what gets
+    printed, instead of the raw int32 accumulator. This is for callers
+    whose ONNX op ALWAYS quantizes its own output in one node --
+    QLinearConv, unlike MatMulInteger, has no "raw int32" variant to
+    import -- so unlike emit_chain_module's per-BRIDGE requantize (0 or 1
+    per adjacent layer pair), this is a single, unconditional one attached
+    to the only layer this function ever emits. Default `None` preserves
+    this function's original raw-int32-output behavior exactly, including
+    byte-identical text against test/python/test_numerical_differential.py's
+    `build_module()`.
 
-    With the default symbol names, no header, no trailing_requantize, and
-    a 1-D (or [1, K]) activation, this returns text byte-identical to
-    `build_module()` -- M > 1 and trailing_requantize are both additive,
-    not a rewrite of the base M == 1 shape.
+    `bias`, if given, is a length-N int32 array (one value per output
+    channel), added to the RAW accumulator -- before any requantize --
+    broadcast across every one of the M rows. Emitted as
+    `cim.reduce_partial(matmul_output, bias_broadcast)`: reduce_partial's
+    own verifier only constrains operand shape and element type, not
+    producer, and cim-partition treats a matmul's `outs` buffer as an
+    opaque, pre-allocated destination it fills in place (op->erase()
+    after writing the real tiled result back into that SAME buffer) --
+    so a hand-emitted reduce_partial reading that buffer composes with
+    partition's own rewrite with no special-casing on either side.
+    Verified by hand against a real cim-opt/cim-run round trip before this
+    parameter was added: `a @ w.T + bias`, exactly, for an asymmetric
+    (non-symmetric-per-row) bias so a row/column mix-up would be a loud,
+    wrong number.
+
+    `per_channel_requantize`, if given, is a list of N `(scale,
+    zero_point)` pairs -- one per output channel -- mutually exclusive
+    with `trailing_requantize`. A single `cim.requantize` call takes only
+    one scalar `scale`/`zero_point` pair, so N of them are emitted
+    instead, each against a `memref.subview` of one output column (a
+    strided, not contiguous, view -- `cim.requantize`'s `AnyMemRef`
+    argument accepts it, and the interpreter's gather/scatter already
+    handle strided memrefs generically, the same machinery `cim-partition`
+    itself relies on for ragged tiles), then copied into the matching
+    column of the final result buffer. `effective_bits` (default 8) is
+    shared across every channel, matching the target contract's own
+    single per-target `output_effective_bits`. Verified by hand the same
+    way as `bias`: two channels at deliberately different scales, so a
+    channel mix-up computes a loud, wrong number rather than a close one.
+
+    With the default symbol names, no header, and no other parameters
+    beyond a 1-D (or [1, K]) activation, this returns text byte-identical
+    to `build_module()` -- every parameter here is additive, not a
+    rewrite of that base M == 1 shape.
     """
     weight = np.asarray(weight)
     activation = np.asarray(activation)
@@ -121,42 +153,115 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
         raise ValueError(
             f"activation's K of {activation.shape[1]} does not match the "
             f"weight's K of {k}")
+    if trailing_requantize is not None and per_channel_requantize is not None:
+        raise ValueError(
+            "trailing_requantize and per_channel_requantize are mutually "
+            "exclusive -- pass one uniform scale or N per-channel ones, "
+            "not both")
+    if per_channel_requantize is not None and len(per_channel_requantize) != n:
+        raise ValueError(
+            f"per_channel_requantize must have one (scale, zero_point) "
+            f"pair per output channel (N = {n}), got "
+            f"{len(per_channel_requantize)}")
 
     rows = _dense_2d(weight)
     acts = _dense_2d(activation)
 
-    matmul_lines = [
+    # (name, type) for every memref this function allocates, in allocation
+    # order, so every one gets exactly one memref.dealloc -- an ASan build
+    # (LeakSanitizer is on by default alongside address) would flag a
+    # missed one as a real leak, not just untidy IR.
+    allocs = [("%out", f"memref<{m}x{n}xi32>")]
+    lines = [
         f"  %out = memref.alloc() : memref<{m}x{n}xi32>",
         f"  linalg.matmul_transpose_b ins(%a, %w : memref<{m}x{k}xi8>, "
         f"memref<{n}x{k}xi8>)",
         f"    outs(%out : memref<{m}x{n}xi32>)",
     ]
-    if trailing_requantize is None:
-        result_val = "%out"
-        result_elem, result_lines = "i32", matmul_lines
-    else:
-        scale, zero_point, effective_bits = trailing_requantize
+    acc_val = "%out"
+    bias_global = ""
+
+    if bias is not None:
+        bias = np.asarray(bias)
+        if bias.shape != (n,):
+            raise ValueError(
+                f"bias must be a length-N ({n}) int32 array, got shape "
+                f"{bias.shape}")
+        broadcast = np.tile(bias.reshape(1, n), (m, 1))
+        bias_global = (
+            f'memref.global "private" constant @{weight_sym}_bias : '
+            f"memref<{m}x{n}xi32> = dense<{_dense_2d(broadcast)}>\n")
+        i32mn = f"memref<{m}x{n}xi32>"
+        lines += [
+            f"  %biasInit = memref.get_global @{weight_sym}_bias : {i32mn}",
+            f"  %bias = memref.alloc() : {i32mn}",
+            f"  memref.copy %biasInit, %bias : {i32mn} to {i32mn}",
+            f"  %biased = cim.reduce_partial %out, %bias : ({i32mn}, "
+            f"{i32mn}) -> {i32mn}",
+        ]
+        # cim.reduce_partial always produces a fresh allocation (see
+        # Interpreter.cpp's runReducePartial: makeAllocation, never an
+        # in-place write into an operand), so %biased needs its own
+        # dealloc distinct from %out's.
+        allocs += [("%bias", i32mn), ("%biased", i32mn)]
+        acc_val = "%biased"
+
+    if per_channel_requantize is not None:
+        i8mn = f"memref<{m}x{n}xi8>"
+        lines.append(f"  %result = memref.alloc() : {i8mn}")
+        allocs.append(("%result", i8mn))
+        for i, (scale, zero_point) in enumerate(per_channel_requantize):
+            if not (float(scale) > 0.0):
+                raise ValueError(
+                    f"per_channel_requantize[{i}]'s scale must be "
+                    f"positive, got {scale}")
+            src_ty = f"memref<{m}x1xi32, strided<[{n}, 1], offset: {i}>>"
+            dst_ty = f"memref<{m}x1xi8, strided<[{n}, 1], offset: {i}>>"
+            col_ty = f"memref<{m}x1xi8>"
+            lines += [
+                f"  %col{i} = memref.subview {acc_val}[0, {i}] [{m}, 1] "
+                f"[1, 1] : memref<{m}x{n}xi32> to {src_ty}",
+                f"  %q{i} = cim.requantize %col{i} {{scale = "
+                f"{float(scale)!r} : f32, zero_point = {int(zero_point)} : "
+                f"i32, effective_bits = {int(effective_bits)} : i32}}",
+                f"    : {src_ty} -> {col_ty}",
+                f"  %rcol{i} = memref.subview %result[0, {i}] [{m}, 1] "
+                f"[1, 1] : {i8mn} to {dst_ty}",
+                f"  memref.copy %q{i}, %rcol{i} : {col_ty} to {dst_ty}",
+            ]
+            # %q{i} is cim.requantize's own fresh allocation (same
+            # reasoning as %biased above), and outlives its one use
+            # (the copy into %result) until this function's own cleanup.
+            allocs.append((f"%q{i}", col_ty))
+        result_val, result_elem = "%result", "i8"
+    elif trailing_requantize is not None:
+        scale, zero_point, eff_bits = trailing_requantize
         if not (float(scale) > 0.0):
             raise ValueError(
                 f"trailing_requantize's scale must be positive, got {scale}")
-        result_val = "%q"
-        result_elem = "i8"
-        result_lines = matmul_lines + [
-            f"  %q = cim.requantize %out {{scale = {float(scale)!r} : f32, "
-            f"zero_point = {int(zero_point)} : i32, "
-            f"effective_bits = {int(effective_bits)} : i32}}",
-            f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}x{result_elem}>",
+        i8mn = f"memref<{m}x{n}xi8>"
+        lines += [
+            f"  %q = cim.requantize {acc_val} {{scale = {float(scale)!r} : "
+            f"f32, zero_point = {int(zero_point)} : i32, effective_bits = "
+            f"{int(eff_bits)} : i32}}",
+            f"    : memref<{m}x{n}xi32> -> {i8mn}",
         ]
+        allocs.append(("%q", i8mn))
+        result_val, result_elem = "%q", "i8"
+    else:
+        result_val, result_elem = acc_val, "i32"
 
-    print_call = "cim_print_i32" if trailing_requantize is None else "cim_print_i8"
+    quantized = trailing_requantize is not None or per_channel_requantize is not None
+    print_call = "cim_print_i8" if quantized else "cim_print_i32"
     result_type = f"memref<{m}x{n}x{result_elem}>"
     unranked_type = f"memref<*x{result_elem}>"
-    dealloc_result = f"  memref.dealloc {result_val} : {result_type}"
-    body = "\n".join(result_lines)
+    body = "\n".join(lines)
+    dealloc_lines = "\n".join(
+        f"  memref.dealloc {name} : {ty}" for name, ty in allocs)
     return f"""\
 {header}memref.global "private" constant @{weight_sym} : memref<{n}x{k}xi8> = dense<{rows}>
 memref.global "private" constant @{act_sym} : memref<{m}x{k}xi8> = dense<{acts}>
-func.func private @{print_call}({unranked_type})
+{bias_global}func.func private @{print_call}({unranked_type})
 func.func @main() {{
   %w = memref.get_global @{weight_sym} : memref<{n}x{k}xi8>
   %aInit = memref.get_global @{act_sym} : memref<{m}x{k}xi8>
@@ -166,7 +271,7 @@ func.func @main() {{
   %u = memref.cast {result_val} : {result_type} to {unranked_type}
   func.call @{print_call}(%u) : ({unranked_type}) -> ()
   memref.dealloc %a : memref<{m}x{k}xi8>
-{dealloc_result}
+{dealloc_lines}
   return
 }}
 """
