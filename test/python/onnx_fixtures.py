@@ -129,9 +129,12 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
 
 
 def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
-                       y_scale=1.0, strides=(1, 1), pads=(0, 0, 0, 0),
+                       y_scale=1.0, x_zero_point=0, w_zero_point=0,
+                       y_zero_point=0, x_dtype=TensorProto.INT8,
+                       y_dtype=TensorProto.INT8, bias=None,
+                       strides=(1, 1), pads=(0, 0, 0, 0),
                        auto_pad="NOTSET", node_name="conv", check=True):
-    """A graph of one QLinearConv: Y = requantize(conv(X, weight)).
+    """A graph of one QLinearConv: Y = requantize(conv(X, weight) [+ B]).
 
     `weight` is [Cout, Cin, Kh, Kw] -- ONNX's own layout, and (unlike
     matmul_integer_model's [K, N]) the SAME layout
@@ -142,9 +145,14 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     output shape (and so the graph's declared output value_info) depends
     on it before any real activation values exist.
 
-    Zero points are fixed at 0 throughout (symmetric quantization, the
-    only case `load_qlinear_conv` accepts) and there is no bias operand --
-    both match that function's own documented scope.
+    `w_scale` is a single float (uniform across output channels) or an
+    array-like of length Cout (real per-channel quantization -- see
+    load_qlinear_conv's own module section header). `x_zero_point` and
+    `y_zero_point` may be any int (with a matching `x_dtype`/`y_dtype` of
+    TensorProto.INT8 or TensorProto.UINT8); `w_zero_point` stays 0 by
+    default since load_qlinear_conv always requires it (pass a non-zero
+    value here only to build a refusal-test fixture). `bias`, if given,
+    is a length-Cout int32 array, ONNX's own QLinearConv bias convention.
     """
     weight = np.asarray(weight)
     cout, cin, kh, kw = weight.shape
@@ -165,35 +173,45 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
             f"non-positive output size ({out_h}, {out_w}) for the given "
             f"x_shape/weight/strides/pads")
 
+    x_np_dtype = np.int8 if x_dtype == TensorProto.INT8 else np.uint8
+    y_np_dtype = np.int8 if y_dtype == TensorProto.INT8 else np.uint8
+    w_scale_arr = np.asarray(w_scale, dtype=np.float32)
+    if w_scale_arr.ndim == 0:
+        w_scale_arr = w_scale_arr.reshape(())
+
     x_name = "X"
     initializers = [
         numpy_helper.from_array(weight, name="W"),
         numpy_helper.from_array(np.array(x_scale, dtype=np.float32),
                                 name="x_scale"),
-        numpy_helper.from_array(np.array(0, dtype=np.int8), name="x_zp"),
-        numpy_helper.from_array(np.array(w_scale, dtype=np.float32),
-                                name="w_scale"),
-        numpy_helper.from_array(np.array(0, dtype=np.int8), name="w_zp"),
+        numpy_helper.from_array(np.array(x_zero_point, dtype=x_np_dtype),
+                                name="x_zp"),
+        numpy_helper.from_array(w_scale_arr, name="w_scale"),
+        numpy_helper.from_array(np.array(w_zero_point, dtype=np.int8),
+                                name="w_zp"),
         numpy_helper.from_array(np.array(y_scale, dtype=np.float32),
                                 name="y_scale"),
-        numpy_helper.from_array(np.array(0, dtype=np.int8), name="y_zp"),
+        numpy_helper.from_array(np.array(y_zero_point, dtype=y_np_dtype),
+                                name="y_zp"),
     ]
+    node_inputs = [x_name, "x_scale", "x_zp", "W", "w_scale", "w_zp",
+                   "y_scale", "y_zp"]
+    if bias is not None:
+        initializers.append(numpy_helper.from_array(
+            np.asarray(bias, dtype=np.int32), name="B"))
+        node_inputs.append("B")
     node_kwargs = {"strides": list(strides)}
     if auto_pad == "NOTSET":
         node_kwargs["pads"] = list(pads)
     else:
         node_kwargs["auto_pad"] = auto_pad
     node = helper.make_node(
-        "QLinearConv",
-        [x_name, "x_scale", "x_zp", "W", "w_scale", "w_zp", "y_scale",
-         "y_zp"],
-        ["Y"], name=node_name, **node_kwargs)
+        "QLinearConv", node_inputs, ["Y"], name=node_name, **node_kwargs)
     graph = helper.make_graph(
         [node], "conv_g",
-        [helper.make_tensor_value_info(x_name, TensorProto.INT8,
-                                       list(x_shape))],
+        [helper.make_tensor_value_info(x_name, x_dtype, list(x_shape))],
         [helper.make_tensor_value_info(
-            "Y", TensorProto.INT8, [n, cout, out_h, out_w])],
+            "Y", y_dtype, [n, cout, out_h, out_w])],
         initializers,
     )
     model = helper.make_model(
@@ -203,16 +221,19 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     return model
 
 
-def _as_activation_feed(activation):
+def _as_activation_feed(activation, dtype=np.int8):
     """[K] promotes to [1, K]; a real [M, K] batch passes through as-is --
     same normalization `cim_frontend.onnx_import._validate_activation`
     applies, so both oracles and the compiled pipeline see the same shape
-    for the same input."""
-    activation = np.asarray(activation, dtype=np.int8)
+    for the same input. `dtype` defaults to int8 (every non-conv fixture's
+    activation); pass `np.uint8` for a QLinearConv model whose `X` is
+    declared uint8 (a real, asymmetric-quantization convention -- see
+    onnx_fixtures.qlinear_conv_model's own `x_dtype` parameter)."""
+    activation = np.asarray(activation, dtype=dtype)
     return activation.reshape(1, -1) if activation.ndim == 1 else activation
 
 
-def onnx_reference_eval(model, activation, act_name="A"):
+def onnx_reference_eval(model, activation, act_name="A", activation_dtype=np.int8):
     """Evaluate with onnx.reference -- the ONNX spec's own implementation.
 
     This is the primary oracle: it ships inside the `onnx` package and is
@@ -223,11 +244,11 @@ def onnx_reference_eval(model, activation, act_name="A"):
     """
     from onnx.reference import ReferenceEvaluator
 
-    feeds = {act_name: _as_activation_feed(activation)}
+    feeds = {act_name: _as_activation_feed(activation, activation_dtype)}
     return np.asarray(ReferenceEvaluator(model).run(None, feeds)[0]).ravel()
 
 
-def onnxruntime_eval(model, activation, act_name="A"):
+def onnxruntime_eval(model, activation, act_name="A", activation_dtype=np.int8):
     """Evaluate with onnxruntime -- a second, independent oracle.
 
     A production engine rather than the reference implementation, and its
@@ -239,5 +260,5 @@ def onnxruntime_eval(model, activation, act_name="A"):
 
     session = ort.InferenceSession(model.SerializeToString(),
                                    providers=["CPUExecutionProvider"])
-    feeds = {act_name: _as_activation_feed(activation)}
+    feeds = {act_name: _as_activation_feed(activation, activation_dtype)}
     return np.asarray(session.run(None, feeds)[0]).ravel()

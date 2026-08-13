@@ -548,13 +548,56 @@ def load_matmul_chain(model):
 # [M, K]) shape load_matmul_integer already does, so emit.emit_module can
 # be reused completely unchanged.
 #
-# WHAT IS DELIBERATELY REFUSED, AND WHY
-# =======================================
-# QLinearConv is a much larger op than MatMulInteger -- grouped/depthwise
-# convolution, dilation, per-output-channel (per-axis) quantization, and a
-# fused int32 bias are all real, common features of quantized conv models
-# that a production quantization toolchain routinely produces. Each is
-# refused explicitly rather than approximated:
+# A REAL MODEL FORCED A SECOND LOOK: PER-CHANNEL SCALE, BIAS, ASYMMETRIC
+# ZERO POINTS
+# =========================================================================
+# The first version of this function refused all three of the above --
+# reasonably, since they looked like real dialect-level gaps. Importing an
+# actual quantized model (squeezenet1.0-12-int8 from the ONNX model zoo)
+# showed otherwise: EVERY layer of a real, ONNX-Runtime-quantized model
+# uses per-channel w_scale, a real int32 bias, and an asymmetric (non-
+# zero) x_zero_point -- none of which are exotic, all three are the
+# default output of a real quantization toolchain. Investigating each one
+# by hand-building a probe module and running it through a real cim-opt/
+# cim-run round trip (not by inspection alone) found that all three are
+# expressible using ONLY existing, already-verified machinery:
+#
+#   * Per-channel scale: `cim.requantize` still takes one scalar `scale`,
+#     but nothing stops emitting N of them -- one per output channel,
+#     each against a `memref.subview` of that column. `AnyMemRef` accepts
+#     a strided (non-contiguous) view, and the interpreter's gather/
+#     scatter already handle strides generically (the same machinery
+#     cim-partition's own ragged-tile padding relies on). See
+#     emit.emit_module's `per_channel_requantize` parameter.
+#   * Bias: `cim.reduce_partial`'s verifier constrains operand shape and
+#     element type only, never producer -- and cim-partition treats a
+#     matmul's `outs` buffer as an opaque, pre-allocated destination it
+#     fills in place, erasing the matmul op once the tiled sequence has
+#     written the real answer back into that SAME buffer. A hand-emitted
+#     `cim.reduce_partial(matmul_output, bias_broadcast)`, sitting between
+#     the matmul and the eventual requantize, therefore composes with
+#     cim-partition's rewrite with no special-casing on either side --
+#     confirmed by a real round trip before this parameter existed. See
+#     emit.emit_module's `bias` parameter.
+#   * A non-zero x_zero_point: this project's own "one baked inference"
+#     contract (this file's own module docstring) makes the activation a
+#     compile-time constant, so `X - x_zero_point` can be computed once,
+#     in Python, before any MLIR is emitted -- exactly like im2col itself.
+#     Requires w_zero_point == 0 (see below): QLinearConv's true
+#     accumulator is `sum (X - x_zp) * (W - w_zp)`, which only reduces to
+#     a plain matmul over `X' = X - x_zp` when the `w_zp` cross term
+#     vanishes. Refused, with the exact out-of-range values named, if the
+#     shifted activation does not fit signed int8 -- the same "refuse
+#     rather than silently wrap" discipline as everywhere else in this
+#     front end.
+#   * A non-zero y_zero_point: `cim.requantize` already takes a real
+#     `zero_point : i32` attribute (`legalize_precision_e2e_test.cpp`
+#     proves it functions at zero_point=3), and `cimrt_requantize`'s
+#     order of operations -- round, THEN add zero_point, THEN clamp --
+#     already matches QLinearConv's own reference formula exactly. The
+#     only change needed was to stop hard-coding 0.
+#
+# What is STILL refused, because it is not one of these reshapes:
 #
 #   * group != 1: each group is really an independent matmul over a slice
 #     of channels, not one reshape. Silently computing group=1's answer
@@ -563,22 +606,18 @@ def load_matmul_chain(model):
 #   * dilations != (1, 1): a dilated kernel tap reads a non-contiguous
 #     patch; im2col_nchw's contiguous-slice implementation does not
 #     express that, and pretending stride covers it would too.
-#   * a non-scalar w_scale (per-output-channel quantization): a real
-#     `cim.requantize` call takes exactly one scalar `scale` attribute, so
-#     per-channel scales cannot be expressed as one op. Averaging or
-#     picking one channel's scale would silently change the arithmetic
-#     for every other channel.
-#   * a non-zero x_zero_point, w_zero_point, or y_zero_point: the same
-#     "needs a per-output bias term this dialect cannot express" reason
-#     load_matmul_integer's own _zero_point_is_zero refuses it for.
-#   * a bias operand B: QLinearConv adds B directly to the raw int32
-#     accumulator, per-output-channel, before scaling. There is no cim op
-#     that adds two same-shape int32 buffers at THIS point in the
-#     pipeline (cim.reduce_partial exists, but only as an implementation
-#     detail cim-partition inserts for its own K-tiling, after this
-#     import-time code has already run) without risking an interaction
-#     with that pass this code has not verified -- the same discipline
-#     `Gemm`'s bias operand is refused for above.
+#   * a non-zero w_zero_point (asymmetric WEIGHT quantization): the cross
+#     term `w_zp * X` above is per-ROW (activation-dependent), not a fixed
+#     per-channel correction the way a bias is -- genuinely not a reshape
+#     of what already exists. In practice this is also the least costly
+#     restriction to keep: real quantization toolchains commonly keep
+#     weights symmetric (w_zero_point == 0) even when activations are
+#     asymmetric, exactly as squeezenet1.0-12-int8 itself does.
+#   * a non-scalar x_zero_point or y_zero_point: per-tensor activation/
+#     output quantization is the near-universal convention (unlike
+#     per-channel WEIGHT scale, which is common); a per-channel x/y zero
+#     point would need the same N-way subview treatment as `w_scale`
+#     above, not yet implemented.
 #   * `auto_pad` other than "NOTSET" (explicit `pads`): SAME_UPPER/
 #     SAME_LOWER/VALID all need shape-dependent padding math to replicate
 #     exactly, and getting that arithmetic wrong is a silent one-pixel
@@ -598,6 +637,7 @@ def load_matmul_chain(model):
 # ---------------------------------------------------------------------------
 
 _INT8 = 3  # TensorProto.INT8
+_UINT8 = 2  # TensorProto.UINT8
 
 
 def _initializer_or_refuse(graph, name, node_name, which):
@@ -611,14 +651,15 @@ def _initializer_or_refuse(graph, name, node_name, which):
 
 
 def _positive_scalar_scale(graph, name, node_name, which):
+    """A scale that must be exactly one value -- x_scale and y_scale,
+    which are per-tensor (never per-channel) in every quantization
+    convention this front end has seen."""
     arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
     if arr.size != 1:
         raise Refusal(
-            f"{which} has {arr.size} elements -- per-output-channel "
-            f"(per-axis) quantization. A single cim.requantize call takes "
-            f"exactly one scalar scale; picking or averaging one channel's "
-            f"scale would silently change the arithmetic for every other "
-            f"channel. Nothing emitted.", where=f"node '{node_name}'")
+            f"{which} has {arr.size} elements; only per-tensor (scalar) "
+            f"quantization is supported here. Nothing emitted.",
+            where=f"node '{node_name}'")
     value = float(arr.reshape(-1)[0])
     if not (value > 0.0):
         raise Refusal(f"{which} must be a positive constant, got {value}. "
@@ -626,18 +667,84 @@ def _positive_scalar_scale(graph, name, node_name, which):
     return value
 
 
-def _zero_int8_zero_point(graph, name, node_name, which):
+def _positive_weight_scale(graph, name, node_name, which, cout):
+    """w_scale: a single scalar (applies to every output channel), OR
+    exactly `cout` values (one per output channel, real per-channel
+    quantization -- see this module's own 'A REAL MODEL FORCED A SECOND
+    LOOK' note). Returns a Python float for the scalar case, or a numpy
+    array of length `cout` for the per-channel case -- the caller tells
+    the two apart with `np.isscalar`/`isinstance(..., float)` vs ndarray,
+    mirroring emit_module's own trailing_requantize/per_channel_requantize
+    split.
+    """
+    arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
+    if arr.size not in (1, cout):
+        raise Refusal(
+            f"{which} has {arr.size} elements; expected either 1 (a single "
+            f"scale for every output channel) or {cout} (one per output "
+            f"channel, this node's Cout). Nothing emitted.",
+            where=f"node '{node_name}'")
+    flat = arr.reshape(-1).astype(np.float64)
+    bad = flat[~(flat > 0.0)]
+    if bad.size:
+        raise Refusal(
+            f"{which} must be all-positive constants, got {flat.tolist()}. "
+            f"Nothing emitted.", where=f"node '{node_name}'")
+    return float(flat[0]) if arr.size == 1 else flat
+
+
+def _scalar_zero_point(graph, name, node_name, which, allow_nonzero):
+    """A zero point that must be exactly one value (per-tensor, never
+    per-channel -- see load_qlinear_conv's own scope note). Returns
+    (value: int, dtype: np.dtype). Does not itself enforce zero; callers
+    that must stay symmetric (w_zero_point) pass allow_nonzero=False.
+    """
+    arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
+    if arr.dtype not in (np.int8, np.uint8):
+        raise Refusal(
+            f"{which} is {arr.dtype}; expected int8 or uint8. Nothing "
+            f"emitted.", where=f"node '{node_name}'")
+    if arr.size != 1:
+        raise Refusal(
+            f"{which} has {arr.size} elements; only per-tensor (scalar) "
+            f"zero points are supported here. Nothing emitted.",
+            where=f"node '{node_name}'")
+    value = int(arr.reshape(-1)[0])
+    if not allow_nonzero and value != 0:
+        raise Refusal(
+            f"{which} is {value}, but only symmetric (zero_point 0) "
+            f"quantization is supported here. Nothing emitted.",
+            where=f"node '{node_name}'")
+    return value, arr.dtype
+
+
+def _weight_zero_point_must_be_zero(graph, name, node_name, cout):
+    """w_zero_point: a single scalar, OR (like w_scale) `cout` values, one
+    per output channel -- real quantization tools commonly emit a
+    per-channel array here even when, as in every model this front end
+    has been tested against, every entry is trivially 0 (a real
+    squeezenet1.0-12-int8 layer does exactly this: a length-64
+    w_zero_point where all 64 entries are 0). Either shape is accepted,
+    but every element must be 0 either way -- this is still the one zero
+    point load_qlinear_conv never accepts non-zero (see its own module
+    section header for why).
+    """
+    which = "w_zero_point"
     arr = np.asarray(_initializer_or_refuse(graph, name, node_name, which))
     if arr.dtype != np.int8:
         raise Refusal(
-            f"{which} is {arr.dtype}; cim.mvm and the simulator are signed "
-            f"throughout. Nothing emitted.", where=f"node '{node_name}'")
+            f"{which} is {arr.dtype}; expected int8. Nothing emitted.",
+            where=f"node '{node_name}'")
+    if arr.size not in (1, cout):
+        raise Refusal(
+            f"{which} has {arr.size} elements; expected either 1 or "
+            f"{cout} (one per output channel, matching w_scale's own "
+            f"shape). Nothing emitted.", where=f"node '{node_name}'")
     if np.any(arr != 0):
         raise Refusal(
             f"{which} is {arr.ravel().tolist()}, but only symmetric "
-            f"(zero_point 0) quantization is supported -- a non-zero zero "
-            f"point needs a per-output bias term this dialect has no op "
-            f"for. Nothing emitted.", where=f"node '{node_name}'")
+            f"(zero_point 0) weight quantization is supported. Nothing "
+            f"emitted.", where=f"node '{node_name}'")
 
 
 def _int_attr(node, name, default):
@@ -665,19 +772,33 @@ def load_qlinear_conv(model):
     """The single accepted QLinearConv node.
 
     Returns (node, weight2d[Cout, Cin*Kh*Kw], x_name, x_shape[N,Cin,H,W],
-    conv_params, derived_scale) where `conv_params` is (kh, kw, stride_h,
-    stride_w, pad_top, pad_bottom, pad_left, pad_right) -- exactly
-    im2col_nchw's own trailing arguments, so callers pass it straight
-    through -- and `derived_scale` is the single positive float that makes
-    `cim.requantize(scale=derived_scale, zero_point=0, effective_bits=8)`
-    compute the same `round(res * (x_scale * w_scale / y_scale))`
-    QLinearConv's own reference semantics define, given `res` is the raw
-    (pre-scale) accumulator: `round(res / (y_scale / (x_scale * w_scale)))
-    == round(res * (x_scale * w_scale / y_scale))`.
+    conv_params, x_zero_point, trailing_requantize, per_channel_requantize,
+    bias) where:
 
-    Raises Refusal for anything outside the scope this module's own header
-    comment names (grouped/dilated convolution, per-channel quantization,
-    a non-zero zero point, a bias operand, non-explicit padding).
+    - `conv_params` is (kh, kw, stride_h, stride_w, pad_top, pad_bottom,
+      pad_left, pad_right) -- exactly im2col_nchw's own trailing
+      arguments, so callers pass it straight through.
+    - `x_zero_point` is a plain int; the caller subtracts it from the
+      supplied activation BEFORE im2col (see this module's own 'A REAL
+      MODEL FORCED A SECOND LOOK' note above for why that is exact when
+      w_zero_point == 0, which is always true here).
+    - Exactly one of `trailing_requantize` (a `(scale, zero_point,
+      effective_bits)` triple, for a scalar w_scale) or
+      `per_channel_requantize` (a length-Cout list of `(scale,
+      zero_point)` pairs, for a per-channel w_scale) is not None --
+      callers pass whichever straight through to emit.emit_module. Both
+      forms derive their scale(s) from `y_scale / (x_scale * w_scale)`,
+      matching QLinearConv's own reference formula
+      `round(res * (x_scale * w_scale / y_scale))` for `res` an integer
+      (raw, pre-scale) accumulator, and thread the real (possibly
+      non-zero) `y_zero_point` through unchanged.
+    - `bias` is None, or a length-Cout int32 numpy array -- the caller
+      passes it straight through to emit.emit_module's own `bias`
+      parameter.
+
+    Raises Refusal for anything outside the scope this module's own
+    header comment names (grouped/dilated convolution, a non-zero
+    w_zero_point, a per-channel x/y zero point, non-explicit padding).
     """
     from onnx import numpy_helper
 
@@ -717,15 +838,7 @@ def load_qlinear_conv(model):
             f"emitted.", where=where)
     (x_name, x_scale_name, x_zp_name, w_name, w_scale_name, w_zp_name,
      y_scale_name, y_zp_name) = node.input[:8]
-    if len(node.input) > 8 and node.input[8]:
-        raise Refusal(
-            f"has a bias operand '{node.input[8]}'. QLinearConv adds it "
-            f"directly to the raw int32 accumulator, per output channel, "
-            f"before scaling -- there is no cim op that does that at this "
-            f"point in the pipeline without risking an interaction with "
-            f"cim-partition's own (unrelated) use of cim.reduce_partial "
-            f"for K-tiling, which this front end has not verified composes "
-            f"correctly. Nothing emitted.", where=where)
+    bias_name = node.input[8] if len(node.input) > 8 else ""
 
     if w_name not in initializers:
         raise Refusal(
@@ -738,12 +851,48 @@ def load_qlinear_conv(model):
             f"both operands are constant initializers. Nothing emitted.",
             where=where)
 
+    # Read the weight early: Cout has to be known before w_scale (which
+    # may be per-channel) or a bias (which is always per-channel) can be
+    # validated.
+    w_init = next(i for i in graph.initializer if i.name == w_name)
+    weight = numpy_helper.to_array(w_init)
+    if weight.dtype != np.int8:
+        raise Refusal(
+            f"the weight operand '{w_name}' has dtype {weight.dtype}. "
+            f"Nothing emitted.", where=where)
+    if weight.ndim != 4:
+        raise Refusal(
+            f"the weight operand '{w_name}' has rank {weight.ndim}; a 2-D "
+            f"convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. Nothing "
+            f"emitted.", where=where)
+    cout, cin, kh, kw = weight.shape
+
     x_scale = _positive_scalar_scale(graph, x_scale_name, node.name, "x_scale")
-    w_scale = _positive_scalar_scale(graph, w_scale_name, node.name, "w_scale")
+    w_scale = _positive_weight_scale(graph, w_scale_name, node.name,
+                                     "w_scale", cout)
     y_scale = _positive_scalar_scale(graph, y_scale_name, node.name, "y_scale")
-    _zero_int8_zero_point(graph, x_zp_name, node.name, "x_zero_point")
-    _zero_int8_zero_point(graph, w_zp_name, node.name, "w_zero_point")
-    _zero_int8_zero_point(graph, y_zp_name, node.name, "y_zero_point")
+    x_zero_point, _x_zp_dtype = _scalar_zero_point(
+        graph, x_zp_name, node.name, "x_zero_point", allow_nonzero=True)
+    _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
+    y_zero_point, y_zp_dtype = _scalar_zero_point(
+        graph, y_zp_name, node.name, "y_zero_point", allow_nonzero=True)
+    if y_zp_dtype != np.int8:
+        raise Refusal(
+            f"y_zero_point is {y_zp_dtype}; cim.requantize's clamp is a "
+            f"SIGNED effective_bits range (see cimrt_requantize), which "
+            f"cannot represent a uint8 output's full [0, 255] span. "
+            f"Nothing emitted.", where=where)
+
+    bias = None
+    if bias_name:
+        bias = np.asarray(_initializer_or_refuse(
+            graph, bias_name, node.name, "B")).astype(np.int64)
+        if bias.shape != (cout,):
+            raise Refusal(
+                f"bias 'B' has shape {list(bias.shape)}; expected a single "
+                f"length-Cout ({cout}) int32 array, one value per output "
+                f"channel. Nothing emitted.", where=where)
+        bias = bias.astype(np.int32)
 
     group = _int_attr(node, "group", 1)
     if group != 1:
@@ -776,19 +925,7 @@ def load_qlinear_conv(model):
             f"own default) for the same effect. Nothing emitted.",
             where=where)
 
-    w_init = next(i for i in graph.initializer if i.name == w_name)
-    weight = numpy_helper.to_array(w_init)
-    if weight.dtype != np.int8:
-        raise Refusal(
-            f"the weight operand '{w_name}' has dtype {weight.dtype}. "
-            f"Nothing emitted.", where=where)
-    if weight.ndim != 4:
-        raise Refusal(
-            f"the weight operand '{w_name}' has rank {weight.ndim}; a 2-D "
-            f"convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. Nothing "
-            f"emitted.", where=where)
-    cout, cin, kh, kw = weight.shape
-
+    kh, kw = weight.shape[2], weight.shape[3]
     kernel_shape = _int_list_attr(node, "kernel_shape", [kh, kw])
     if kernel_shape != [kh, kw]:
         raise Refusal(
@@ -816,10 +953,10 @@ def load_qlinear_conv(model):
         raise Refusal(
             f"the activation operand '{x_name}' is neither a graph input "
             f"nor a constant. Nothing emitted.", where=where)
-    if x_info.type.tensor_type.elem_type != _INT8:
+    if x_info.type.tensor_type.elem_type not in (_INT8, _UINT8):
         raise Refusal(
-            f"the activation operand '{x_name}' is not int8. Nothing "
-            f"emitted.", where=where)
+            f"the activation operand '{x_name}' is not int8 or uint8. "
+            f"Nothing emitted.", where=where)
     x_shape = _shape_of(x_info)
     if x_shape is None:
         raise Refusal(
@@ -843,29 +980,50 @@ def load_qlinear_conv(model):
     # round(res / derived_scale) == round(res * (x_scale * w_scale /
     # y_scale)), QLinearConv's own reference formula for `res` an integer
     # (raw, pre-scale) accumulator -- see this function's own docstring.
-    derived_scale = y_scale / (x_scale * w_scale)
+    # w_scale is either a single float (uniform) or a length-Cout array
+    # (per-channel); the two cases produce trailing_requantize XOR
+    # per_channel_requantize, matching emit.emit_module's own split.
+    if isinstance(w_scale, np.ndarray):
+        derived_scales = y_scale / (x_scale * w_scale)
+        trailing_requantize = None
+        per_channel_requantize = [(float(s), y_zero_point)
+                                  for s in derived_scales]
+    else:
+        derived_scale = y_scale / (x_scale * w_scale)
+        trailing_requantize = (derived_scale, y_zero_point, 8)
+        per_channel_requantize = None
 
     conv_params = (kh, kw, stride_h, stride_w,
                   pad_top, pad_bottom, pad_left, pad_right)
-    return node, weight2d, x_name, tuple(x_shape), conv_params, derived_scale
+    return (node, weight2d, x_name, tuple(x_shape), conv_params,
+           x_zero_point, trailing_requantize, per_channel_requantize, bias)
 
 
-def _validate_conv_activation(activation, x_shape):
-    """The supplied activation must be exactly `x_shape` ([N, Cin, H, W])."""
+def _validate_conv_activation(activation, x_shape, x_zero_point=0):
+    """The supplied activation must be exactly `x_shape` ([N, Cin, H, W]).
+
+    Returns it as int8, with `x_zero_point` already subtracted -- exact
+    whenever w_zero_point == 0 (always true here; see load_qlinear_conv's
+    own 'A REAL MODEL FORCED A SECOND LOOK' note for why). Refuses,
+    naming the actual out-of-range values, if the shifted result does not
+    fit signed int8, rather than silently wrapping -- the default
+    `x_zero_point=0` makes this exactly the old (pre-asymmetric-
+    quantization) range check, so nothing changes for a symmetric model.
+    """
     activation = np.asarray(activation)
     if tuple(activation.shape) != tuple(x_shape):
         raise Refusal(
             f"the supplied activation has shape {list(activation.shape)}; "
             f"the model's convolution input is {list(x_shape)}. Nothing "
             f"emitted.")
-    if activation.dtype != np.int8:
-        lo, hi = int(activation.min()), int(activation.max())
-        if lo < -128 or hi > 127:
-            raise Refusal(
-                f"the supplied activation has values in [{lo}, {hi}], which "
-                f"does not fit int8. Nothing emitted.")
-        activation = activation.astype(np.int8)
-    return activation
+    shifted = activation.astype(np.int64) - int(x_zero_point)
+    lo, hi = int(shifted.min()), int(shifted.max())
+    if lo < -128 or hi > 127:
+        raise Refusal(
+            f"the supplied activation, after subtracting x_zero_point "
+            f"({x_zero_point}), has values in [{lo}, {hi}], which does not "
+            f"fit signed int8. Nothing emitted.")
+    return shifted.astype(np.int8)
 
 
 def provenance(model_path, model_bytes, activation_source):
@@ -939,9 +1097,11 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
                      if n.op_type == ACCEPTED_CONV_OP)
 
     if matmul_count == 0 and conv_count >= 1:
-        (node, weight2d, x_name, x_shape, conv_params,
-         derived_scale) = load_qlinear_conv(model)
-        activation = _validate_conv_activation(activation, x_shape)
+        (node, weight2d, x_name, x_shape, conv_params, x_zero_point,
+         trailing_requantize, per_channel_requantize,
+         bias) = load_qlinear_conv(model)
+        activation = _validate_conv_activation(activation, x_shape,
+                                               x_zero_point)
 
         patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
                                                         *conv_params)
@@ -958,8 +1118,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             f"for ONNX's own [N, Cout, OutH, OutW] layout.\n")
         return emit_module(
             weight2d, patches, weight_sym=weight_sym, act_sym=act_sym,
-            header=header,
-            trailing_requantize=(derived_scale, 0, 8))
+            header=header, trailing_requantize=trailing_requantize,
+            per_channel_requantize=per_channel_requantize, bias=bias)
 
     if matmul_count >= 2:
         nodes, weights, first_act_name, scales = load_matmul_chain(model)
