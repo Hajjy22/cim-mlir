@@ -120,7 +120,7 @@ def main(argv=None):
                             if n.op_type == ACCEPTED_CONV_OP)
             rng = np.random.default_rng(args.input_random)
             if matmul_count == 0 and conv_count >= 1:
-                _, _, _, x_shape, _, _, _, _, _ = load_qlinear_conv(model)
+                _, _, _, x_shape, _, _, _, _, _, _ = load_qlinear_conv(model)
                 activation = rng.integers(
                     -128, 128, size=x_shape, dtype=np.int64).astype(np.int8)
             else:

@@ -1569,13 +1569,33 @@ out of scope for v0.1 across the board, not just here.
   extracted into a standalone single-node model and run through the real
   `cim-opt`/`cim-run` pipeline. Every one of the 14,400 output elements
   (a 15x15x64 feature map) matched `onnx.reference`'s own evaluation of
-  the same real model exactly. The one remaining gap this exposed: that
-  layer's `y_zero_point` is declared `uint8`, and `cim.requantize`'s
-  clamp is a signed `effective_bits` range that cannot represent a uint8
-  output's full `[0, 255]` span -- refused explicitly (not silently
-  wrapped) rather than forced through. This is a real, currently
-  uninvestigated gap, not the earlier "y_zero_point unsupported"
-  restriction reappearing under a new name.
+  the same real model exactly. The one remaining gap this exposed at the
+  time: that layer's `y_zero_point` is declared `uint8`, and
+  `cim.requantize`'s clamp is a signed `effective_bits` range that cannot
+  represent a uint8 output's full `[0, 255]` span -- refused explicitly
+  (not silently wrapped) rather than forced through.
+
+  **Closed, without a dialect change.** `clamp(-128, 127, t - 128) ==
+  clamp(0, 255, t) - 128` for every real `t` -- both clamp bounds shift by
+  exactly 128, so the shift commutes with clamping exactly, not
+  approximately. Requantizing with `(y_zero_point - 128)` instead of the
+  declared `y_zero_point` therefore produces EXACTLY
+  `(true_uint8_output - 128)` in every element, algebraically, not a
+  lucky coincidence at the extremes. The emitted module's own provenance
+  header discloses the shift explicitly (`load_qlinear_conv`'s
+  `uint8_output_shifted` flag), on the same "the front end's job ends at
+  'produce the right numbers'; a documented caller-side transform is not
+  a silent one" discipline as the NHWC reshape a conv's own caller
+  already has to apply. Verified by a differential test at a real,
+  non-edge `y_zero_point` (130, not 0 or 128, so an off-by-one or a
+  forgotten shift could not accidentally still pass) against
+  `onnx.reference`'s own uint8 output, mutation-tested by perturbing the
+  shift constant by one and confirming the comparison catches it. Not
+  re-run against the actual `squeezenet1.0-12-int8` file -- this
+  session's sandboxed network policy blocks the ONNX model zoo fetch that
+  produced the original capstone extraction -- so this is a synthetic
+  fixture at realistic parameters, not a second capstone run; said
+  plainly rather than implied otherwise.
 
   Verified: `test/python/test_onnx_frontend_conv.py` -- a bias
   differential with three distinct, non-symmetric channel values (so a

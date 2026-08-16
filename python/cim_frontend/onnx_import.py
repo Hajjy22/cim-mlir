@@ -782,7 +782,7 @@ def load_qlinear_conv(model):
 
     Returns (node, weight2d[Cout, Cin*Kh*Kw], x_name, x_shape[N,Cin,H,W],
     conv_params, x_zero_point, trailing_requantize, per_channel_requantize,
-    bias) where:
+    bias, uint8_output_shifted) where:
 
     - `conv_params` is (kh, kw, stride_h, stride_w, pad_top, pad_bottom,
       pad_left, pad_right, dilation_h, dilation_w) -- exactly
@@ -800,11 +800,20 @@ def load_qlinear_conv(model):
       forms derive their scale(s) from `y_scale / (x_scale * w_scale)`,
       matching QLinearConv's own reference formula
       `round(res * (x_scale * w_scale / y_scale))` for `res` an integer
-      (raw, pre-scale) accumulator, and thread the real (possibly
-      non-zero) `y_zero_point` through unchanged.
+      (raw, pre-scale) accumulator. The `zero_point` they carry is
+      ALREADY the emitted-module's own zero point, which is
+      `y_zero_point` unchanged for an int8 output but `y_zero_point -
+      128` for a uint8 one -- see `uint8_output_shifted` below.
     - `bias` is None, or a length-Cout int32 numpy array -- the caller
       passes it straight through to emit.emit_module's own `bias`
       parameter.
+    - `uint8_output_shifted` is a bool: True when the ONNX node declares
+      a uint8 `y_zero_point` (and so a uint8 output). `cim.requantize`'s
+      clamp is a signed `effective_bits` range, so the emitted module's
+      result is exactly `(true_uint8_output - 128)` in every element,
+      not the true value -- callers MUST disclose this in the module's
+      provenance header (import_model does). False for the ordinary
+      int8-output case, where the emitted result needs no adjustment.
 
     Raises Refusal for anything outside the scope this module's own
     header comment names (grouped/dilated convolution, a non-zero
@@ -886,12 +895,24 @@ def load_qlinear_conv(model):
     _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
     y_zero_point, y_zp_dtype = _scalar_zero_point(
         graph, y_zp_name, node.name, "y_zero_point", allow_nonzero=True)
-    if y_zp_dtype != np.int8:
-        raise Refusal(
-            f"y_zero_point is {y_zp_dtype}; cim.requantize's clamp is a "
-            f"SIGNED effective_bits range (see cimrt_requantize), which "
-            f"cannot represent a uint8 output's full [0, 255] span. "
-            f"Nothing emitted.", where=where)
+    # cim.requantize's clamp is a SIGNED effective_bits range (see
+    # cimrt_requantize), which cannot represent a uint8 output's full
+    # [0, 255] span directly -- but it does not need to. For any real t,
+    # clamp(-128, 127, t - 128) == clamp(0, 255, t) - 128: both clamp
+    # bounds shift by exactly 128, so the affine shift commutes with
+    # clamping exactly, not approximately. Requantizing with
+    # (y_zero_point - 128) instead of y_zero_point therefore produces
+    # EXACTLY (true_uint8_output - 128) in every element, never a lucky
+    # coincidence at the extremes. `uint8_output_shifted` tells the
+    # caller (import_model) to disclose that shift in the EMITTED
+    # MODULE's own provenance header, on the same "the front end's job
+    # ends at 'produce the right numbers'; a documented caller-side
+    # transform is not a silent one" discipline as the NHWC reshape a
+    # conv's own caller already has to apply (import_model's own
+    # "conv im2col: ..." header line).
+    uint8_output_shifted = y_zp_dtype == np.uint8
+    if uint8_output_shifted:
+        y_zero_point -= 128
 
     bias = None
     if bias_name:
@@ -1010,7 +1031,8 @@ def load_qlinear_conv(model):
                   pad_top, pad_bottom, pad_left, pad_right,
                   dilation_h, dilation_w)
     return (node, weight2d, x_name, tuple(x_shape), conv_params,
-           x_zero_point, trailing_requantize, per_channel_requantize, bias)
+           x_zero_point, trailing_requantize, per_channel_requantize, bias,
+           uint8_output_shifted)
 
 
 def _validate_conv_activation(activation, x_shape, x_zero_point=0):
@@ -1112,8 +1134,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
 
     if matmul_count == 0 and conv_count >= 1:
         (node, weight2d, x_name, x_shape, conv_params, x_zero_point,
-         trailing_requantize, per_channel_requantize,
-         bias) = load_qlinear_conv(model)
+         trailing_requantize, per_channel_requantize, bias,
+         uint8_output_shifted) = load_qlinear_conv(model)
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
 
@@ -1130,6 +1152,14 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             f"raw matmul output rows are in (n, oh, ow) row-major order, "
             f"reshape to [N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) "
             f"for ONNX's own [N, Cout, OutH, OutW] layout.\n")
+        if uint8_output_shifted:
+            header += (
+                f"//   NOTE: this node's y_zero_point is uint8, so its true "
+                f"output is uint8 too -- but cim.requantize's clamp is "
+                f"SIGNED. Every printed value below is (true_uint8_value - "
+                f"128), EXACTLY (see load_qlinear_conv's own "
+                f"uint8_output_shifted note): add 128 back to recover the "
+                f"real QLinearConv output.\n")
         return emit_module(
             weight2d, patches, weight_sym=weight_sym, act_sym=act_sym,
             header=header, trailing_requantize=trailing_requantize,

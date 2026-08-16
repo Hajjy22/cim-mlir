@@ -356,6 +356,49 @@ def test_an_asymmetric_y_zero_point_matches_the_quantized_reference(cim_opt,
         f"{want.tolist()}")
 
 
+def test_a_uint8_output_matches_the_quantized_reference_after_the_shift(
+    cim_opt, cim_run
+):
+    # squeezenet1.0-12-int8's real first layer declares a uint8
+    # y_zero_point (docs/roadmap.md's own M4 entry names this as the one
+    # gap the capstone verification exposed) -- cim.requantize's clamp is
+    # SIGNED, so load_qlinear_conv requantizes with (y_zero_point - 128)
+    # instead and the emitted module's own provenance header discloses
+    # that every printed value is (true_uint8_value - 128), exactly (see
+    # onnx_import.py's own algebraic proof: clamp(-128,127,t-128) ==
+    # clamp(0,255,t)-128 for every real t). This test is that proof
+    # exercised on real compiled output: `want` is onnx.reference's own
+    # TRUE uint8 values; `got + 128` is what the compiled pipeline
+    # produces, asserted equal.
+    #
+    # y_zero_point=130 -- comfortably nonzero and not itself 128, so a
+    # bug that forgot the shift entirely (comparing `got` to `want`
+    # directly) or applied a DIFFERENT constant (off-by-one, or
+    # subtracting 127) would not accidentally still pass.
+    rng = np.random.default_rng(SEED + 44)
+    cout, cin = 2, 2
+    weight = rng.integers(-6, 7, size=(cout, cin, 2, 2),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 4, 4)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=3.0, y_zero_point=130,
+                               y_dtype=onnx.TensorProto.UINT8)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert want.dtype == np.uint8
+    assert 0 < want.min() and want.max() < 255, (
+        "this fixture is meant to stay off both ends of uint8's range; a "
+        "result pinned to 0 or 255 everywhere would make the shift "
+        "invisible regardless of whether it is correct")
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
+    shifted_back = got.astype(np.int64) + 128
+    assert np.array_equal(shifted_back, want.astype(np.int64).reshape(1, cout, 3, 3)), (
+        f"compiled {got.tolist()} + 128 != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
 # --- refusals ------------------------------------------------------------
 
 def _base_model(cout=2, cin=2, kh=2, kw=2, h=4, w=4, **kwargs):
@@ -457,17 +500,6 @@ def test_accepts_an_all_zero_per_channel_w_zero_point(cim_opt, cim_run):
     want = onnx_reference_eval(model, act, act_name="X")
     got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3)
     assert np.array_equal(got, want.reshape(1, cout, 3, 3))
-
-
-def test_refuses_a_uint8_y_zero_point():
-    # Even at a value (0) that would be harmless either way -- the dtype
-    # alone is refused, because cim.requantize's clamp is a signed
-    # effective_bits range and cannot represent uint8's full [0, 255].
-    weight, x_shape, model = _base_model(
-        y_dtype=onnx.TensorProto.UINT8)
-    act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="SIGNED"):
-        import_model(model, act)
 
 
 def test_refuses_an_x_zero_point_that_overflows_int8_after_shift():
