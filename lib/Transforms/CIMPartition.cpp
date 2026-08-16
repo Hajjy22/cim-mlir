@@ -204,13 +204,9 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
 
     OpBuilder builder(op);
     const Location loc = op.getLoc();
-    Type i8 = builder.getI8Type();
-    Type i32 = builder.getI32Type();
     Type actElem = actType.getElementType();
     Type outElem = outType.getElementType();
     Type weightElem = weightType.getElementType();
-    (void)i8;
-    (void)i32;
 
     // A plain linalg.matmul's weight is [K, N] -- ONNX's own layout, and
     // the transpose of what cim.mvm wants. Transpose it into a fresh

@@ -1939,6 +1939,27 @@ out of scope for v0.1 across the board, not just here.
   input) pin this; `test/Dialect/CIM/requantize.mlir`'s existing valid
   case already used integer types throughout and needed no change.
 
+- **`cim-partition`'s `lowerLinalgMatmulCandidate` no longer declares two
+  `Type` locals (`i8`, `i32`) it never uses.** Found continuing the same
+  dead-code sweep that turned up the `cim.requantize` gap above: `git log
+  -L` traces both back to `0da2a5c`, the very first real implementation
+  of this pass, replacing a `TODO(spec Sec.6, Pass 2)` placeholder --
+  eighteen commits ago, never referenced since. Unlike `memRefElementType`
+  above, these were not masking a missing check: the only place a
+  `weight_dtype`/`activation_dtype` mismatch can legitimately be caught is
+  `cimrt_open` (closed properly in Phase 0's defect D fix, with its own
+  commit explaining why partition time is too early to own that refusal
+  -- this pass takes element types from the memrefs it is given, never
+  from the target file). `cim_build_flags` already compiles this file
+  under `-Wall -Wextra -Werror`, and the `(void)i8; (void)i32;` lines
+  exist specifically to suppress the `-Wunused-variable` that would
+  otherwise fire -- so this was a deliberate, tracked silencing of dead
+  code, not an overlooked warning. No behavior change; no new test, since
+  there is nothing to pin (removing an unused local cannot regress
+  anything the existing suite exercises). Verified by full rebuild (zero
+  new warnings), the full lit/ctest/pytest suite, clang-tidy (clang-18
+  tree, zero findings), and cppcheck (zero findings).
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).
