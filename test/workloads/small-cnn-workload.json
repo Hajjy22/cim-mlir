@@ -1,0 +1,36 @@
+{
+  "model": "small-cnn.onnx",
+  "layers": [
+    {
+      "name": "conv1",
+      "op_type": "QLinearConv",
+      "k": 27,
+      "n": 8
+    },
+    {
+      "name": "conv2",
+      "op_type": "QLinearConv",
+      "k": 72,
+      "n": 16
+    },
+    {
+      "name": "conv3",
+      "op_type": "QLinearConv",
+      "k": 16,
+      "n": 32
+    }
+  ],
+  "skipped": [
+    {
+      "name": "pool1",
+      "op_type": "MaxPool",
+      "reason": "'MaxPool' is not MatMulInteger or QLinearConv, the only op types this project recognizes as weight-stationary; it has no resident weights to place on tiles."
+    },
+    {
+      "name": "pool2",
+      "op_type": "MaxPool",
+      "reason": "'MaxPool' is not MatMulInteger or QLinearConv, the only op types this project recognizes as weight-stationary; it has no resident weights to place on tiles."
+    }
+  ],
+  "note": "weight-programming cost for the 3 offloadable layer(s) listed in 'layers' ONLY -- this is NOT end-to-end inference cost. 2 other op(s) were skipped (see 'skipped' for which, and why); nothing they compute is represented anywhere downstream of this report."
+}

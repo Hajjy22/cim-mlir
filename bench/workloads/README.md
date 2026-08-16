@@ -14,6 +14,14 @@ The workloads are generated in `lib/Placement/Workloads.cpp` and sized
 against whichever target file is passed, so the same table runs on an 8-tile
 near-memory device and a 64-tile DPU without editing anything.
 
+These five are synthetic, sized to probe specific placement behaviors
+(best case, spill, thrashing, cross-layer, a real transformer FFN shape).
+For a REAL model's own layer shapes instead, see `cim-bench analyze` and
+`cim-import-onnx --emit-workload` (`python/README.md`'s "Analyzing a real
+model, without compiling it") — same placement engine, same cost report,
+a workload built from a real network's weights rather than one of the
+five above.
+
 | Workload | Shape | What it probes |
 |---|---|---|
 | `mm-fit` | weights fit entirely in tiles | Best case: zero reprogramming after install |

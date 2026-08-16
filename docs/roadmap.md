@@ -1592,6 +1592,144 @@ out of scope for v0.1 across the board, not just here.
   zero check were each caught by the correctness or refusal tests built
   for that specific capability.
 
+- **Cost-model integrity: every declared target field either charges what
+  it says or is refused, not silently ignored.** A fresh audit of the
+  whole project, run against its own stated philosophy ("every declared
+  knob must be real, every executable operation must be cost-charged,
+  anything unsupported must be refused loudly"), found the published cost
+  report was not honest yet. Five defects, each landed with the test that
+  would have caught it:
+  - `cim-cost-report`'s JSON hardcoded `num_tiles`,
+    `standby_leakage_uw_per_tile`, and `double_buffer_capable` to struct
+    defaults instead of the parsed target -- every target was published as
+    a leak-free device, silently, because every existing lit test happened
+    to use `tiny-4x4.yaml`, whose declared values coincide with the
+    defaults. `test/Transforms/cim-cost-report-target-fields.mlir` runs
+    against a target where they differ.
+  - `cim.copy` was never counted in the static report even though
+    `costs.transfer.energy_pj_per_byte` is a **required** target field --
+    an entire declared cost class silently zero. Now counted
+    (`CostReportUtils.cpp`), with the gap that remains -- `lowerProgram`/
+    `lowerMvm`'s implicit weight/activation staging via `cimrt_write`,
+    which no `cim.copy` op represents and no IR walk can see -- disclosed
+    explicitly (`transfer_bytes_excludes_implicit_staging`,
+    `host_to_host_copies`) rather than silently absent, and NOT asserted
+    equal to the runtime side in `cost_report_e2e_test.cpp`'s differential,
+    with a comment explaining why that assertion would be false advertising:
+    the compiled path hoists staging out of loops while the interpreter
+    re-stages per op, so the two executors already disagree with each
+    other before static-vs-runtime is even asked.
+  - `costs.transfer.bandwidth_gbps` -- required, and mandatory for every
+    vendor -- charged zero latency; every byte moved took 0 ns. Now charged
+    on both the runtime side (`CostAccumulator::recordTransfer`) and the
+    static report, reading `gbps` as **gigabytes** per second (`ns = bytes
+    / gbps` exactly), pinned by a fixture (`tiny-4x4-bandwidth.yaml`,
+    `bandwidth_gbps: 4.0`) chosen specifically because every prior test
+    target's `bandwidth_gbps: 1.0` makes the correct reading, the gigabits
+    reading, and no conversion at all collapse to the same number -- the
+    same "passes for the wrong reason" trap a saturating quantization
+    fixture fell into earlier in this project.
+  - `tiles.weight_dtype`/`activation_dtype` -- required, unread, and
+    silently mis-executed: a target declaring `weight_dtype: i4` opened,
+    compiled, and ran with `int8_t` reinterpretation at full declared cost,
+    because the passes take element types from the memrefs, never from the
+    target. The check belongs in `cimrt_open` (execution), not
+    `TargetYAMLParser` (parsing) -- the first attempt in the parser broke
+    `test_yaml_differential.py` correctly, because that test compares
+    reader **syntax** against PyYAML, and `i4`/`u8`/`i16` are valid
+    *spellings* even though nothing executes them yet.
+    `tiny-4x4-i4-weights.yaml` must parse but must not open.
+  - `cim-detect` declined a candidate with three bare `return;`s and no
+    diagnostic at any level, in a file whose own header says convolution
+    "must not be silently accepted" -- a dropped op made the entire
+    pipeline quiet, offloading nothing with no message, while the very
+    next pass warns four different ways for the same kind of decline. Now
+    a remark naming the op and the reason, pinned by
+    `test/Transforms/cim-detect-remarks.mlir` (which documents two
+    FileCheck hazards hit while writing it: `--split-input-file`
+    concatenates all sections' diagnostics into one stream, and FileCheck
+    scans comment prose too, so naming a directive in an explanation makes
+    the explanation a directive).
+
+  Also closed: no CI job ran the ONNX front end's *generated* IR under
+  sanitizers -- `mlir-asan` was C++/lit only, and the interpreter's
+  `memref.cast` use-after-free (fixed earlier in M2) lived exactly in IR
+  shapes only the front end produces. `mlir-asan` now also runs `pytest
+  test/python`; a first attempt silently skipped 44 of 180 tests because
+  only `cim-opt`/`cim-run` had been built, which is the same defect class
+  (a check that quietly does less than it claims) as everything else on
+  this list.
+
+  Left open, deliberately, because none of them produces a wrong number
+  today: `cim.program`'s `cost_ns`/`cost_pj` attributes are dead IR (zero
+  readers); `tiles.persistence` (string) is inert and can contradict
+  `tiles.persistent` (bool); the `class:` enum is unread but carries
+  neither a disclosure nor a pinning test the way `autonomous_control`
+  does.
+
+- **Real-model placement/cost analysis: point the placement engine at a
+  real network without executing it.** This project's differentiated
+  asset -- Belady tile eviction, the amortization model, the target cost
+  schema -- could previously only be driven by five hardcoded synthetic
+  workloads (`makeV01Workloads`). The enabling insight: **placement
+  analysis needs only weight shapes, never execution.**
+  `makeLayeredWorkload` takes nothing but a `vector<uint32_t>` of per-layer
+  block counts, and `partitionBlockCount(k, n, tileRows, tileCols)` derives
+  each purely from a layer's `[K, N]` -- so a real model can be *analyzed*
+  even though large parts of it (MaxPool, Concat, Softmax, a grouped or
+  dilated convolution) cannot yet be *compiled*.
+  - `python/cim_frontend/analyze.py` -- unlike `import_model`, which
+    refuses an entire graph on the first unrecognized op, this walks every
+    node and classifies it: an offloadable `MatMulInteger`/`QLinearConv`
+    goes in `layers` with its `[k, n]`, anything else goes in `skipped`
+    with a stated reason, and the walk never aborts. Reuses
+    `onnx_import.py`'s field-level validators (`_zero_point_is_zero`,
+    `_positive_weight_scale`, `_weight_zero_point_must_be_zero`, …)
+    directly rather than duplicating their logic, so a defect reads as the
+    same sentence whether it blocked compilation or was merely skipped
+    here. One deliberate, narrow divergence from the strict loaders: a
+    grouped or dilated `QLinearConv` is still counted as offloadable,
+    because ONNX already stores its weight as `[Cout, Cin/group, Kh, Kw]`
+    -- the real per-filter footprint -- so the shape is known and correct
+    even though this front end cannot yet *emit* IR for it.
+  - `cim-import-onnx --emit-workload model.onnx -o w.json` -- a second,
+    unrelated entry point needing no `--input`/`--input-random`: unlike
+    compiling, shape-only analysis never needs an activation.
+  - `cim-bench analyze --workload-file w.json --target t.yaml` -- maps
+    each layer's `[k, n]` through the existing `partitionBlockCount` into
+    `makeLayeredWorkload`, then reuses the Belady/LRU/FIFO comparison and
+    cost report unchanged. Reads the interchange file with a small,
+    dependency-free JSON reader (`lib/Placement/WorkloadJSON.cpp`, same
+    rationale as the YAML target reader: `cim-bench` and `cimPlacement`
+    build with no LLVM/MLIR toolchain, so no JSON library is available
+    either) that refuses -- rather than silently defaults -- a document
+    missing the `skipped` field, so "nothing was skipped" can never be
+    confused with "the producer forgot to say". `test/unit/
+    workload_json_test.cpp` pins the rejection table the same way
+    `parser_error_test.cpp` pins the YAML reader's; `test/python/
+    test_workload_json_differential.py` runs the real `cim-bench` binary
+    against documents Python's own `json` module also parses, including
+    `\u` escapes and quote/backslash-bearing names, the same "compare the
+    shipped artifact against an implementation written by other people"
+    discipline as `test_yaml_differential.py`.
+  - The honesty requirement, checked by test, not just stated: every
+    report -- Python's JSON and `cim-bench analyze`'s stdout and JSON
+    alike -- states in words that the numbers are weight-programming cost
+    for the N offloadable layers *only*, not end-to-end inference cost,
+    and names what was skipped and why.
+  - `test/workloads/small-cnn-workload.json` is a checked-in fixture (a
+    hand-built three-conv/two-maxpool graph -- this session's sandboxed
+    network policy returns 403 on a raw GitHub content fetch, so it is not
+    an actual downloaded model, unlike the convolution feature's
+    `squeezenet1.0-12-int8` capstone above) kept current by
+    `test/python/test_analyze.py::test_checked_in_workload_fixture_is_current`,
+    the same regenerate-and-diff convention `test_onnx_frontend.py` uses
+    for `onnx-imported-matmul.mlir`. It lets `test_cim_bench_analyze.py`
+    exercise the full Python-front-end-to-C++-placement-engine path,
+    including a mutation check that enlarging one real layer's `K`
+    increases the placed `programs` count, with no network fetch or
+    `onnx` dependency in the C++-only jobs.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

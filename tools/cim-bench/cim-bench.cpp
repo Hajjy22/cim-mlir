@@ -19,6 +19,7 @@
 
 #include "cim/Placement/CostReport.h"
 #include "cim/Placement/Placement.h"
+#include "cim/Placement/WorkloadJSON.h"
 #include "cim/Placement/Workloads.h"
 #include "cim/Target/TargetSpec.h"
 
@@ -44,6 +45,7 @@ struct Options {
   uint32_t inferences = 1000;
   std::string workload = "mm-fit";
   std::string policy = "belady";
+  std::string workloadFile;
 };
 
 void printUsage() {
@@ -52,7 +54,9 @@ void printUsage() {
          "usage: cim-bench run --target <name> [--out <path>] [--inferences <n>]\n"
          "       cim-bench dump-target --target <name>\n"
          "       cim-bench amortize --target <name> [--workload <name>] "
-         "[--policy <p>] [--out <path>]\n\n"
+         "[--policy <p>] [--out <path>]\n"
+         "       cim-bench analyze --target <name> --workload-file <path> "
+         "[--inferences <n>] [--out <path>]\n\n"
          "  dump-target        print the parsed target as canonical key=value\n"
          "                     lines, for differential-testing the reader\n"
          "  amortize           sweep amortizedInstallEnergyPjPerInference over a\n"
@@ -60,8 +64,18 @@ void printUsage() {
          "                     to plot how install cost amortizes -- or, on a\n"
          "                     volatile target, does not (docs/roadmap.md's M3\n"
          "                     section; bench/plots/plot_amortization.py)\n"
+         "  analyze            weight-programming cost for a REAL model's\n"
+         "                     offloadable layers, read from a JSON file\n"
+         "                     produced by `cim-import-onnx --emit-workload`.\n"
+         "                     Belady/LRU/FIFO, same as `run`, over one workload\n"
+         "                     built from the file's layer shapes rather than a\n"
+         "                     built-in synthetic one. This is NOT end-to-end\n"
+         "                     inference cost -- see the emitted `note` field\n"
+         "                     and 'skipped' list for what the source model\n"
+         "                     contained that is not represented here.\n"
          "  --target <name>    target name; resolved to targets/<name>.yaml\n"
          "  --target-file <p>  explicit path to a target file (overrides --target)\n"
+         "  --workload-file <p> analyze only: path to an --emit-workload JSON file\n"
          "  --out <path>       results JSON destination (default results.json)\n"
          "  --inferences <n>   inferences to model per workload (default 1000)\n"
          "  --workload <name>  amortize only: one of mm-fit, mm-spill-2x,\n"
@@ -80,9 +94,10 @@ bool parseArgs(int argc, char **argv, Options &opts) {
     return false;
   }
   if (opts.command != "run" && opts.command != "dump-target" &&
-      opts.command != "amortize") {
+      opts.command != "amortize" && opts.command != "analyze") {
     std::cerr << "cim-bench: unknown command '" << opts.command
-              << "' (expected 'run', 'dump-target', or 'amortize')\n";
+              << "' (expected 'run', 'dump-target', 'amortize', or "
+                 "'analyze')\n";
     return false;
   }
 
@@ -123,6 +138,10 @@ bool parseArgs(int argc, char **argv, Options &opts) {
       const char *v = next("--policy");
       if (!v) return false;
       opts.policy = v;
+    } else if (arg == "--workload-file") {
+      const char *v = next("--workload-file");
+      if (!v) return false;
+      opts.workloadFile = v;
     } else {
       std::cerr << "cim-bench: unrecognized option '" << arg << "'\n";
       return false;
@@ -137,6 +156,12 @@ bool parseArgs(int argc, char **argv, Options &opts) {
     opts.targetFile = "targets/" + opts.target + ".yaml";
   if (opts.target.empty())
     opts.target = opts.targetFile;
+
+  if (opts.command == "analyze" && opts.workloadFile.empty()) {
+    std::cerr << "cim-bench: analyze requires --workload-file <path> (a "
+                 "JSON file from `cim-import-onnx --emit-workload`)\n";
+    return false;
+  }
 
   return true;
 }
@@ -204,6 +229,38 @@ const char *provenanceName(Provenance p) {
   case Provenance::Estimated: return "estimated";
   }
   return "unknown";
+}
+
+/// Escapes a string for embedding in the hand-rolled JSON this tool
+/// writes. Every other string this file emits (target names, policy
+/// names, workload names) is drawn from a fixed, internally-controlled
+/// vocabulary and never needed this -- `analyze`'s layer names and skip
+/// reasons come from a real ONNX model's own node names, which are
+/// attacker- or at least author-uncontrolled text this tool cannot
+/// vouch for, so writing them unescaped would risk emitting invalid JSON
+/// (or, worse, JSON that parses but says something the model itself did
+/// not).
+std::string jsonEscape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size());
+  for (unsigned char c : s) {
+    switch (c) {
+    case '"': out += "\\\""; break;
+    case '\\': out += "\\\\"; break;
+    case '\n': out += "\\n"; break;
+    case '\r': out += "\\r"; break;
+    case '\t': out += "\\t"; break;
+    default:
+      if (c < 0x20) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out += static_cast<char>(c);
+      }
+    }
+  }
+  return out;
 }
 
 struct Row {
@@ -386,6 +443,183 @@ int main(int argc, char **argv) {
     std::printf("wrote %s (target %s, workload %s, policy %s, hash %s)\n",
                 opts.outPath.c_str(), spec.name.c_str(), wl->name.c_str(),
                 opts.policy.c_str(), targetHash.c_str());
+    return 0;
+  }
+
+  if (opts.command == "analyze") {
+    WorkloadDocument doc;
+    std::string parseError;
+    if (!parseWorkloadDocumentFromFile(opts.workloadFile, doc, &parseError)) {
+      std::cerr << "cim-bench: " << parseError << "\n";
+      return 1;
+    }
+    if (doc.layers.empty()) {
+      std::cerr << "cim-bench: '" << opts.workloadFile
+                << "' declares 0 offloadable layers ("
+                << doc.skipped.size()
+                << " skipped) -- nothing to analyze\n";
+      return 1;
+    }
+
+    if (spec.provenance != Provenance::Measured) {
+      std::cerr << "cim-bench: WARNING: target '" << spec.name << "' declares "
+                << provenanceName(spec.provenance)
+                << " costs, not measured. Results below inherit that "
+                   "uncertainty and must be labelled as such in any plot.\n\n";
+    }
+    // The honesty requirement, loudly, every run: this is a partial view of
+    // the source model by construction (see python/cim_frontend/
+    // analyze.py's own module docstring), and a reader who only looks at
+    // stdout -- not the JSON file -- must still see that.
+    std::cerr << "cim-bench: '" << doc.model << "': " << doc.layers.size()
+              << " offloadable layer(s) analyzed, " << doc.skipped.size()
+              << " op(s) skipped (not represented below). This is "
+                 "weight-programming cost for the offloadable layers ONLY "
+                 "-- NOT end-to-end inference cost.\n";
+    for (const WorkloadSkip &skip : doc.skipped)
+      std::cerr << "  skipped: " << skip.name << " (" << skip.opType
+                << "): " << skip.reason << "\n";
+    std::cerr << "\n";
+
+    std::vector<uint32_t> blocksPerLayer;
+    blocksPerLayer.reserve(doc.layers.size());
+    for (const WorkloadLayer &layer : doc.layers)
+      blocksPerLayer.push_back(partitionBlockCount(
+          layer.k, layer.n, spec.tiles.rows, spec.tiles.cols));
+
+    const Workload wl = makeLayeredWorkload(
+        "analyze:" + doc.model,
+        std::to_string(doc.layers.size()) + " real offloadable layer(s), " +
+            std::to_string(doc.skipped.size()) + " skipped",
+        blocksPerLayer, spec.tiles.count, opts.inferences);
+
+    const EvictionPolicy policies[] = {EvictionPolicy::Belady,
+                                       EvictionPolicy::LRU,
+                                       EvictionPolicy::FIFO};
+    std::vector<Row> rows;
+    bool allCorrect = true;
+
+    std::printf("%-14s %-8s %6s %10s %10s %12s\n", "workload", "policy", "ok",
+                "programs", "install", "steady/inf");
+    std::printf("%s\n", std::string(66, '-').c_str());
+
+    for (EvictionPolicy policy : policies) {
+      PlacementResult result = computePlacement(wl.problem, policy);
+      std::string validationError;
+      const bool ok = validatePlacement(wl.problem, result, &validationError);
+      if (!ok) {
+        allCorrect = false;
+        std::fprintf(stderr, "cim-bench: INVALID SCHEDULE for %s/%s: %s\n",
+                     wl.name.c_str(), toString(policy),
+                     validationError.c_str());
+      }
+
+      CostReport report =
+          computeCostReport(spec, result, wl.stepsPerInference);
+
+      Row row;
+      row.workload = wl.name;
+      row.probes = wl.probes;
+      row.policy = toString(policy);
+      row.correct = ok;
+      row.programs = result.programs;
+      row.reuses = result.reuses;
+      row.installPrograms = report.installPrograms;
+      row.steadyPrograms = report.steadyStateProgramsPerInference;
+      row.totalEnergyPj = report.totalEnergyPj;
+      row.amortizedInstallPjPerInference =
+          amortizedInstallEnergyPjPerInference(report, opts.inferences);
+      rows.push_back(row);
+
+      std::printf("%-14s %-8s %6s %10llu %10llu %12llu\n", wl.name.c_str(),
+                  row.policy.c_str(), ok ? "yes" : "NO",
+                  static_cast<unsigned long long>(row.programs),
+                  static_cast<unsigned long long>(row.installPrograms),
+                  static_cast<unsigned long long>(row.steadyPrograms));
+    }
+
+    const std::string targetHash = hashFile(opts.targetFile);
+    const std::string workloadHash = hashFile(opts.workloadFile);
+    const std::string commit = gitCommit();
+    const std::string timestamp = utcTimestamp();
+
+    std::ofstream out(opts.outPath);
+    if (!out) {
+      std::cerr << "cim-bench: failed to open '" << opts.outPath
+                << "' for writing\n";
+      return 1;
+    }
+
+    out << "{\n";
+    out << "  \"target\": \"" << jsonEscape(spec.name) << "\",\n";
+    out << "  \"target_file\": \"" << jsonEscape(opts.targetFile) << "\",\n";
+    out << "  \"target_file_hash\": \"" << targetHash << "\",\n";
+    out << "  \"provenance\": \"" << provenanceName(spec.provenance)
+        << "\",\n";
+    out << "  \"git_commit\": \"" << commit << "\",\n";
+    out << "  \"date\": \"" << timestamp << "\",\n";
+    out << "  \"workload_file\": \"" << jsonEscape(opts.workloadFile)
+        << "\",\n";
+    out << "  \"workload_file_hash\": \"" << workloadHash << "\",\n";
+    out << "  \"model\": \"" << jsonEscape(doc.model) << "\",\n";
+    out << "  \"inferences_modeled\": " << opts.inferences << ",\n";
+    out << "  \"layers_analyzed\": " << doc.layers.size() << ",\n";
+    out << "  \"layers_skipped\": " << doc.skipped.size() << ",\n";
+    // The disclosure, in the artifact itself and not only in stderr --
+    // anyone who only ever looks at --out's JSON must still be unable to
+    // mistake this for end-to-end inference cost. Mirrors analyze.py's own
+    // `note` field so the same sentence exists on both sides of the
+    // Python/C++ boundary.
+    out << "  \"note\": \"weight-programming cost for the "
+        << doc.layers.size()
+        << " offloadable layer(s) analyzed ONLY -- this is NOT end-to-end "
+           "inference cost. "
+        << doc.skipped.size()
+        << " other op(s) were skipped (see 'skipped'); nothing they "
+           "compute is represented anywhere in this report.\",\n";
+    out << "  \"skipped\": [\n";
+    for (size_t i = 0; i < doc.skipped.size(); ++i) {
+      const WorkloadSkip &skip = doc.skipped[i];
+      out << "    {\"name\": \"" << jsonEscape(skip.name)
+          << "\", \"op_type\": \"" << jsonEscape(skip.opType)
+          << "\", \"reason\": \"" << jsonEscape(skip.reason) << "\"}"
+          << (i + 1 < doc.skipped.size() ? "," : "") << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"all_schedules_valid\": " << (allCorrect ? "true" : "false")
+        << ",\n";
+    out << "  \"results\": [\n";
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const Row &r = rows[i];
+      out << "    {\n";
+      out << "      \"policy\": \"" << r.policy << "\",\n";
+      out << "      \"schedule_valid\": " << (r.correct ? "true" : "false")
+          << ",\n";
+      out << "      \"programs\": " << r.programs << ",\n";
+      out << "      \"reuses\": " << r.reuses << ",\n";
+      out << "      \"install_programs\": " << r.installPrograms << ",\n";
+      out << "      \"steady_state_programs_per_inference\": "
+          << r.steadyPrograms << ",\n";
+      out << "      \"total_energy_pj\": " << r.totalEnergyPj << ",\n";
+      out << "      \"amortized_install_pj_per_inference\": "
+          << r.amortizedInstallPjPerInference << "\n";
+      out << "    }" << (i + 1 < rows.size() ? "," : "") << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+
+    std::printf(
+        "\nwrote %s (target %s, model %s, %zu layer(s) analyzed, %zu "
+        "skipped)\n",
+        opts.outPath.c_str(), spec.name.c_str(), doc.model.c_str(),
+        doc.layers.size(), doc.skipped.size());
+
+    if (!allCorrect) {
+      std::fprintf(stderr,
+                   "cim-bench: at least one schedule failed validation; "
+                   "performance numbers above are not trustworthy\n");
+      return 1;
+    }
     return 0;
   }
 

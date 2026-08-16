@@ -13,6 +13,12 @@ result stops matching an unquantized ONNX oracle as soon as any
 accumulator leaves [-128, 127]. Compare against an oracle through
 detect/partition/placement; add the rest when you want the modeled
 precision loss.
+
+A second, unrelated entry point, `--emit-workload`, skips MLIR entirely:
+it does not compile the model, only reports the weight shapes cim-bench's
+placement engine needs to estimate residency cost, and unlike the above
+never refuses on an op it does not recognize -- see analyze.py's own
+module docstring.
 """
 
 import argparse
@@ -53,6 +59,16 @@ def main(argv=None):
              "module's provenance header.")
     parser.add_argument("-o", "--output", metavar="PATH",
                         help="write here instead of stdout")
+    parser.add_argument(
+        "--emit-workload", action="store_true",
+        help="skip MLIR emission; instead permissively walk the graph "
+             "(cim_frontend.analyze) and write a JSON report of "
+             "offloadable-layer weight shapes to -o/--output (or stdout), "
+             "for `cim-bench analyze`. No --input/--input-random needed: "
+             "unlike compiling, placement/cost analysis needs only weight "
+             "shapes, never an activation. The report always names what "
+             "was skipped alongside what was counted -- see "
+             "cim_frontend/analyze.py's own docstring.")
     args = parser.parse_args(argv)
 
     try:
@@ -62,6 +78,26 @@ def main(argv=None):
               "(pip install -r test/python/requirements-onnx.txt)",
               file=sys.stderr)
         return 2
+
+    if args.emit_workload:
+        try:
+            with open(args.model, "rb") as handle:
+                model_bytes = handle.read()
+            model = onnx.load_from_string(model_bytes)
+
+            from .analyze import analyze_model
+            report = analyze_model(model, model_path=args.model)
+            text = json.dumps(report, indent=2) + "\n"
+        except Refusal as refusal:
+            print(refusal.format(), file=sys.stderr)
+            return 1
+
+        if args.output:
+            with open(args.output, "w") as handle:
+                handle.write(text)
+        else:
+            sys.stdout.write(text)
+        return 0
 
     try:
         with open(args.model, "rb") as handle:
