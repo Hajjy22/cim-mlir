@@ -5,6 +5,7 @@ add_library(cimPlacement STATIC
   Placement.cpp
   CostReport.cpp
   Workloads.cpp
+  WorkloadJSON.cpp
 )
 
 target_include_directories(cimPlacement PUBLIC

@@ -8,6 +8,7 @@ add_executable(cim-unit-tests
   validator_mutation_test.cpp
   parser_error_test.cpp
   cost_report_test.cpp
+  workload_json_test.cpp
 )
 
 # cimrt was previously linked into no test binary at all, which is why its

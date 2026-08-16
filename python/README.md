@@ -283,6 +283,45 @@ shipped target). That is a real modeled hardware effect, not a bug — but
 it means the result stops matching an *unquantized* ONNX oracle as soon as
 any accumulator leaves `[-128, 127]`.
 
+## Analyzing a real model, without compiling it
+
+Everything above answers "does this model compile and run correctly".
+`--emit-workload` answers a different, narrower question: "how much
+weight-residency pressure does this real network put on a given chip" —
+without needing the whole graph to be offloadable, and without needing an
+activation at all.
+
+```sh
+cim-import-onnx real_model.onnx --emit-workload -o workload.json
+cim-bench analyze --target erbium-8t --workload-file workload.json --out results.json
+```
+
+The insight this rests on: **weight-residency cost is a function of
+shape, not execution.** `cim-bench`'s placement engine only ever needs a
+layer's `[K, N]` — never its values, and never an activation — so a real
+network's `MaxPool`, `Concat`, `Softmax`, or even a grouped/dilated
+convolution this front end cannot yet *compile* does not block *analysis*
+of the layers around it.
+
+`--emit-workload` (`cim_frontend.analyze`) walks the graph permissively —
+unlike every path above, it never refuses the whole model. Every node
+becomes either an offloadable layer (its `[k, n]` goes in the output's
+`layers`) or a skip (its op type and a stated reason go in `skipped`), and
+the walk always completes. `cim-bench analyze` reads that JSON with a
+small, dependency-free reader (`lib/Placement/WorkloadJSON.cpp`, same
+LLVM-free rationale as the target-YAML reader), maps each layer's `[k, n]`
+through the existing `partitionBlockCount` into a real placement problem,
+and runs the same Belady/LRU/FIFO comparison and cost report `cim-bench
+run`'s built-in workloads use.
+
+**This is not end-to-end inference cost, and every output says so.** Both
+the JSON `--emit-workload` produces and `cim-bench analyze`'s own output
+(stdout and JSON) state in words how many layers were analyzed and how
+many other ops were skipped, and name the reason for each skip — a number
+that silently represented only part of a network is exactly the kind of
+confident-but-partial result this project refuses to publish anywhere
+else.
+
 ## Tests
 
 - `test/python/test_onnx_emitter.py` — needs no ONNX and no build; pins
@@ -316,6 +355,20 @@ any accumulator leaves `[-128, 127]`.
   zoo) itself — see `docs/roadmap.md`'s M4 entry for the exact result.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
+- `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid
+  matmul/conv is offloaded not skipped, an unrecognized op is skipped with
+  a named reason rather than crashing the walk, a grouped convolution is
+  still offloaded (shape-only analysis, unlike compilation), the honesty
+  `note` field, and a regenerate-and-diff check on the checked-in
+  `test/workloads/small-cnn-workload.json` fixture.
+- `test/python/test_workload_json_differential.py` — the C++
+  `WorkloadJSON` reader vs Python's own `json` module on the same file,
+  including `\u` escapes and quote-bearing names.
+- `test/python/test_cim_bench_analyze.py` — `cim-bench analyze` end to
+  end against the checked-in fixture, including a mutation check that
+  enlarging one real layer's `K` moves the placed program count.
+- `test/unit/workload_json_test.cpp` — the JSON reader's own rejection
+  table, same convention as `parser_error_test.cpp`'s for the YAML reader.
 
 Install the optional dependencies with:
 

@@ -221,6 +221,79 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     return model
 
 
+def small_multi_layer_cnn_model(seed=0, check=True):
+    """Three QLinearConv layers with two MaxPool ops between them --
+    conv/pool/conv/pool/conv, loosely the early-layer shape of a real
+    small classification CNN (a SqueezeNet-style stem: a few 3x3 convs
+    narrowing spatial size, expanding channels, capped by a 1x1
+    "classifier-ish" conv). HAND-BUILT, not downloaded from the ONNX model
+    zoo: this session's sandboxed network policy returns 403 for a raw
+    GitHub content fetch, so `analyze.py`'s own multi-op-graph test
+    coverage cannot depend on one being reachable. What matters for that
+    coverage is real either way -- multiple offloadable layers of
+    different [K, N] competing for tile residency, interleaved with ops
+    that have no resident weights -- not that the specific numbers came
+    from a trained model.
+
+    Backs test/python/test_analyze.py's checked-in JSON workload fixture
+    (test/workloads/small-cnn-workload.json) the same way
+    onnx_fixtures.matmul_integer_model backs
+    test/Transforms/onnx-imported-matmul.mlir: a test regenerates the
+    fixture from this function and diffs it, so it cannot silently go
+    stale (test_analyze.py::test_checked_in_workload_fixture_is_current).
+    """
+    rng = np.random.default_rng(seed)
+
+    def conv_layer(name, x_name, cout, cin, kh, kw):
+        w = rng.integers(-3, 4, size=(cout, cin, kh, kw),
+                         dtype=np.int64).astype(np.int8)
+        inits = [
+            numpy_helper.from_array(w, name=f"{name}_w"),
+            numpy_helper.from_array(np.array(1.0, dtype=np.float32),
+                                    name=f"{name}_xs"),
+            numpy_helper.from_array(np.array(0, dtype=np.int8),
+                                    name=f"{name}_xzp"),
+            numpy_helper.from_array(np.array(1.0, dtype=np.float32),
+                                    name=f"{name}_ws"),
+            numpy_helper.from_array(np.array(0, dtype=np.int8),
+                                    name=f"{name}_wzp"),
+            numpy_helper.from_array(np.array(1.0, dtype=np.float32),
+                                    name=f"{name}_ys"),
+            numpy_helper.from_array(np.array(0, dtype=np.int8),
+                                    name=f"{name}_yzp"),
+        ]
+        node = helper.make_node(
+            "QLinearConv",
+            [x_name, f"{name}_xs", f"{name}_xzp", f"{name}_w", f"{name}_ws",
+             f"{name}_wzp", f"{name}_ys", f"{name}_yzp"],
+            [f"{name}_y"], name=name, strides=[1, 1], pads=[0, 0, 0, 0])
+        return node, inits
+
+    def pool_layer(name, x_name):
+        return helper.make_node("MaxPool", [x_name], [f"{name}_y"],
+                                name=name, kernel_shape=[2, 2],
+                                strides=[2, 2])
+
+    conv1, init1 = conv_layer("conv1", "X", cout=8, cin=3, kh=3, kw=3)
+    pool1 = pool_layer("pool1", "conv1_y")
+    conv2, init2 = conv_layer("conv2", "pool1_y", cout=16, cin=8, kh=3, kw=3)
+    pool2 = pool_layer("pool2", "conv2_y")
+    conv3, init3 = conv_layer("conv3", "pool2_y", cout=32, cin=16, kh=1,
+                              kw=1)
+
+    graph = helper.make_graph(
+        [conv1, pool1, conv2, pool2, conv3], "small_cnn",
+        [helper.make_tensor_value_info("X", TensorProto.INT8, [1, 3, 10, 10])],
+        [helper.make_tensor_value_info("conv3_y", TensorProto.INT8,
+                                       [1, 32, 1, 1])],
+        init1 + init2 + init3,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def _as_activation_feed(activation, dtype=np.int8):
     """[K] promotes to [1, K]; a real [M, K] batch passes through as-is --
     same normalization `cim_frontend.onnx_import._validate_activation`
