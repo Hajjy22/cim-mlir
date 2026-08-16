@@ -13,6 +13,7 @@
 #include "test_harness.h"
 
 #include "cimrt.h"
+#include "cim/Target/TargetSpec.h"
 
 #include <cmath>
 #include <cstdint>
@@ -1276,4 +1277,53 @@ CIM_TEST(transfer_latency_pins_the_gigabytes_per_second_convention) {
 
   cimrt_free(buf);
   cimrt_close(dev);
+}
+
+CIM_TEST(cimrt_open_refuses_a_dtype_the_simulator_does_not_implement) {
+  // tiles.weight_dtype and tiles.activation_dtype were REQUIRED fields
+  // that nothing read -- their only consumers were two printfs in
+  // cim-bench -- while cimrt_mvm hardcodes i8 x i8 -> i32 in a comment and
+  // enforced it nowhere. A vendor target declaring i4 weights therefore
+  // opened cleanly, compiled (the passes take element types from the
+  // memrefs, never from the target), executed with int8_t
+  // reinterpretation, and was charged full declared mvm cost: plausible
+  // numbers for a different function than the file describes.
+  //
+  // The refusal lives at cimrt_open, not in the YAML parser, and this test
+  // pins BOTH halves of that split -- a refusal that also broke inspection
+  // would be over-correcting.
+  const char *path = nullptr;
+  for (const char *candidate :
+       {"test/targets/tiny-4x4-i4-weights.yaml",
+        "../test/targets/tiny-4x4-i4-weights.yaml",
+        "../../test/targets/tiny-4x4-i4-weights.yaml"}) {
+    cim::TargetSpec probe;
+    if (cim::parseTargetSpecFromFile(candidate, probe)) {
+      path = candidate;
+      break;
+    }
+  }
+
+  // Half one: it PARSES. The file is well-formed with every required field
+  // present, so the reader must read it -- `cim-bench dump-target` is an
+  // inspection tool and being able to read a spec you cannot yet run is
+  // useful, not an error. A null here means the parser rejected it, which
+  // would mean the check landed in the wrong layer.
+  CIM_EXPECT(path != nullptr);
+  if (!path)
+    return;
+
+  // Half two: it does NOT open. This is where execution begins, so this is
+  // where "I cannot run this" belongs.
+  cimrt_device *dev = nullptr;
+  CIM_EXPECT_EQ(cimrt_open(path, &dev), CIMRT_ERR_NO_DEVICE);
+  CIM_EXPECT(dev == nullptr);
+
+  // And the ordinary i8 target still opens -- without this, deleting the
+  // dtype comparison entirely and returning NO_DEVICE unconditionally
+  // would satisfy every assertion above.
+  cimrt_device *ok = nullptr;
+  CIM_EXPECT_EQ(cimrt_open(tinyTargetPath(), &ok), CIMRT_OK);
+  CIM_EXPECT(ok != nullptr);
+  cimrt_close(ok);
 }
