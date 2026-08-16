@@ -209,6 +209,18 @@ def coerce(doc):
     if out["tiles.persistence"] and out["tiles.persistence"] not in PERSISTENCES:
         raise ValueError("tiles.persistence must be 'volatile' or "
                          "'nonvolatile'")
+    elif out["tiles.persistence"]:
+        # Mirrors TargetYAMLParser.cpp's own cross-check: tiles.persistence
+        # is documentation-only (tiles.persistent is the field every pass
+        # actually reads), so when both are present they must agree, or a
+        # target file could describe two different devices with nothing to
+        # catch it.
+        declared_nonvolatile = out["tiles.persistence"] == "nonvolatile"
+        if declared_nonvolatile != out["tiles.persistent"]:
+            raise ValueError(
+                f"tiles.persistence ('{out['tiles.persistence']}') "
+                f"contradicts tiles.persistent "
+                f"({'true' if out['tiles.persistent'] else 'false'})")
 
     return out
 

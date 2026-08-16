@@ -23,8 +23,8 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 | `count` | Number of physical tiles on the device. |
 | `rows`, `cols` | Weight sub-matrix capacity per tile. |
 | `weight_dtype`, `activation_dtype`, `accumulator_dtype` | Native precision (e.g. `i8`, `i8`, `i32`). **The functional simulator implements `i8` x `i8` -> `i32` only**, and `cimrt_open` now *refuses* a target declaring any other weight/activation width rather than reinterpreting it as `i8` and charging full cost — the silent-wrong-answer this schema previously allowed. The file still **parses**, so `cim-bench dump-target` can inspect hardware this build cannot run; parsing and executability are deliberately separate answers given at separate places. Widening the accepted set is real kernel work, and this refusal is what keeps that work visible instead of silently skipped. |
-| `persistent` | Do weights survive across kernels / power-off? |
-| `persistence` | `volatile` or `nonvolatile` — drives the program/mvm cost asymmetry (`docs/abstraction.md`). |
+| `persistent` | Do weights survive across kernels / power-off? This is the field that actually drives the program/mvm cost asymmetry (`docs/abstraction.md`) — `cim-partition` writes it straight onto every `cim.program`'s own `persistent` attribute, and `lib/Placement/CostReport.cpp`'s amortization curve shape depends on it. |
+| `persistence` | `volatile` or `nonvolatile`, optional. **Documentation-only** — no pass reads it back; `persistent` above is the field that matters. When both are present the parser refuses a document where they disagree (`TargetYAMLParser.cpp`), so it cannot silently describe a different device than `persistent` does. |
 
 ## `costs:`
 
