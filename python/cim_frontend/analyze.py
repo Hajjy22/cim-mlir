@@ -16,9 +16,9 @@ Placement analysis needs only a layer's weight SHAPE -- the [K, N] pair
 `cim.Placement.Workloads.partitionBlockCount` turns into a tile-block
 count -- never its values, and never an activation. A `MaxPool` or
 `Softmax` node has no resident weights and so cannot change that count no
-matter what it computes; a grouped or dilated `QLinearConv` this project's
-compiler cannot yet EMIT still has a real, known weight tensor whose shape
-this module can still report. So this walker never refuses the graph:
+matter what it computes; a grouped `QLinearConv` this project's compiler
+cannot yet EMIT still has a real, known weight tensor whose shape this
+module can still report. So this walker never refuses the graph:
 every node is either an offloadable layer (its shape goes in `layers`) or
 a skip (its op type and the reason go in `skipped`), and the walk always
 completes.
@@ -125,12 +125,13 @@ def _matmul_integer_kn(model, initializers, node):
 def _qlinear_conv_kn(graph, initializers, node):
     """(k, n) = (Cin*Kh*Kw, Cout) for a QLinearConv node's weight, matching
     im2col_nchw's own reshape (see im2col.py's "THE KERNEL NEEDS NO
-    TRANSPOSE" note). Unlike load_qlinear_conv, this accepts group != 1
-    and dilations != (1, 1): the weight tensor's shape is real and known
-    either way, even though this front end cannot yet EMIT IR for a
-    grouped or dilated convolution -- see this module's own docstring.
-    Still refuses what would make the shape itself unknowable or the op
-    not truly weight-stationary."""
+    TRANSPOSE" note). Unlike load_qlinear_conv, this accepts group != 1:
+    the weight tensor's shape is real and known even though this front
+    end cannot yet EMIT IR for a grouped convolution -- see this module's
+    own docstring. (Dilation needs no such carve-out: onnx_import.py's
+    compile path accepts any positive dilation too, same as here.) Still
+    refuses what would make the shape itself unknowable or the op not
+    truly weight-stationary."""
     from onnx import numpy_helper
 
     where = f"node '{node.name or ACCEPTED_CONV_OP}'"
@@ -170,8 +171,8 @@ def _qlinear_conv_kn(graph, initializers, node):
     # means this is not the symmetric-weight, per-tensor-or-per-channel
     # contract this project's cost model was calibrated against at all, so
     # a reported k/n would not describe a layer this project actually
-    # understands -- as opposed to group/dilation below, which the weight
-    # tensor's shape already accounts for regardless.
+    # understands -- as opposed to group below, which the weight tensor's
+    # shape already accounts for regardless.
     _positive_weight_scale(graph, w_scale_name, node.name, "w_scale", cout)
     _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
     _y_zero_point, y_zp_dtype = _scalar_zero_point(
@@ -184,9 +185,10 @@ def _qlinear_conv_kn(graph, initializers, node):
 
     # ONNX stores a grouped conv's weight as [Cout, Cin/group, Kh, Kw] --
     # Cin here is already the real per-filter channel count, so k = Cin *
-    # Kh * Kw is correct regardless of `group` or `dilations`, even though
-    # this front end cannot yet emit IR to COMPILE a grouped or dilated
-    # convolution (see module docstring). Deliberately NOT read here at
+    # Kh * Kw is correct regardless of `group` (this front end cannot yet
+    # emit IR to COMPILE a grouped convolution, see module docstring) or
+    # `dilations` (which the compile path now accepts too, so there is no
+    # divergence to explain there at all). Deliberately NOT read here at
     # all: an earlier version of this function called _int_attr/
     # _int_list_attr on them "to check that something read-able exists",
     # but neither helper can actually fail that check -- both read the

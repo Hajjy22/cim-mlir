@@ -167,19 +167,28 @@ single "layer" — the scale it needs is derived as
 `y_scale / (x_scale * w_scale)`, matching `QLinearConv`'s own reference
 semantics for an integer accumulator.
 
-Only a plain (non-grouped, non-dilated), explicit-padding convolution is
-accepted — see `onnx_import.py`'s `load_qlinear_conv` module section
-header for the full list of what is refused and why (each is a real scope
-boundary, not an oversight; the refusal table below has an entry for the
-exact-padding requirement, which is the one surprise: `auto_pad=VALID` is
-refused too, despite being definitionally just zero padding, because
-`onnx.reference`'s own `Conv` implementation computes it with a padding
-formula that is wrong for any model with more than one image or input
-channel — an oracle bug this front end sidesteps by refusing it, rather
-than a limitation of its own). A chain of convolutions, or a convolution
-feeding a matmul, is not supported — only a single, standalone
-`QLinearConv`, matching how single-layer `MatMulInteger` import preceded
-chained import.
+Only a plain (non-grouped), explicit-padding convolution is accepted — see
+`onnx_import.py`'s `load_qlinear_conv` module section header for the full
+list of what is refused and why (each is a real scope boundary, not an
+oversight; the refusal table below has an entry for the exact-padding
+requirement, which is the one surprise: `auto_pad=VALID` is refused too,
+despite being definitionally just zero padding, because `onnx.reference`'s
+own `Conv` implementation computes it with a padding formula that is wrong
+for any model with more than one image or input channel — an oracle bug
+this front end sidesteps by refusing it, rather than a limitation of its
+own). A chain of convolutions, or a convolution feeding a matmul, is not
+supported — only a single, standalone `QLinearConv`, matching how
+single-layer `MatMulInteger` import preceded chained import.
+
+**Dilation (`dilations != (1, 1)`) is accepted** — unlike group, it changes
+only which source pixels a kernel tap reads, not the shape of anything:
+the destination patch `im2col_nchw` builds per output position is the same
+dense block either way, so numpy's own strided slicing (step = the
+dilation factor) reads the pattern directly with no new data structure or
+second pass. See `im2col.py`'s own "DILATION IS A SAMPLING PATTERN" note.
+Grouped convolution remains refused: each group is really an independent
+matmul over a slice of channels, which genuinely cannot be expressed as a
+single reshape the way dilation can.
 
 **Per-channel scale, a real bias, and asymmetric zero points are also
 accepted** — found necessary, not merely nice-to-have, by importing a real
@@ -242,7 +251,7 @@ is worse than a refusal.
 | a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
 | a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
 | a grouped/depthwise `QLinearConv` (`group != 1`) | each group is really an independent matmul over a slice of channels, not one reshape |
-| a dilated `QLinearConv` (`dilations != (1, 1)`) | a dilated kernel tap reads a non-contiguous patch, which this front end's im2col does not express |
+| a `QLinearConv` with a non-positive `dilations` entry | not a sampling pattern any real accelerator (or numpy's own strided slicing) can express; a positive dilation is accepted (see above) |
 | a `QLinearConv` with a non-zero `w_zero_point` | its correction term is per-row (activation-dependent), not a fixed per-channel bias, so it is not one of the reshapes above |
 | a `QLinearConv` with a non-scalar `x_zero_point` or `y_zero_point` | per-tensor activation/output quantization is the near-universal convention, unlike per-channel weight scale |
 | a `QLinearConv` with a uint8 `y_zero_point` | `cim.requantize`'s clamp is a signed `effective_bits` range; it cannot represent a uint8 output's full `[0, 255]` span |
@@ -299,9 +308,9 @@ cim-bench analyze --target erbium-8t --workload-file workload.json --out results
 The insight this rests on: **weight-residency cost is a function of
 shape, not execution.** `cim-bench`'s placement engine only ever needs a
 layer's `[K, N]` — never its values, and never an activation — so a real
-network's `MaxPool`, `Concat`, `Softmax`, or even a grouped/dilated
-convolution this front end cannot yet *compile* does not block *analysis*
-of the layers around it.
+network's `MaxPool`, `Concat`, `Softmax`, or even a grouped convolution
+this front end cannot yet *compile* does not block *analysis* of the
+layers around it.
 
 `--emit-workload` (`cim_frontend.analyze`) walks the graph permissively —
 unlike every path above, it never refuses the whole model. Every node

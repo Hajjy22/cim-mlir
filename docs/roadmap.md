@@ -1808,6 +1808,51 @@ out of scope for v0.1 across the board, not just here.
     dimension or zero output channels not being a degenerate real layer
     but not a layer at all.
 
+- **Dilated convolution (`dilations != (1, 1)`) is now imported, not
+  refused.** Broadening convolution support was the next item on the
+  "deliberately out of scope" list from Phase 1's own plan. Of the two
+  restrictions named there (grouped and dilated), dilation turned out to
+  need no real model to motivate lifting it, unlike every other
+  convolution capability landed so far (per-channel scale, bias,
+  asymmetric zero points) which needed `squeezenet1.0-12-int8` to prove
+  necessary: the shape argument alone was sufficient once looked at
+  closely. "A dilated kernel tap reads a non-contiguous patch" is true,
+  but non-contiguous describes only the SOURCE indices -- the destination
+  patch `im2col_nchw` builds per output position is the same dense
+  `[C, Kh, Kw]` block either way, and numpy's own strided slicing
+  (`start:stop:step`, step = the dilation factor) reads exactly that
+  pattern with no new data structure or second pass needed. Grouped
+  convolution remains refused: each group is really an independent matmul
+  over a slice of channels, which genuinely cannot be expressed as a
+  single reshape the way dilation can.
+
+  `im2col_nchw` (`python/cim_frontend/im2col.py`) gained
+  `dilation_h`/`dilation_w` parameters (default 1, identical to every
+  call site before this landed); `load_qlinear_conv`
+  (`onnx_import.py`) validates `dilations` has length 2 and both entries
+  positive instead of refusing any value but `(1, 1)`.
+  `analyze.py`'s shape-only path needed no change at all: `k`/`n` never
+  depended on dilation, so the earlier "grouped or dilated, either way
+  the shape is known" framing in its own comments simply lost the
+  "dilated" half now that dilation is no longer a compile-path
+  restriction to work around.
+
+  Verified: a differential test with deliberately asymmetric
+  `dilation_h != dilation_w`, `stride_h != stride_w`, and non-zero
+  padding (so a swapped H/W axis anywhere in the plumbing reads as a
+  shape error or a wrong number, not a lucky match) against
+  `onnx.reference`'s own quantized `QLinearConv` evaluation, plus a
+  direct `im2col_nchw` unit test against an independent hand-written
+  convolution loop that visits each kernel tap one at a time (not numpy's
+  own strided-slice syntax, which the implementation itself uses --
+  reusing that trick in the "independent" oracle would really be testing
+  the same formula against itself). Both mutation-tested: reverting
+  `im2col_nchw`'s dilated sampling back to a contiguous slice turned both
+  red; reverting `load_qlinear_conv`'s positivity check turned the
+  refusal test red (for the right reason -- it still raised, but a raw
+  `ValueError` from deep inside `im2col_nchw` rather than a proper
+  `Refusal`, which is exactly what that check exists to prevent).
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).
