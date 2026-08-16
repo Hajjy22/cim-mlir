@@ -157,6 +157,8 @@ jobs:
           sudo apt-get install -y ninja-build \
             llvm-18-dev libmlir-18-dev mlir-18-tools
           pip install lit
+          pip install -r test/python/requirements.txt
+          pip install -r test/python/requirements-onnx.txt
 
       - name: Configure with ASan + UBSan
         run: |
@@ -171,7 +173,9 @@ jobs:
       # detect_leaks=0 is not a workaround for our leaks: MLIR intentionally
       # leaks ManagedStatic and cl::opt storage at exit. Per-frame
       # suppressions were tried and are unmaintainable; core-valgrind covers
-      # the code we actually own.
+      # the code we actually own. Note it disables LEAK detection only --
+      # use-after-free, buffer overflow and every UBSan check still fire,
+      # which is what the front-end step below is here for.
       - name: Tests under sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=0
@@ -179,6 +183,24 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure
           cmake --build build --target check-cim-opt
+
+      # The ONNX front end is now the project's primary entry point, and it
+      # emits IR SHAPES no hand-written C++ or lit test produces: different
+      # allocation counts, column subviews, a cim.reduce_partial reading a
+      # broadcast global, N-per-channel requantize chains. That distinction
+      # is not hypothetical -- a heap-use-after-free in the interpreter's
+      # memref.cast handler (a self-referential DenseMap insert) lived
+      # exactly there, and was found only by building an ASan tree by hand,
+      # because no CI job ran front-end-generated IR under sanitizers:
+      # mlir-asan ran the C++/lit suites only, and the `differential` job
+      # that runs pytest configures a Release build with no sanitizer.
+      # This step closes that gap.
+      - name: Front-end differential tests under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+          CIM_BUILD_DIR: build
+        run: python3 -m pytest test/python -q
 
   # ---------------------------------------------------------------------
   # Differential tests (test/python)

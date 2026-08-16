@@ -74,15 +74,43 @@ struct CIMDetectPass : public CIMDetectBase<CIMDetectPass> {
     MLIRContext *ctx = &getContext();
     unsigned detected = 0;
 
+    // Declining is legitimate -- most linalg ops in a real module are not
+    // CIM candidates and never will be -- so these are remarks, not
+    // warnings or errors. What is NOT legitimate is declining in silence,
+    // which is what this pass used to do: three bare `return`s, no
+    // diagnostic at any level, in a file whose own comment below says
+    // convolution "must not be silently accepted". Because cim-partition
+    // only walks ops carrying cim.candidate, an undetected op makes the
+    // ENTIRE pipeline silent -- a conv, an fp32 matmul, or a matmul whose
+    // weight arrives as a function argument compiles to a module with
+    // nothing offloaded and no message anywhere explaining why. The very
+    // next pass warns four different ways for each candidate it declines
+    // ("leaving this candidate unoffloaded"); the front door said nothing.
+    //
+    // Remarks are off by default and surface under
+    // -mlir-print-ir-after-all / a diagnostic handler, so this costs a
+    // normal run nothing while making "why did nothing offload?" a
+    // question the compiler can answer about itself.
     module.walk([&](linalg::LinalgOp op) {
       // v0.1 handles plain and batched matmul. Convolution is explicitly
       // out of scope (spec Sec. 2) and must not be silently accepted.
       if (!llvm::isa<linalg::MatmulOp, linalg::BatchMatmulOp,
-                     linalg::MatmulTransposeBOp>(op.getOperation()))
+                     linalg::MatmulTransposeBOp>(op.getOperation())) {
+        op->emitRemark("cim-detect: not a matmul shape this pass offloads (")
+            << op->getName()
+            << "); v0.1 accepts linalg.matmul, linalg.batch_matmul and "
+               "linalg.matmul_transpose_b only, so this op is left "
+               "unoffloaded";
         return;
+      }
 
-      if (!hasInt8Contract(op))
+      if (!hasInt8Contract(op)) {
+        op->emitRemark(
+            "cim-detect: does not match the INT8-in/wider-accumulator-out "
+            "contract (every input i8, every init wider than i8), so this "
+            "op is left unoffloaded");
         return;
+      }
 
       // Exactly one input must be a weight. If both are constants the op
       // should have been folded; if neither is, there is nothing to hold
@@ -96,8 +124,14 @@ struct CIMDetectPass : public CIMDetectBase<CIMDetectPass> {
             weightIndex = static_cast<unsigned>(index);
         }
       }
-      if (constantCount != 1)
+      if (constantCount != 1) {
+        op->emitRemark("cim-detect: needs exactly one constant (weight) "
+                       "operand, found ")
+            << constantCount
+            << "; weight-stationary hardware has nothing to make resident "
+               "otherwise, so this op is left unoffloaded";
         return;
+      }
 
       op->setAttr("cim.candidate", UnitAttr::get(ctx));
       // Which operand to make resident. cim-partition needs this and should
