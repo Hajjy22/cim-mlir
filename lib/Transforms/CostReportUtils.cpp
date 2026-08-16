@@ -95,5 +95,62 @@ mlir::cim::IRCostCounts mlir::cim::countWeightedOps(ModuleOp module) {
     counts.reduceAdds += static_cast<uint64_t>(counted->first) * addsPerFiring;
   });
 
+  module.walk([&](mlir::cim::CopyOp op) {
+    FailureOr<std::pair<int64_t, int>> counted = weightedCount(op);
+    if (failed(counted)) {
+      ++counts.unknownCopySites;
+      return;
+    }
+
+    auto srcType = llvm::dyn_cast<MemRefType>(op.getSource().getType());
+    auto destType = llvm::dyn_cast<MemRefType>(op.getDest().getType());
+    if (!srcType || !destType) {
+      ++counts.unknownCopySites;
+      return;
+    }
+
+    // Mirrors lowerCimCopy's own host/device test (CIMLowerToTarget.cpp)
+    // exactly, because the point of this count is to charge precisely the
+    // transfers that lowering routes through cimrt -- a different rule
+    // here would produce a static number that describes a different
+    // program than the one that runs.
+    auto spaceOf = [](MemRefType t) {
+      return llvm::dyn_cast_or_null<mlir::cim::SpaceAttr>(t.getMemorySpace());
+    };
+    auto isDevice = [&](MemRefType t) {
+      auto space = spaceOf(t);
+      return space && space.getKind() != mlir::cim::SpaceKind::host;
+    };
+
+    if (!isDevice(srcType) && !isDevice(destType)) {
+      // Host to host: lowerCimCopy short-circuits this to a plain
+      // memref.copy that never reaches cimrt, so the runtime charges it
+      // nothing. Counted separately rather than folded into zero -- see
+      // IRCostCounts::transferBytes.
+      counts.hostToHostCopies += static_cast<uint64_t>(counted->first);
+      return;
+    }
+
+    // lowerCimCopy sizes a device->host transfer by its SOURCE and every
+    // other case by its destination; match that, or a copy between
+    // differently-sized views would be charged the wrong way round.
+    const bool deviceToHost = isDevice(srcType) && !isDevice(destType);
+    MemRefType sizingType = deviceToHost ? srcType : destType;
+    if (!sizingType.hasStaticShape()) {
+      ++counts.unknownCopySites;
+      return;
+    }
+    auto elemType = llvm::dyn_cast<IntegerType>(sizingType.getElementType());
+    if (!elemType || elemType.getWidth() % 8 != 0) {
+      ++counts.unknownCopySites;
+      return;
+    }
+    const uint64_t bytesPerFiring =
+        static_cast<uint64_t>(sizingType.getNumElements()) *
+        (elemType.getWidth() / 8);
+    counts.transferBytes +=
+        static_cast<uint64_t>(counted->first) * bytesPerFiring;
+  });
+
   return counts;
 }

@@ -51,6 +51,27 @@ struct CostReport {
   double reducePartialEnergyPj = 0.0;
   double reducePartialLatencyNs = 0.0;
 
+  /// Bytes moved by cim.copy sites that cross the host/device boundary,
+  /// and the energy `costs.transfer.energy_pj_per_byte` charges for them.
+  /// Same "only cim-cost-report can count this" story as requantizes and
+  /// reducePartialAdds above: a PlacementResult has no notion of a copy
+  /// step, so the engine-side path leaves these at zero.
+  ///
+  /// IMPORTANT, and disclosed in the emitted report itself: this is NOT
+  /// every byte the runtime charges. lowerProgram/lowerMvm stage weights,
+  /// activations and results through cimrt_write/cimrt_read without any
+  /// cim.copy op to represent them, and on a small placed module that
+  /// implicit traffic is the majority of cimrt_profile's `bytes`. See
+  /// IRCostCounts::transferBytes for the full reasoning and why the
+  /// static-vs-runtime differential deliberately does not assert these
+  /// two numbers are equal.
+  uint64_t transferBytes = 0;
+  double transferEnergyPj = 0.0;
+  /// Host-to-host cim.copy sites: real movement that neither this report
+  /// nor cimrt charges, surfaced so zero-because-none is distinguishable
+  /// from zero-because-uncharged.
+  uint64_t hostToHostCopies = 0;
+
   double totalEnergyPj = 0.0;
   double totalLatencyNs = 0.0;
 
