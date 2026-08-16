@@ -352,6 +352,33 @@ void expectDifferentialAgrees(const char *label, const std::string &source,
   // Note both sides count cimrt_reduce_add CALLS (N-1 per N-operand
   // cim.reduce_partial), not op sites -- see CostReportUtils.cpp.
   CIM_EXPECT_EQ(d.predicted.reduceAdds, d.actual.reduceAdds);
+
+  // WHY `bytes` IS NOT COMPARED HERE, THOUGH BOTH SIDES REPORT ONE
+  // =============================================================
+  // Every other counter above is an op count, and both sides count the
+  // same ops, so equality is the right invariant. Bytes are not:
+  //
+  //   * The static side (IRCostCounts::transferBytes) can only see
+  //     explicit cim.copy ops. lowerProgram writes the whole weight tile
+  //     through cimrt_write before every cimrt_program, and lowerMvm
+  //     stages the activation and reads the result back the same way --
+  //     traffic cimrt's recordTransfer charges in full, with no cim.copy
+  //     op anywhere in the IR to represent it. On a small placed module
+  //     that implicit share is the MAJORITY of `bytes`.
+  //   * The two executors do not even agree with each other. The compiled
+  //     path hoists staging buffers out of loops (noteHoisted); the
+  //     interpreter re-stages on every op. So `bytes` is partly an
+  //     artifact of which executor ran, not a property of the program.
+  //
+  // Asserting equality would therefore fail for reasons that are not
+  // bugs in either side, and asserting some fudged inequality would be
+  // worse than asserting nothing. What IS pinned lives in
+  // test/Transforms/cim-pipeline-full.mlir, which fixes the static
+  // transfer_bytes and the total_energy_pj that now includes them. The
+  // gap above is a known, disclosed limitation -- see CostReport.h's
+  // transferBytes comment and the
+  // "transfer_bytes_excludes_implicit_staging" key the JSON emits -- not
+  // an oversight this test forgot to cover.
   CIM_EXPECT(d.predicted.complete());
 }
 

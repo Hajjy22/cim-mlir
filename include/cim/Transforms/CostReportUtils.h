@@ -54,6 +54,46 @@ struct IRCostCounts {
   /// emitted by cim-partition, but not IR-invalid) costs zero, since it
   /// lowers to a plain forward with no add at all.
   uint64_t reduceAdds = 0;
+  /// Weighted bytes moved by cim.copy sites that actually cross the
+  /// host/device boundary -- the transfers `costs.transfer` describes and
+  /// the ones lowerCimCopy routes through cimrt (and so charges).
+  ///
+  /// WHAT THIS DELIBERATELY DOES NOT INCLUDE, because the omission is
+  /// large enough that leaving it undisclosed would be the exact defect
+  /// this project refuses:
+  ///
+  ///   * Implicit staging. lowerProgram writes the whole weight tile
+  ///     through cimrt_write before every cimrt_program, and lowerMvm
+  ///     stages the activation and reads the result back the same way
+  ///     (the interpreter does likewise). None of that traffic is
+  ///     represented by a cim.copy op, so no IR walk can see it -- yet
+  ///     cimrt's own recordTransfer charges every byte of it. On a small
+  ///     placed 8x8 module the implicit share is the MAJORITY of the
+  ///     runtime's reported bytes, not a rounding error. cim.copy's own
+  ///     docstring ("transfers are always explicit ops, never implicit")
+  ///     describes the dialect's intent, not what the lowering currently
+  ///     emits.
+  ///   * Host-to-host cim.copy. lowerCimCopy short-circuits it to a plain
+  ///     memref.copy with no cimrt involvement, so the runtime charges it
+  ///     nothing and neither does this. `costs.transfer` is documented as
+  ///     a host<->near cost, so this is a scope decision -- but it is
+  ///     counted separately below rather than silently folded to zero.
+  ///
+  /// The consequence for the static-vs-runtime differential
+  /// (test/mlir/cost_report_e2e_test.cpp): this figure is NOT expected to
+  /// equal cimrt_profile's `bytes`, and that test does not assert it does.
+  /// The two executors do not even agree with each other -- the compiled
+  /// path hoists staging buffers out of loops while the interpreter
+  /// re-stages per op -- so `bytes` is partly an artifact of which
+  /// executor ran, which is itself a known gap rather than a property
+  /// worth pinning.
+  uint64_t transferBytes = 0;
+  /// Weighted count of host-to-host cim.copy sites: real data movement
+  /// that neither this report nor the runtime charges (see transferBytes).
+  /// Surfaced so a reader can tell "no host-to-host copies happened" from
+  /// "they happened and cost nothing here".
+  uint64_t hostToHostCopies = 0;
+
   /// Static cim.program sites whose weight could not be determined because
   /// some enclosing loop's trip count is not a compile-time constant.
   uint64_t unknownProgramSites = 0;
@@ -63,13 +103,17 @@ struct IRCostCounts {
   uint64_t unknownRequantizeSites = 0;
   /// Same, for cim.reduce_partial.
   uint64_t unknownReduceSites = 0;
+  /// Same, for cim.copy -- either an unknown enclosing trip count, or a
+  /// shape/element type whose byte size is not statically computable.
+  uint64_t unknownCopySites = 0;
 
   /// True iff every site's weight was determined -- `programs`/`mvms`/
   /// `requantizes`/`reduceAdds` are then the exact whole-run totals, not a
   /// lower bound.
   bool complete() const {
     return unknownProgramSites == 0 && unknownMvmSites == 0 &&
-           unknownRequantizeSites == 0 && unknownReduceSites == 0;
+           unknownRequantizeSites == 0 && unknownReduceSites == 0 &&
+           unknownCopySites == 0;
   }
 };
 

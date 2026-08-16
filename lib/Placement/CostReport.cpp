@@ -199,6 +199,14 @@ std::string formatCostReport(const CostReport &report,
     os << "  reduce_partial total: " << report.reducePartialAdds << " adds  "
        << formatTime(report.reducePartialLatencyNs) << "  "
        << formatEnergy(report.reducePartialEnergyPj) << "\n";
+  if (report.transferBytes > 0 || report.hostToHostCopies > 0) {
+    os << "  transfer total: " << report.transferBytes << " bytes  "
+       << formatEnergy(report.transferEnergyPj)
+       << "  (explicit cim.copy only; excludes weight/activation staging)\n";
+    if (report.hostToHostCopies > 0)
+      os << "                  " << report.hostToHostCopies
+         << " host-to-host copies, charged nothing by target or runtime\n";
+  }
   os << "  reuses:    " << report.reuses << " (steps needing no reprogram)\n";
 
   if (!report.persistent && report.standbyLeakageUwPerTile > 0.0) {
@@ -235,6 +243,16 @@ std::string toJson(const CostReport &report, const std::string &label) {
   os << "  \"mvms\": " << report.mvms << ",\n";
   os << "  \"requantizes\": " << report.requantizes << ",\n";
   os << "  \"reduce_partial_adds\": " << report.reducePartialAdds << ",\n";
+  // Host<->device cim.copy traffic only. NOT comparable to cimrt_profile's
+  // `bytes`, which additionally includes the weight/activation staging
+  // lowerProgram and lowerMvm perform through cimrt_write with no cim.copy
+  // op to represent it -- the companion key below names that gap in the
+  // artifact itself rather than leaving a reader to discover the shortfall
+  // by diffing against a profile run.
+  os << "  \"transfer_bytes\": " << report.transferBytes << ",\n";
+  os << "  \"transfer_energy_pj\": " << report.transferEnergyPj << ",\n";
+  os << "  \"host_to_host_copies\": " << report.hostToHostCopies << ",\n";
+  os << "  \"transfer_bytes_excludes_implicit_staging\": true,\n";
   os << "  \"reuses\": " << report.reuses << ",\n";
   os << "  \"install_programs\": " << report.installPrograms << ",\n";
   os << "  \"install_energy_pj\": " << report.installEnergyPj << ",\n";

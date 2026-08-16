@@ -30,6 +30,7 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -71,6 +72,21 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
 
     ::cim::CostReport report;
     report.persistent = spec.tiles.persistent;
+    // Copied from the target the same way computeCostReport
+    // (lib/Placement/CostReport.cpp) does for the engine-side path. This
+    // pass builds its CostReport by hand from IR op counts rather than
+    // from a PlacementResult, so it does not go through that function and
+    // has to mirror these assignments explicitly. Leaving them at their
+    // struct defaults is not a harmless omission: toJson's
+    // standby_leakage_pj_per_inference_floor is
+    // numTiles * standbyLeakageUwPerTile * steadyStateElapsedNsPerInference,
+    // so ANY of them left at zero silently reports a leak-free device, and
+    // double_buffer_capable reports false for hardware whose own target
+    // file declares the capability. cim-bench reads the same three values
+    // straight from the spec and gets them right, so before this the
+    // project shipped two emitters of one JSON schema that disagreed.
+    report.numTiles = spec.tiles.count;
+    report.standbyLeakageUwPerTile = spec.costs.standbyLeakageUwPerTile;
     report.programs = counts.programs;
     report.mvms = counts.mvms;
     // Every cim.mvm reads one resident tile; a step that needed a fresh
@@ -102,9 +118,21 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.reducePartialLatencyNs = static_cast<double>(counts.reduceAdds) *
                                      spec.costs.reducePartial.latencyNs;
 
+    // Transfers: an entire declared cost class that this report used to
+    // omit silently, while costs.transfer.energy_pj_per_byte sat in every
+    // shipped target file as a required field. Only the host<->device
+    // copies are charged -- see IRCostCounts::transferBytes for what is
+    // deliberately still missing (implicit staging) and why no IR walk can
+    // see it.
+    report.transferBytes = counts.transferBytes;
+    report.hostToHostCopies = counts.hostToHostCopies;
+    report.transferEnergyPj = static_cast<double>(counts.transferBytes) *
+                               spec.costs.transfer.energyPjPerByte;
+
     report.totalEnergyPj = report.programEnergyPj + report.mvmEnergyPj +
                             report.requantizeEnergyPj +
-                            report.reducePartialEnergyPj;
+                            report.reducePartialEnergyPj +
+                            report.transferEnergyPj;
     report.totalLatencyNs = report.programLatencyNs + report.mvmLatencyNs +
                              report.requantizeLatencyNs +
                              report.reducePartialLatencyNs;
@@ -122,6 +150,29 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.steadyStateLatencyNsPerInference =
         static_cast<double>(counts.steadyStatePrograms) *
         spec.costs.program.latencyNs;
+
+    // Elapsed = reprogramming + compute, sequential, matching
+    // computeCostReport's own steadyStateElapsedNsPerInference (and its
+    // comment on why it stays a SUM even on a double-buffer-capable
+    // target: that describes the hardware, not the schedule v0.1 emits).
+    // The module this pass reports on bakes exactly one inference -- see
+    // python/cim_frontend/onnx_import.py's own note, and the fact that
+    // cim-run takes no runtime inputs -- so counts.mvms IS the per-
+    // inference mvm count, no window division needed. This has to be set
+    // for the leakage floor above to be non-zero on a volatile target.
+    const double mvmLatencyPerInferenceNs =
+        static_cast<double>(counts.mvms) * spec.costs.mvm.latencyNs;
+    report.steadyStateElapsedNsPerInference =
+        report.steadyStateLatencyNsPerInference + mvmLatencyPerInferenceNs;
+
+    // A projection, computed only where the target says it could ever be
+    // realized -- never substituted for the honest sum above. Same
+    // discipline and same formula as computeCostReport's.
+    report.doubleBufferCapable = spec.capabilities.doubleBufferProgram;
+    if (report.doubleBufferCapable)
+      report.steadyStateElapsedNsPerInferenceIfOverlapped =
+          std::max(report.steadyStateLatencyNsPerInference,
+                   mvmLatencyPerInferenceNs);
 
     const std::string label =
         module.getName() ? module.getName()->str() : std::string("module");

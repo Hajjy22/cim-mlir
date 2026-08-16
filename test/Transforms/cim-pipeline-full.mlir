@@ -101,7 +101,23 @@ memref.global "private" constant @weights_4x4 : memref<4x4xi8> = dense<1>
 // costs.requantize entry would silently produce.
 // COST-JSON: "requantizes": 1,
 // COST-JSON: "reduce_partial_adds": 0,
-// COST-JSON: "total_energy_pj": 10150,
+// The two host<->device cim.copy ops this module lowers to: the activation
+// in (4 x i8) and the result back out (4 x i32), 20 bytes, at
+// tiny-4x4.yaml's 1.0 pj_per_byte.
+// COST-JSON: "transfer_bytes": 20,
+// COST-JSON: "transfer_energy_pj": 20,
+// total_energy_pj was 10150 before transfers were counted at all. The
+// extra 20 pJ is not a cost that appeared -- it is a cost that was always
+// being paid, declared in every target file as a required
+// costs.transfer.energy_pj_per_byte, and silently omitted from this
+// report. The number went UP because it got more honest, which is the one
+// direction a published figure is allowed to move without a hardware
+// change behind it.
+// COST-JSON: "total_energy_pj": 10170,
+// Latency is unchanged: recordTransfer still charges no time (the
+// bandwidth_gbps TODO in runtime/src/simulator/cost_model.h), so counting
+// the bytes moves energy without moving the clock. That asymmetry is
+// itself a known gap, not a rounding artifact.
 // COST-JSON: "total_latency_ns": 1015,
 
 // TARGET-LABEL: func.func @single_tile_matmul
