@@ -43,6 +43,11 @@ namespace cim {
 struct WorkloadLayer {
   std::string name;
   std::string opType;
+  /// Both required to be strictly positive by the reader (WorkloadJSON.cpp)
+  /// -- a matmul with a zero contraction dimension or zero output channels
+  /// is not a degenerate real layer, it is not a layer at all, and
+  /// partitionBlockCount would silently place zero blocks for it while
+  /// this layer still counted toward "layers_analyzed".
   uint32_t k = 0;
   uint32_t n = 0;
 };

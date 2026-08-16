@@ -1781,6 +1781,33 @@ out of scope for v0.1 across the board, not just here.
     once against a mutation in `cim-lower-to-target`'s buffer-space choice
     that does survive to final text, which correctly turned the test red.
 
+- **A self-audit of Phase 1 itself, the same rigor turned on the code that
+  did the auditing.** Three findings, all mutation-tested:
+  - `analyze.py`'s `_qlinear_conv_kn` called `_int_attr(node, "group", 1)`
+    and `_int_list_attr(node, "dilations", [1, 1])` "to check that
+    something read-able exists" and discarded the result -- but neither
+    helper can actually fail that check: both read the raw protobuf field
+    for their expected type and silently return the type's zero value if
+    the attribute is stored under a different `AttributeProto` type,
+    rather than raising. A call that cannot fail and whose result is
+    discarded is not a check; it was dead code dressed up as one. Removed.
+  - `analyze_model` walks only `graph.node`, which never visits a nested
+    `GraphProto` -- an `If`/`Loop`/`Scan` branch. A `MatMulInteger` inside
+    one was previously not merely skipped but genuinely invisible: not in
+    `layers`, not in `skipped`, not named anywhere. `_has_subgraph`
+    detects any node carrying a `GRAPH`/`GRAPHS`-typed attribute and gives
+    it a distinct skip reason saying its subgraph was never entered,
+    rather than the generic "not a weight-stationary op" wording that
+    would otherwise read as a complete story when it is not one.
+  - The C++ `WorkloadJSON` reader accepted `k=0` or `n=0` on a layer (a
+    non-negative integer, which the schema's own bounds allow) --
+    `partitionBlockCount(0, n, ...)` silently returns 0 blocks for that
+    layer, so it would count toward `layers_analyzed` while contributing
+    nothing whatsoever to the placement result. Now refused: `k` and `n`
+    must both be strictly positive, a matmul with a zero contraction
+    dimension or zero output channels not being a degenerate real layer
+    but not a layer at all.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

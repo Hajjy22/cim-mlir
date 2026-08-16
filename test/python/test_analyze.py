@@ -164,6 +164,52 @@ def test_grouped_conv_is_offloaded_despite_not_being_compilable_today():
     assert report["skipped"] == []
 
 
+# --- control-flow subgraphs: what the walker CANNOT see must say so -------
+
+def test_a_matmul_hidden_inside_an_if_branch_is_flagged_not_silently_missed():
+    # graph.node never visits an If/Loop/Scan node's own branches -- they
+    # are nested GraphProto attributes, not sibling nodes. A MatMulInteger
+    # inside one is genuinely invisible to this walker; the honesty
+    # requirement is that its own containing node says so distinctly,
+    # rather than reading like an ordinary "no resident weights" skip.
+    weight = np.ones((8, 4), dtype=np.int8)
+    inner_mm = helper.make_node("MatMulInteger", ["A", "W"], ["Y"],
+                                name="hidden_mm")
+    then_graph = helper.make_graph(
+        [inner_mm], "then_g", [],
+        [helper.make_tensor_value_info("Y", TensorProto.INT32, [1, 4])],
+        [numpy_helper.from_array(weight, name="W")])
+    else_graph = helper.make_graph(
+        [], "else_g", [],
+        [helper.make_tensor_value_info("Y", TensorProto.INT32, [1, 4])], [])
+    if_node = helper.make_node(
+        "If", ["cond"], ["Z"], name="branch",
+        then_branch=then_graph, else_branch=else_graph)
+    graph = helper.make_graph(
+        [if_node], "g",
+        [helper.make_tensor_value_info("cond", TensorProto.BOOL, [])],
+        [helper.make_tensor_value_info("Z", TensorProto.INT32, [1, 4])], [])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+
+    report = analyze_model(model)
+    assert report["layers"] == []
+    assert len(report["skipped"]) == 1
+    skip = report["skipped"][0]
+    assert skip["name"] == "branch" and skip["op_type"] == "If"
+    assert "INVISIBLE" in skip["reason"]
+    assert "hidden_mm" not in [l["name"] for l in report["layers"]]
+
+
+def test_an_ordinary_op_with_no_subgraph_still_gets_the_generic_reason():
+    # The control: without it, the If-specific message above could be
+    # firing for every skipped op, not just subgraph-bearing ones.
+    mm = helper.make_node("MatMulInteger", ["A", "W"], ["Y"], name="mm1")
+    relu = helper.make_node("Relu", ["Y"], ["Z"], name="relu1")
+    model = _mixed_graph(mm, relu, "Y", "Z")
+    report = analyze_model(model)
+    assert "INVISIBLE" not in report["skipped"][0]["reason"]
+
+
 # --- graph-level (not per-node) refusals still raise -----------------------
 
 def test_unusable_opset_refuses_the_whole_call():
