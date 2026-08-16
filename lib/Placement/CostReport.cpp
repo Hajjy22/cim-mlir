@@ -201,6 +201,7 @@ std::string formatCostReport(const CostReport &report,
        << formatEnergy(report.reducePartialEnergyPj) << "\n";
   if (report.transferBytes > 0 || report.hostToHostCopies > 0) {
     os << "  transfer total: " << report.transferBytes << " bytes  "
+       << formatTime(report.transferLatencyNs) << "  "
        << formatEnergy(report.transferEnergyPj)
        << "  (explicit cim.copy only; excludes weight/activation staging)\n";
     if (report.hostToHostCopies > 0)
@@ -251,6 +252,7 @@ std::string toJson(const CostReport &report, const std::string &label) {
   // by diffing against a profile run.
   os << "  \"transfer_bytes\": " << report.transferBytes << ",\n";
   os << "  \"transfer_energy_pj\": " << report.transferEnergyPj << ",\n";
+  os << "  \"transfer_latency_ns\": " << report.transferLatencyNs << ",\n";
   os << "  \"host_to_host_copies\": " << report.hostToHostCopies << ",\n";
   os << "  \"transfer_bytes_excludes_implicit_staging\": true,\n";
   os << "  \"reuses\": " << report.reuses << ",\n";

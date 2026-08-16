@@ -76,7 +76,31 @@ public:
   void recordTransfer(uint64_t bytes) {
     bytesTransferred += bytes;
     energyPj += static_cast<double>(bytes) * spec.costs.transfer.energyPjPerByte;
-    // TODO(spec Sec.9.2): fold in bandwidth_gbps to derive transfer latency.
+
+    // THE UNITS, PINNED. `bandwidth_gbps` is read as GIGABYTES per second,
+    // not gigabits -- despite the field name, which is inherited from the
+    // spec and is misleading. Two independent reasons, because an 8x
+    // silent error in every latency number is exactly the class of
+    // plausible-but-wrong this project refuses:
+    //
+    //   1. The shipped values only make sense as GB/s: erbium-8t 12.8,
+    //      generic-digital-cim 25.6, upmem-like 6.4 -- textbook DDR
+    //      channel bandwidths in GB/s. As gigabits those would describe
+    //      implausibly slow memory for the devices they model.
+    //   2. Reading them as GB/s makes the conversion exact and unit-free:
+    //      1 GB/s IS 1 byte per nanosecond, so ns = bytes / gbps with no
+    //      scale factor to get backwards. (A bits reading would need a
+    //      /8 that nothing in the schema mentions.)
+    //
+    // Same discipline as install_energy_pins_the_pj_as_written_convention
+    // in test/unit/cost_report_test.cpp: the convention is pinned by a
+    // test, not just asserted in a comment, so a future "fix" cannot
+    // silently rescale every published latency. Guarded against a zero or
+    // negative bandwidth, which the parser already rejects, so this is
+    // belt-and-braces rather than a live path.
+    if (spec.costs.transfer.bandwidthGbps > 0.0)
+      latencyNs +=
+          static_cast<double>(bytes) / spec.costs.transfer.bandwidthGbps;
   }
 
   uint64_t getProgramsIssued() const { return programsIssued; }

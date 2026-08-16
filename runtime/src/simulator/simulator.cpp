@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -100,6 +101,47 @@ cimrt_status cimrt_open(const char *target_name, cimrt_device **out) {
   if (!parseTargetSpecFromFile(resolveTargetPath(name), dev->spec)) {
     delete dev;
     return CIMRT_ERR_NO_DEVICE;
+  }
+
+  // The target file may DESCRIBE a device this simulator cannot execute.
+  // tiles.weight_dtype and tiles.activation_dtype are required fields that
+  // nothing used to read -- their only consumers were two printfs in
+  // cim-bench -- while cimrt_mvm below hardcodes the v0.1 contract (i8 x
+  // i8 -> i32) in a comment and enforced it nowhere. So a vendor target
+  // declaring `weight_dtype: i4` opened cleanly, compiled (the passes take
+  // element types from the memrefs, never from the target), executed with
+  // int8_t reinterpretation, and was charged full declared mvm cost:
+  // plausible numbers for a different function than the file describes,
+  // which is exactly what this project refuses everywhere else. It is also
+  // the sharpest counterexample to "retargetable" available, since
+  // precision is the axis a CIM vendor is most likely to differ on.
+  //
+  // Refused HERE rather than in the YAML parser on purpose. Parsing and
+  // executability are different questions: `cim-bench dump-target` is an
+  // inspection tool and must keep working on any well-formed file,
+  // including one describing hardware this build cannot run -- being able
+  // to read a vendor's spec before you can execute it is useful, not an
+  // error. (Putting this in the parser also broke
+  // test/python/test_yaml_differential.py for a real reason: schema.py
+  // generates i4/u8/i16 as valid SPELLINGS, and that test compares the
+  // reader against PyYAML on document syntax, not on semantic support.)
+  // cimrt_open is where execution begins, so it is where "I cannot run
+  // this" belongs.
+  for (const auto &[field, value] :
+       {std::pair<const char *, const std::string &>{"tiles.weight_dtype",
+                                                     dev->spec.tiles.weightDtype},
+        std::pair<const char *, const std::string &>{
+            "tiles.activation_dtype", dev->spec.tiles.activationDtype}}) {
+    if (value != "i8") {
+      std::fprintf(stderr,
+                   "cimrt_open: target '%s' declares %s: '%s', but this "
+                   "functional simulator computes i8 x i8 -> i32 only "
+                   "(cimrt_mvm) and would reinterpret any other width as "
+                   "i8 rather than refuse it\n",
+                   name.c_str(), field, value.c_str());
+      delete dev;
+      return CIMRT_ERR_NO_DEVICE;
+    }
   }
 
   *out = dev;

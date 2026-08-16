@@ -67,6 +67,13 @@ struct CostReport {
   /// two numbers are equal.
   uint64_t transferBytes = 0;
   double transferEnergyPj = 0.0;
+  /// Time those bytes take at the target's declared bandwidth. `gbps` is
+  /// read as GIGABYTES per second, so this is simply bytes / gbps -- see
+  /// CostAccumulator::recordTransfer (runtime/src/simulator/cost_model.h)
+  /// for why that reading, and not gigabits, is the right one, and
+  /// transfer_latency_pins_the_gigabytes_per_second_convention in
+  /// test/unit/cost_report_test.cpp for the test that holds it there.
+  double transferLatencyNs = 0.0;
   /// Host-to-host cim.copy sites: real movement that neither this report
   /// nor cimrt charges, surfaced so zero-because-none is distinguishable
   /// from zero-because-uncharged.

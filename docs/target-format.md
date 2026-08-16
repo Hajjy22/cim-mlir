@@ -22,7 +22,7 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 |---|---|
 | `count` | Number of physical tiles on the device. |
 | `rows`, `cols` | Weight sub-matrix capacity per tile. |
-| `weight_dtype`, `activation_dtype`, `accumulator_dtype` | Native precision (e.g. `i8`, `i8`, `i32`). |
+| `weight_dtype`, `activation_dtype`, `accumulator_dtype` | Native precision (e.g. `i8`, `i8`, `i32`). **The functional simulator implements `i8` x `i8` -> `i32` only**, and `cimrt_open` now *refuses* a target declaring any other weight/activation width rather than reinterpreting it as `i8` and charging full cost — the silent-wrong-answer this schema previously allowed. The file still **parses**, so `cim-bench dump-target` can inspect hardware this build cannot run; parsing and executability are deliberately separate answers given at separate places. Widening the accepted set is real kernel work, and this refusal is what keeps that work visible instead of silently skipped. |
 | `persistent` | Do weights survive across kernels / power-off? |
 | `persistence` | `volatile` or `nonvolatile` — drives the program/mvm cost asymmetry (`docs/abstraction.md`). |
 
@@ -32,7 +32,7 @@ is parsed into (`lib/Target/TargetYAMLParser.cpp`).
 |---|---|
 | `program.latency_ns`, `program.energy_pj` | Cost of `cim.program` — the expensive, asymmetric op. |
 | `mvm.latency_ns`, `mvm.energy_pj` | Cost of one `cim.mvm` against a resident tile. |
-| `transfer.bandwidth_gbps`, `transfer.energy_pj_per_byte` | Per-byte host↔near transfer cost, charged on `cim.copy`. |
+| `transfer.bandwidth_gbps`, `transfer.energy_pj_per_byte` | Per-byte host↔near transfer cost, charged on `cim.copy`. **`gbps` means gigaBYTES per second, not gigabits** — so transfer latency is exactly `bytes / bandwidth_gbps` ns (1 GB/s is 1 byte/ns). The field name is inherited from the spec and is misleading; the reading is pinned by `transfer_latency_pins_the_gigabytes_per_second_convention` in `test/unit/cimrt_test.cpp`, on a fixture with a non-unit bandwidth so the alternative readings actually differ. Note the static report counts only *explicit* `cim.copy` traffic — weight/activation staging is charged at runtime but has no `cim.copy` op to see, and the report says so via `transfer_bytes_excludes_implicit_staging`. |
 | `requantize.latency_ns`, `requantize.energy_pj` | Cost of one `cim.requantize` — an ADC readout on an analog target, a narrowing/rounding step on a digital one (spec Sec. 5.3). Required like `program`/`mvm`: leaving it unset would silently cost every `cim.requantize` at zero rather than say so. |
 | `reduce_partial.latency_ns`, `reduce_partial.energy_pj` | Cost of one chained add inside `cim.reduce_partial` — summing two already-computed partial accumulators (spec Sec. 5.4 rule 4), charged once per `cimrt_reduce_add` call an *N*-operand `cim.reduce_partial` lowers to (*N*-1 calls, not once per op site). Required like `requantize`, for the same reason. |
 | `standby_leakage_uw_per_tile` | Idle power draw; `0.0` for non-volatile targets (the non-volatile advantage). |
