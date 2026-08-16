@@ -117,6 +117,32 @@ func.func @requantize_bits_exceed_result(%sum: memref<256xi32, #cim.space<near>>
 
 // -----
 
+// scale/zero_point/effective_bits describe an integer requantization; a
+// float result has no such thing to clamp into, and neither the
+// interpreter nor cim-lower-to-target has any other way to execute this.
+func.func @requantize_result_not_integer(%sum: memref<256xi32, #cim.space<near>>)
+    -> memref<256xf32, #cim.space<near>> {
+  // expected-error @+1 {{element types must both be integers}}
+  %q = cim.requantize %sum {scale = 1.0 : f32, zero_point = 0 : i32, effective_bits = 8 : i32}
+       : memref<256xi32, #cim.space<near>> -> memref<256xf32, #cim.space<near>>
+  return %q : memref<256xf32, #cim.space<near>>
+}
+
+// -----
+
+// Same rule, the other operand: a float partial sum is not a real
+// cim.mvm/cim.reduce_partial output, so nothing upstream should ever
+// produce this, but the verifier must still catch it if something does.
+func.func @requantize_input_not_integer(%sum: memref<256xf32, #cim.space<near>>)
+    -> memref<256xi8, #cim.space<near>> {
+  // expected-error @+1 {{element types must both be integers}}
+  %q = cim.requantize %sum {scale = 1.0 : f32, zero_point = 0 : i32, effective_bits = 8 : i32}
+       : memref<256xf32, #cim.space<near>> -> memref<256xi8, #cim.space<near>>
+  return %q : memref<256xi8, #cim.space<near>>
+}
+
+// -----
+
 // TileType::verify's branches were unreachable from parsing until
 // TileType::parse switched from get() to getChecked(): get() asserts in a
 // debug build and silently constructs a malformed type otherwise.
