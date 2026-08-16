@@ -128,6 +128,13 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.hostToHostCopies = counts.hostToHostCopies;
     report.transferEnergyPj = static_cast<double>(counts.transferBytes) *
                                spec.costs.transfer.energyPjPerByte;
+    // bytes / (GB/s) == ns exactly, since 1 GB/s is 1 byte per ns. Mirrors
+    // CostAccumulator::recordTransfer so the static and runtime sides read
+    // bandwidth_gbps the same way; the units themselves are pinned by a
+    // test, not just by these two comments agreeing.
+    if (spec.costs.transfer.bandwidthGbps > 0.0)
+      report.transferLatencyNs = static_cast<double>(counts.transferBytes) /
+                                  spec.costs.transfer.bandwidthGbps;
 
     report.totalEnergyPj = report.programEnergyPj + report.mvmEnergyPj +
                             report.requantizeEnergyPj +
@@ -135,7 +142,8 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
                             report.transferEnergyPj;
     report.totalLatencyNs = report.programLatencyNs + report.mvmLatencyNs +
                              report.requantizeLatencyNs +
-                             report.reducePartialLatencyNs;
+                             report.reducePartialLatencyNs +
+                             report.transferLatencyNs;
 
     report.installPrograms = counts.installPrograms;
     report.installEnergyPj = static_cast<double>(counts.installPrograms) *

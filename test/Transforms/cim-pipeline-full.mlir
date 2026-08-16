@@ -106,6 +106,7 @@ memref.global "private" constant @weights_4x4 : memref<4x4xi8> = dense<1>
 // tiny-4x4.yaml's 1.0 pj_per_byte.
 // COST-JSON: "transfer_bytes": 20,
 // COST-JSON: "transfer_energy_pj": 20,
+// COST-JSON: "transfer_latency_ns": 20,
 // total_energy_pj was 10150 before transfers were counted at all. The
 // extra 20 pJ is not a cost that appeared -- it is a cost that was always
 // being paid, declared in every target file as a required
@@ -114,11 +115,17 @@ memref.global "private" constant @weights_4x4 : memref<4x4xi8> = dense<1>
 // direction a published figure is allowed to move without a hardware
 // change behind it.
 // COST-JSON: "total_energy_pj": 10170,
-// Latency is unchanged: recordTransfer still charges no time (the
-// bandwidth_gbps TODO in runtime/src/simulator/cost_model.h), so counting
-// the bytes moves energy without moving the clock. That asymmetry is
-// itself a known gap, not a rounding artifact.
-// COST-JSON: "total_latency_ns": 1015,
+// And the same 20 bytes at tiny-4x4's bandwidth_gbps: 1.0 -- read as
+// GIGABYTES per second, where 1 GB/s is exactly 1 byte/ns -- add 20 ns,
+// taking latency 1015 -> 1035. Both totals moved for the same reason: a
+// required target field that charged nothing now charges what it declares.
+// The units behind that 20 are pinned independently, on a target where
+// they are actually visible, by
+// transfer_latency_pins_the_gigabytes_per_second_convention in
+// test/unit/cimrt_test.cpp -- at bandwidth 1.0 the conversion is the
+// identity, so this line alone could not tell a units bug from a correct
+// one.
+// COST-JSON: "total_latency_ns": 1035,
 
 // TARGET-LABEL: func.func @single_tile_matmul
 // Every cim op became a real cimrt_* call; none survive. Ordinary

@@ -40,6 +40,27 @@ const char *tinyTargetPath() {
   return path.c_str();
 }
 
+/// tiny-4x4 with costs.transfer.bandwidth_gbps: 4.0 instead of 1.0 -- the
+/// one fixture where the bytes->nanoseconds conversion is not the
+/// identity, and so the only one that can pin its units. See the target
+/// file's own header for why 1.0 makes a units bug invisible.
+const char *bandwidthTargetPath() {
+  static std::string path = [] {
+    for (const char *candidate :
+         {"test/targets/tiny-4x4-bandwidth.yaml",
+          "../test/targets/tiny-4x4-bandwidth.yaml",
+          "../../test/targets/tiny-4x4-bandwidth.yaml"}) {
+      cimrt_device *probe = nullptr;
+      if (cimrt_open(candidate, &probe) == CIMRT_OK) {
+        cimrt_close(probe);
+        return std::string(candidate);
+      }
+    }
+    return std::string("test/targets/tiny-4x4-bandwidth.yaml");
+  }();
+  return path.c_str();
+}
+
 /// Same target, minus capabilities.partial_sum_in_place -- every other
 /// tiny test target declares it true, so this is the one fixture that
 /// exercises "this target cannot accumulate in place" at all.
@@ -1202,4 +1223,57 @@ CIM_TEST(cimrt_profiling_measures_a_window_not_the_whole_device_lifetime) {
   CIM_EXPECT_EQ(cimrt_profile_start(dev.dev), CIMRT_OK);
   CIM_EXPECT_EQ(cimrt_profile_stop(dev.dev, &second), CIMRT_OK);
   CIM_EXPECT_EQ(second.programs_issued, 0u);
+}
+
+CIM_TEST(transfer_latency_pins_the_gigabytes_per_second_convention) {
+  // costs.transfer.bandwidth_gbps was a REQUIRED field that influenced
+  // nothing: recordTransfer added energy and left latency untouched behind
+  // a TODO, so every byte the runtime moved took zero nanoseconds and
+  // estimated_latency_ns was a program+mvm+requantize+reduce sum with a
+  // whole cost class missing. Now it is charged -- and the units it is
+  // charged in are the thing this test exists to hold still.
+  //
+  // `gbps` is read as GIGABYTES per second despite the name. The shipped
+  // values only make sense that way (erbium-8t 12.8, generic-digital-cim
+  // 25.6, upmem-like 6.4 are textbook DDR channel figures in GB/s), and it
+  // makes the conversion exact: 1 GB/s IS 1 byte per nanosecond, so
+  // ns = bytes / gbps with no scale factor to get backwards.
+  //
+  // This target declares 4.0, not the 1.0 every other test target uses,
+  // precisely so the three plausible readings disagree:
+  //   * gigabytes (correct):     N bytes -> N/4 ns
+  //   * gigabits  (a /8 nowhere in the schema): N/32 ns
+  //   * conversion dropped:      0 ns
+  // At bandwidth_gbps: 1.0 all three collapse toward the same number and
+  // the test would pass either way -- the same "passes for the wrong
+  // reason" trap a saturating quantization fixture fell into earlier in
+  // this project's history.
+  cimrt_device *dev = nullptr;
+  CIM_EXPECT_EQ(cimrt_open(bandwidthTargetPath(), &dev), CIMRT_OK);
+
+  cimrt_buffer *buf = nullptr;
+  CIM_EXPECT_EQ(cimrt_alloc(dev, 64, CIMRT_SPACE_NEAR, &buf), CIMRT_OK);
+  std::vector<uint8_t> payload(64, 7);
+
+  // The profiling window covers ONE write and nothing else -- no program,
+  // no mvm -- so every nanosecond it reports is attributable to this
+  // transfer, with no other cost class to hide an error behind.
+  CIM_EXPECT_EQ(cimrt_profile_start(dev), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(buf, 0, payload.data(), payload.size()), CIMRT_OK);
+  cimrt_profile p{};
+  CIM_EXPECT_EQ(cimrt_profile_stop(dev, &p), CIMRT_OK);
+
+  CIM_EXPECT_EQ(p.bytes_transferred, 64u);
+
+  // 64 bytes / 4.0 GB/s = 16 ns. Gigabits would give 2; a dropped
+  // conversion would give 0.
+  CIM_EXPECT(p.estimated_latency_ns > 15.9 && p.estimated_latency_ns < 16.1);
+
+  // Energy is unchanged by any of this -- 1.0 pJ/byte, still 64 pJ -- so a
+  // regression that "fixed" latency by rescaling the shared byte count
+  // would show up here rather than hiding behind the latency assertion.
+  CIM_EXPECT(p.estimated_energy_pj > 63.9 && p.estimated_energy_pj < 64.1);
+
+  cimrt_free(buf);
+  cimrt_close(dev);
 }
