@@ -56,6 +56,23 @@ def test_a_valid_conv_is_offloaded_not_skipped():
     assert layer["n"] == 6          # Cout
 
 
+def test_a_uint8_y_zero_point_conv_is_offloaded_not_skipped():
+    # Regression test: analyze.py used to skip this with a "cim.
+    # requantize's clamp is SIGNED" reason copied from the strict compile
+    # path -- correct at the time, stale the moment that compile-path
+    # refusal was lifted (load_qlinear_conv's uint8_output_shifted
+    # feature). Left unfixed, this would have silently under-reported a
+    # real model's own offloadable layers: squeezenet1.0-12-int8's first
+    # layer ships exactly a uint8 y_zero_point.
+    weight = np.ones((6, 3, 2, 2), dtype=np.int8)
+    model = qlinear_conv_model(weight, x_shape=(1, 3, 5, 5),
+                               y_dtype=onnx.TensorProto.UINT8,
+                               y_zero_point=130)
+    report = analyze_model(model)
+    assert len(report["layers"]) == 1, report["skipped"]
+    assert report["skipped"] == []
+
+
 # --- the walk never refuses the graph -----------------------------------
 
 def _mixed_graph(offload_node, other_node, other_input, output_name):

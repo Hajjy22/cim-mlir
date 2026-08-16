@@ -1597,6 +1597,22 @@ out of scope for v0.1 across the board, not just here.
   fixture at realistic parameters, not a second capstone run; said
   plainly rather than implied otherwise.
 
+  **A follow-up self-check, immediately after landing the shift, found
+  `analyze.py`'s permissive walker still carried the OLD refusal.**
+  `_qlinear_conv_kn` had its own copy of the "y_zero_point is uint8;
+  cim.requantize's clamp is SIGNED" check, correct at the time it was
+  written, stale the moment `load_qlinear_conv`'s matching refusal was
+  lifted above. Left unfixed, `cim-import-onnx --emit-workload` would
+  have kept reporting a uint8-output conv layer as `skipped` -- silently
+  under-counting a real model's own offloadable layers for a reason that
+  had stopped being true, on exactly the kind of real layer
+  `squeezenet1.0-12-int8`'s own first layer is. The dtype check is
+  removed (shape never depended on it, the same reason dilation needs no
+  check there either); the scalar-ness check beside it stays, since a
+  non-scalar `y_zero_point` is still genuinely refused by the compile
+  path. Pinned by a regression test, mutation-tested by reintroducing the
+  stale check and confirming it goes red.
+
   Verified: `test/python/test_onnx_frontend_conv.py` -- a bias
   differential with three distinct, non-symmetric channel values (so a
   row/column mix-up in the broadcast reads as a loud wrong number), a

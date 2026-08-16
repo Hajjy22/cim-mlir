@@ -175,13 +175,21 @@ def _qlinear_conv_kn(graph, initializers, node):
     # shape already accounts for regardless.
     _positive_weight_scale(graph, w_scale_name, node.name, "w_scale", cout)
     _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
-    _y_zero_point, y_zp_dtype = _scalar_zero_point(
-        graph, y_zp_name, node.name, "y_zero_point", allow_nonzero=True)
-    if y_zp_dtype != np.int8:
-        raise Refusal(
-            f"y_zero_point is {y_zp_dtype}; cim.requantize's clamp is a "
-            f"SIGNED effective_bits range, which cannot represent a uint8 "
-            f"output's full [0, 255] span.", where=where)
+    # Scalar-ness is a real check (a non-scalar y_zero_point is still
+    # refused by the compile path -- see load_qlinear_conv's own module
+    # section header), but the VALUE's dtype (int8 vs uint8) is not:
+    # load_qlinear_conv now accepts a uint8 y_zero_point by requantizing
+    # with (y_zero_point - 128) instead (its own "uint8_output_shifted"
+    # note), an execution-time detail with zero bearing on this node's
+    # weight shape -- the same reason dilation needs no check here
+    # either. A dtype check WAS here once, matching a refusal that no
+    # longer exists on the compile side; leaving it in place after that
+    # refusal was lifted would have under-reported a real model's own
+    # offloadable layers (squeezenet1.0-12-int8's first layer ships
+    # exactly a uint8 y_zero_point) as skipped, silently, for a reason
+    # that stopped being true.
+    _scalar_zero_point(graph, y_zp_name, node.name, "y_zero_point",
+                       allow_nonzero=True)
 
     # ONNX stores a grouped conv's weight as [Cout, Cin/group, Kh, Kw] --
     # Cin here is already the real per-filter channel count, so k = Cin *
