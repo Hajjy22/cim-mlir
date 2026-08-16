@@ -133,6 +133,7 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
                        y_zero_point=0, x_dtype=TensorProto.INT8,
                        y_dtype=TensorProto.INT8, bias=None,
                        strides=(1, 1), pads=(0, 0, 0, 0),
+                       dilations=(1, 1),
                        auto_pad="NOTSET", node_name="conv", check=True):
     """A graph of one QLinearConv: Y = requantize(conv(X, weight) [+ B]).
 
@@ -153,6 +154,8 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     default since load_qlinear_conv always requires it (pass a non-zero
     value here only to build a refusal-test fixture). `bias`, if given,
     is a length-Cout int32 array, ONNX's own QLinearConv bias convention.
+    `dilations` defaults to (1, 1) -- ordinary convolution -- matching
+    every call site before dilation support existed.
     """
     weight = np.asarray(weight)
     cout, cin, kh, kw = weight.shape
@@ -162,16 +165,19 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
             f"x_shape's Cin ({x_cin}) does not match weight's Cin ({cin})")
 
     stride_h, stride_w = strides
+    dilation_h, dilation_w = dilations
     if auto_pad == "NOTSET":
         pad_top, pad_left, pad_bottom, pad_right = pads
     else:
         pad_top = pad_left = pad_bottom = pad_right = 0
-    out_h = (h + pad_top + pad_bottom - kh) // stride_h + 1
-    out_w = (w + pad_left + pad_right - kw) // stride_w + 1
+    dilated_kh = (kh - 1) * dilation_h + 1
+    dilated_kw = (kw - 1) * dilation_w + 1
+    out_h = (h + pad_top + pad_bottom - dilated_kh) // stride_h + 1
+    out_w = (w + pad_left + pad_right - dilated_kw) // stride_w + 1
     if out_h <= 0 or out_w <= 0:
         raise ValueError(
             f"non-positive output size ({out_h}, {out_w}) for the given "
-            f"x_shape/weight/strides/pads")
+            f"x_shape/weight/strides/pads/dilations")
 
     x_np_dtype = np.int8 if x_dtype == TensorProto.INT8 else np.uint8
     y_np_dtype = np.int8 if y_dtype == TensorProto.INT8 else np.uint8
@@ -200,7 +206,7 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
         initializers.append(numpy_helper.from_array(
             np.asarray(bias, dtype=np.int32), name="B"))
         node_inputs.append("B")
-    node_kwargs = {"strides": list(strides)}
+    node_kwargs = {"strides": list(strides), "dilations": list(dilations)}
     if auto_pad == "NOTSET":
         node_kwargs["pads"] = list(pads)
     else:

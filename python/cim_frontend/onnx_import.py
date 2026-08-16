@@ -596,6 +596,18 @@ def load_matmul_chain(model):
 #     order of operations -- round, THEN add zero_point, THEN clamp --
 #     already matches QLinearConv's own reference formula exactly. The
 #     only change needed was to stop hard-coding 0.
+#   * dilations != (1, 1): "a dilated kernel tap reads a non-contiguous
+#     patch" is true, but non-contiguous refers to the SOURCE indices
+#     only -- the destination patch im2col_nchw builds per output
+#     position is the same dense [C, Kh, Kw] block either way. numpy's
+#     own strided slicing (`start:stop:step`) reads exactly that pattern
+#     with the step set to the dilation factor, so this is a sampling
+#     change inside the existing loop, not a different data structure --
+#     see im2col.py's own "DILATION IS A SAMPLING PATTERN" note. Unlike
+#     the four reshapes above, this one needed no real model to motivate
+#     it: the shape argument alone was sufficient once looked at closely,
+#     which is itself worth naming, since the other four were each found
+#     by importing squeezenet1.0-12-int8 rather than by inspection.
 #
 # What is STILL refused, because it is not one of these reshapes:
 #
@@ -603,9 +615,6 @@ def load_matmul_chain(model):
 #     of channels, not one reshape. Silently computing group=1's answer
 #     for a grouped (e.g. depthwise) conv would be a confident wrong
 #     number, not a shape error.
-#   * dilations != (1, 1): a dilated kernel tap reads a non-contiguous
-#     patch; im2col_nchw's contiguous-slice implementation does not
-#     express that, and pretending stride covers it would too.
 #   * a non-zero w_zero_point (asymmetric WEIGHT quantization): the cross
 #     term `w_zp * X` above is per-ROW (activation-dependent), not a fixed
 #     per-channel correction the way a bias is -- genuinely not a reshape
@@ -776,8 +785,9 @@ def load_qlinear_conv(model):
     bias) where:
 
     - `conv_params` is (kh, kw, stride_h, stride_w, pad_top, pad_bottom,
-      pad_left, pad_right) -- exactly im2col_nchw's own trailing
-      arguments, so callers pass it straight through.
+      pad_left, pad_right, dilation_h, dilation_w) -- exactly
+      im2col_nchw's own trailing arguments, so callers pass it straight
+      through.
     - `x_zero_point` is a plain int; the caller subtracts it from the
       supplied activation BEFORE im2col (see this module's own 'A REAL
       MODEL FORCED A SECOND LOOK' note above for why that is exact when
@@ -903,12 +913,15 @@ def load_qlinear_conv(model):
             f"reshape. Nothing emitted.", where=where)
 
     dilations = _int_list_attr(node, "dilations", [1, 1])
-    if dilations != [1, 1]:
+    if len(dilations) != 2:
         raise Refusal(
-            f"dilations={dilations}; only dilation (1, 1) is imported. A "
-            f"dilated kernel tap reads a non-contiguous patch, which this "
-            f"front end's im2col does not express. Nothing emitted.",
-            where=where)
+            f"dilations={dilations} has {len(dilations)} entries; a 2-D "
+            f"convolution needs exactly 2. Nothing emitted.", where=where)
+    dilation_h, dilation_w = dilations
+    if dilation_h <= 0 or dilation_w <= 0:
+        raise Refusal(
+            f"dilations={dilations}; both entries must be positive. "
+            f"Nothing emitted.", where=where)
 
     auto_pad = _str_attr(node, "auto_pad", "NOTSET")
     if auto_pad != "NOTSET":
@@ -994,7 +1007,8 @@ def load_qlinear_conv(model):
         per_channel_requantize = None
 
     conv_params = (kh, kw, stride_h, stride_w,
-                  pad_top, pad_bottom, pad_left, pad_right)
+                  pad_top, pad_bottom, pad_left, pad_right,
+                  dilation_h, dilation_w)
     return (node, weight2d, x_name, tuple(x_shape), conv_params,
            x_zero_point, trailing_requantize, per_channel_requantize, bias)
 

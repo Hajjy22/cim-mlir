@@ -12,8 +12,11 @@ is reshaped into the SAME (weight[N, K], activation[M, K]) shape a plain
 MatMulInteger already produces -- see im2col.py's own module docstring for
 the exact reshape, and load_qlinear_conv's module section header
 (onnx_import.py) for what is deliberately still refused (grouped
-convolution, dilation, a non-zero w_zero_point, non-explicit padding) and
-why each is a real scope boundary rather than an oversight.
+convolution, a non-zero w_zero_point, non-explicit padding) and why each
+is a real scope boundary rather than an oversight. Dilation is accepted
+(see im2col.py's own "DILATION IS A SAMPLING PATTERN" note) -- it changes
+which source pixels a kernel tap reads, not the shape of anything, unlike
+the three restrictions that remain.
 
 PER-CHANNEL SCALE, BIAS, AND ASYMMETRIC ZERO POINTS ARE ALSO RESHAPES
 ------------------------------------------------------------------------
@@ -158,6 +161,36 @@ def test_a_batched_conv_matches_the_quantized_reference(cim_opt, cim_run):
 
     got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=2, out_w=2, n=3)
     assert np.array_equal(got, want.reshape(3, cout, 2, 2)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_a_dilated_conv_matches_the_quantized_reference(cim_opt, cim_run):
+    # dilations=(2, 2), asymmetric stride (2, 1) so a swapped H/W axis
+    # anywhere in the dilation plumbing -- onnx_import.py's own
+    # dilation_h/dilation_w unpacking, or im2col_nchw's -- reads as a
+    # shape mismatch or a wrong number, not a lucky match. Kernel/input
+    # sized so the dilated receptive field (3x3 effective, from a 2x2
+    # kernel at dilation 2) fits a 5x5 input with room for a real,
+    # non-trivial output grid.
+    rng = np.random.default_rng(SEED + 26)
+    cout, cin, kh, kw = 2, 2, 2, 2
+    weight = rng.integers(-6, 7, size=(cout, cin, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 5, 5)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=5.0, strides=(2, 1),
+                               dilations=(2, 2))
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100, (
+        "this fixture is meant to stay far from the +-128 clamp; a "
+        "saturated result here would mean a future edit to the seed or "
+        "weight range quietly defeated the point of this test")
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=2, out_w=3)
+    assert np.array_equal(got, want.reshape(1, cout, 2, 3)), (
         f"compiled {got.tolist()} != ONNX's own quantized reference "
         f"{want.tolist()}")
 
@@ -342,12 +375,21 @@ def test_refuses_a_grouped_convolution():
         import_model(model, act)
 
 
-def test_refuses_a_dilated_convolution():
-    weight, x_shape, model = _base_model()
-    model.graph.node[0].attribute.append(
-        onnx.helper.make_attribute("dilations", [2, 2]))
+def test_refuses_a_non_positive_dilation():
+    # A real dilation (>= 1) is accepted -- see
+    # test_a_dilated_conv_matches_the_quantized_reference below -- but 0
+    # or negative is not a sampling pattern this front end (or a real
+    # accelerator) can express. Set through qlinear_conv_model's own
+    # `dilations` kwarg, not by appending a second `dilations` attribute
+    # onto the node by hand the way the grouped-conv refusal test appends
+    # `group`: the fixture now always emits ITS OWN `dilations` attribute
+    # (default (1, 1)), so appending a second one would leave the node
+    # with two, and onnx_import.py's `_int_list_attr` reads the FIRST
+    # match -- silently validating the fixture's own (1, 1), not this
+    # test's (0, 1), and never refusing at all.
+    weight, x_shape, model = _base_model(dilations=(0, 1))
     act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="dilation"):
+    with pytest.raises(Refusal, match="dilations"):
         import_model(model, act)
 
 
@@ -540,4 +582,55 @@ def test_im2col_matches_a_hand_written_convolution():
                         np.sum(window.astype(np.int64) *
                               weight[co].astype(np.int64)))
 
+    assert np.array_equal(got, want)
+
+
+def test_im2col_with_dilation_matches_a_hand_written_convolution():
+    """Same independence goal as the test above, but with a real dilation
+    != 1 -- see im2col.py's own 'DILATION IS A SAMPLING PATTERN' note.
+    The oracle here deliberately does NOT use numpy's strided-slice
+    syntax (`start:stop:step`) the way im2col_nchw's own implementation
+    does -- reusing that trick in the "independent" check would really be
+    testing the same formula against itself. Instead it visits each
+    (kh_i, kw_i) tap one at a time and computes its source pixel by hand
+    (`h0 + kh_i * dilation_h`), which is the literal definition of a
+    dilated convolution rather than a reimplementation of im2col's own
+    indexing. Deliberately asymmetric (dilation_h != dilation_w,
+    stride_h != stride_w, pad != 0) so a swapped H/W axis anywhere in the
+    dilation plumbing reads as a shape error or a wrong number, not a
+    lucky match."""
+    rng = np.random.default_rng(SEED + 25)
+    n, c, h, w = 2, 3, 9, 7
+    cout, kh, kw = 4, 3, 2
+    stride_h, stride_w = 2, 1
+    dilation_h, dilation_w = 3, 2
+    pad = (1, 0, 1, 0)  # top, bottom, left, right
+
+    x = rng.integers(-10, 11, size=(n, c, h, w))
+    weight = rng.integers(-10, 11, size=(cout, c, kh, kw))
+
+    patches, (out_n, out_h, out_w) = im2col_nchw(
+        x, kh, kw, stride_h, stride_w, *pad,
+        dilation_h=dilation_h, dilation_w=dilation_w)
+    got = (patches @ weight.reshape(cout, -1).T).reshape(
+        out_n, out_h, out_w, cout).transpose(0, 3, 1, 2)
+
+    xp = np.pad(x, ((0, 0), (0, 0), (pad[0], pad[1]), (pad[2], pad[3])))
+    want = np.zeros((n, cout, out_h, out_w), dtype=np.int64)
+    for ni in range(n):
+        for co in range(cout):
+            for oh in range(out_h):
+                for ow in range(out_w):
+                    h0, w0 = oh * stride_h, ow * stride_w
+                    acc = 0
+                    for ci in range(c):
+                        for khi in range(kh):
+                            for kwi in range(kw):
+                                pixel = xp[ni, ci,
+                                          h0 + khi * dilation_h,
+                                          w0 + kwi * dilation_w]
+                                acc += int(pixel) * int(weight[co, ci, khi, kwi])
+                    want[ni, co, oh, ow] = acc
+
+    assert got.shape == want.shape, (got.shape, want.shape)
     assert np.array_equal(got, want)

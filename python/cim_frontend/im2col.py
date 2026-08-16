@@ -38,12 +38,23 @@ a transpose appearing anywhere in this file.
 
 WHAT THIS DOES NOT HANDLE
 ==========================
-Grouped convolution (each group needs its own, disjoint matmul, not
-expressible as a single reshape) and dilation (the patch a kernel tap reads
-is no longer contiguous) are both real convolution features this module
-does not implement. onnx_import.py refuses both explicitly rather than
-silently computing plain convolution's answer for a dilated or grouped
-model.
+Grouped convolution: each group needs its own, disjoint matmul over a
+slice of channels, not expressible as a single reshape the way dilation
+(below) is. onnx_import.py refuses it explicitly rather than silently
+computing plain convolution's answer for a grouped (e.g. depthwise) model.
+
+DILATION IS A SAMPLING PATTERN, NOT A SHAPE CHANGE
+====================================================
+A dilated kernel tap reads a non-contiguous patch, but "non-contiguous"
+only means the SOURCE indices are strided -- the DESTINATION patch this
+function builds is still a dense [C, Kh, Kw] block per output position,
+identical in shape to the non-dilated case. numpy's own strided slicing
+(`start:stop:step`) reads exactly that pattern directly, with the step set
+to the dilation factor, so no different data structure or a second pass is
+needed: `im2col_nchw` below takes `dilation_h`/`dilation_w` (default 1,
+identical to every call site before dilation was supported) and the same
+loop already here does the rest. Contrast with grouped convolution above,
+which genuinely cannot be expressed this way.
 """
 
 import numpy as np
@@ -71,7 +82,8 @@ def _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right):
 
 
 def im2col_nchw(x, kh, kw, stride_h, stride_w,
-                pad_top, pad_bottom, pad_left, pad_right):
+                pad_top, pad_bottom, pad_left, pad_right,
+                dilation_h=1, dilation_w=1):
     """[N, C, H, W] -> ([N*OutH*OutW, C*Kh*Kw] patches, (N, OutH, OutW)).
 
     Row `m` of the returned patches matrix is output position
@@ -82,6 +94,16 @@ def im2col_nchw(x, kh, kw, stride_h, stride_w,
     `patches @ weight.reshape(Cout, -1).T` is exactly the convolution's raw
     (pre-quantization) accumulator, in `linalg.matmul_transpose_b`'s own
     ins/outs convention.
+
+    `dilation_h`/`dilation_w` (default 1, ordinary convolution) space the
+    Kh*Kw taps `dilation` elements apart instead of adjacent -- see this
+    module's own "DILATION IS A SAMPLING PATTERN" note. The output-size
+    formula matches the ONNX spec's own
+    `floor((input + pad - dilation*(kernel-1) - 1) / stride) + 1`
+    algebraically: `dilated_kh = (kh-1)*dilation_h + 1` is the span an
+    already-dilated kernel covers, so `(hp - dilated_kh)/stride + 1`
+    is the same expression rearranged around that span instead of the
+    kernel size directly.
 
     Built as an explicit loop over output positions rather than a strided-
     view trick: this is import-time, one-shot, non-performance-critical
@@ -99,28 +121,36 @@ def im2col_nchw(x, kh, kw, stride_h, stride_w,
     if stride_h <= 0 or stride_w <= 0:
         raise ValueError(
             f"stride must be positive, got ({stride_h}, {stride_w})")
+    if dilation_h <= 0 or dilation_w <= 0:
+        raise ValueError(
+            f"dilation must be positive, got ({dilation_h}, {dilation_w})")
 
     xp = _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right)
     hp, wp = xp.shape[2], xp.shape[3]
-    if kh > hp or kw > wp:
+    dilated_kh = (kh - 1) * dilation_h + 1
+    dilated_kw = (kw - 1) * dilation_w + 1
+    if dilated_kh > hp or dilated_kw > wp:
         raise ValueError(
-            f"kernel ({kh}, {kw}) is larger than the padded input "
-            f"({hp}, {wp})")
+            f"dilated kernel ({dilated_kh}, {dilated_kw}) -- kernel "
+            f"({kh}, {kw}) at dilation ({dilation_h}, {dilation_w}) -- is "
+            f"larger than the padded input ({hp}, {wp})")
 
-    out_h = (hp - kh) // stride_h + 1
-    out_w = (wp - kw) // stride_w + 1
+    out_h = (hp - dilated_kh) // stride_h + 1
+    out_w = (wp - dilated_kw) // stride_w + 1
     if out_h <= 0 or out_w <= 0:
         raise ValueError(
             f"non-positive output size ({out_h}, {out_w}) for input "
             f"{(h, w)}, kernel ({kh}, {kw}), stride ({stride_h}, "
             f"{stride_w}), pad ({pad_top}, {pad_bottom}, {pad_left}, "
-            f"{pad_right})")
+            f"{pad_right}), dilation ({dilation_h}, {dilation_w})")
 
     patches = np.empty((n, out_h, out_w, c, kh, kw), dtype=xp.dtype)
     for oh in range(out_h):
         h0 = oh * stride_h
         for ow in range(out_w):
             w0 = ow * stride_w
-            patches[:, oh, ow] = xp[:, :, h0:h0 + kh, w0:w0 + kw]
+            patches[:, oh, ow] = xp[:, :,
+                                    h0:h0 + dilated_kh:dilation_h,
+                                    w0:w0 + dilated_kw:dilation_w]
 
     return patches.reshape(n * out_h * out_w, c * kh * kw), (n, out_h, out_w)
