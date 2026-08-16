@@ -13,17 +13,6 @@
 using namespace mlir;
 using namespace mlir::cim;
 
-namespace {
-
-/// Element type of a memref operand, or null if it is not a memref.
-Type memRefElementType(Value value) {
-  if (auto memref = llvm::dyn_cast<MemRefType>(value.getType()))
-    return memref.getElementType();
-  return nullptr;
-}
-
-} // namespace
-
 //===----------------------------------------------------------------------===//
 // TileAllocOp
 //===----------------------------------------------------------------------===//
@@ -207,6 +196,23 @@ LogicalResult RequantizeOp::verify() {
   if (inType.getShape() != outType.getShape())
     return emitOpError("requantize must not change shape");
 
+  // The interpreter (Interpreter.cpp's runRequantize) and cim-lower-to-target
+  // (lowerRequantize) each independently refuse a non-integer input or
+  // result element type before this check existed -- neither has any other
+  // accumulator representation to read or produce, and scale/zero_point/
+  // effective_bits are meaningless against a float or index buffer. That
+  // left the verifier itself, the one place structural IR validity is
+  // supposed to be settled once, silently accepting what both real
+  // consumers would go on to reject -- so a malformed module surfaced two
+  // different messages depending on which pass touched it first, instead
+  // of one, at verification time, from the op that owns the shape.
+  auto inElem = llvm::dyn_cast<IntegerType>(inType.getElementType());
+  auto outElem = llvm::dyn_cast<IntegerType>(outType.getElementType());
+  if (!inElem || !outElem)
+    return emitOpError("input and result element types must both be "
+                        "integers; requantize has no other accumulator "
+                        "representation to read or produce");
+
   // Signed reinterpretation for the same reason as TileAllocOp's id: the
   // ODS accessor for an I32Attr is unsigned, so a negative effective_bits
   // in the IR would otherwise read as a very large positive one.
@@ -217,14 +223,11 @@ LogicalResult RequantizeOp::verify() {
   // effective_bits models what the readout path can actually resolve (an
   // ADC on an analog target). Claiming more bits out than the result type
   // can hold is a target-description error worth catching early.
-  if (auto outElem = llvm::dyn_cast<IntegerType>(outType.getElementType())) {
-    if (effectiveBits > static_cast<int64_t>(outElem.getWidth()))
-      return emitOpError("effective_bits (")
-             << getEffectiveBits() << ") exceeds the width of the result type "
-             << outElem;
-  }
+  if (effectiveBits > static_cast<int64_t>(outElem.getWidth()))
+    return emitOpError("effective_bits (")
+           << getEffectiveBits() << ") exceeds the width of the result type "
+           << outElem;
 
-  (void)memRefElementType(getInput());
   return success();
 }
 

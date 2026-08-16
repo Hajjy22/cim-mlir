@@ -1889,6 +1889,56 @@ out of scope for v0.1 across the board, not just here.
   `ValueError` from deep inside `im2col_nchw` rather than a proper
   `Refusal`, which is exactly what that check exists to prevent).
 
+- **`cim.requantize`'s verifier now rejects a non-integer input or result
+  element type, instead of silently accepting IR that two different
+  downstream consumers were already independently refusing on their own.**
+  Found while auditing `include/cim/Dialect/CIMOps.td`'s own header
+  comment claiming every verifier rule from spec Sec. 5.4 is "implemented
+  in lib/Dialect/CIM/IR/CIMOps.cpp" -- true for the numbered rules, but
+  `RequantizeOp::verify()` carried a leftover: a private
+  `memRefElementType(Value)` helper, defined and called
+  (`(void)memRefElementType(getInput())`) purely to discard its result --
+  the exact "a call that cannot fail and whose result is discarded is not
+  a check" pattern already found and removed twice in the Phase 1
+  self-audit above, not caught here until now because it lived in the
+  dialect's own C++ rather than the front end. Both `Interpreter.cpp`'s
+  `runRequantize` and `CIMLowerToTarget.cpp`'s `lowerRequantize` already
+  refuse a non-integer input or result element type -- scale/zero_point/
+  effective_bits describe an integer quantization and neither has any
+  other accumulator representation to read or produce -- but each does so
+  independently, with its own wording, only once the module reaches that
+  specific pass. `test/Dialect/CIM/invalid.mlir` had exactly this gap
+  documented two cases above as precedent (`!cim.tile`'s own
+  element-type-must-be-integer check, added "until the verifier took the
+  argument and never looked at it"): the same class of bug, in the same
+  file, left unfixed on a different op.
+
+  Fixed directly in `RequantizeOp::verify()`: refuse before the
+  `effective_bits`-vs-result-width check even runs, matching the
+  interpreter's own message ("input and result element types must both be
+  integers"). The dead `memRefElementType` helper is removed rather than
+  reused -- the new check only needs `dyn_cast<IntegerType>` on types
+  already recovered as `MemRefType`s two lines above it, so the extra
+  indirection had no purpose to begin with.
+
+  Mutation-tested, and more decisively than most guards in this project:
+  removing the check does not merely let a malformed module through
+  silently -- it segfaults `cim-opt` outright. With the integer check
+  gone, the `effective_bits > outElem.getWidth()` comparison right below
+  it (itself simplified from a conditional to unconditional once integer-
+  ness is guaranteed) calls `IntegerType::getWidth()` on a null
+  `IntegerType` for the new `f32`-result negative test, crashing before
+  any diagnostic prints. Reverting restores both negative-test passes and
+  a clean `cim-opt` run. This is a property of the mutated code (the
+  refactor deliberately trades the old conditional guard for reliance on
+  the earlier early-return), not a claim that a pre-existing crash shipped
+  in `main` -- but it is a sharp demonstration that the new check is load-
+  bearing, not cosmetic.
+
+  Two new `test/Dialect/CIM/invalid.mlir` cases (float result, float
+  input) pin this; `test/Dialect/CIM/requantize.mlir`'s existing valid
+  case already used integer types throughout and needed no change.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).
