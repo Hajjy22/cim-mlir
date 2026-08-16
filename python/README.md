@@ -214,19 +214,28 @@ already-verified machinery rather than a dialect change:
   `zero_point` parameter; this front end just stopped hard-coding it to
   0.
 
+`squeezenet1.0-12-int8`'s own first layer was extracted standalone and run
+through the real compiled pipeline as a capstone check: all 14,400 output
+elements matched `onnx.reference` exactly, using its actual per-channel
+scales, actual bias, and actual asymmetric input. The one thing that layer
+could not be imported with unmodified at the time — its declared `uint8`
+output (`y_zero_point` dtype) — is also now accepted: `cim.requantize`'s
+clamp is a signed range and cannot represent uint8's full `[0, 255]` span
+directly, but `clamp(-128, 127, t - 128) == clamp(0, 255, t) - 128` for
+every real `t`, so requantizing with `y_zero_point - 128` instead of the
+declared value produces exactly `(true_uint8_output - 128)` in every
+element — algebraically exact, not approximate. **The emitted module's
+provenance header discloses this shift explicitly**: a uint8-output
+`QLinearConv`'s printed result is `(true value - 128)`, and the caller
+must add 128 back, the same "the front end's job ends at 'produce the
+right numbers'; a documented caller-side transform is not a silent one"
+discipline as the NHWC reshape a conv's own caller already has to apply.
+
 Still refused: a non-zero `w_zero_point` (the correction term it would
 need is per-row, activation-dependent — not a fixed per-channel bias, so
 it is not a reshape of anything above), and a non-scalar `x_zero_point`/
 `y_zero_point` (per-tensor activation/output quantization is the
 near-universal convention, unlike per-channel weight scale).
-`squeezenet1.0-12-int8`'s own first layer was extracted standalone and run
-through the real compiled pipeline as a capstone check: all 14,400 output
-elements matched `onnx.reference` exactly, using its actual per-channel
-scales, actual bias, and actual asymmetric input — the one thing that
-layer could not be imported with unmodified is its declared `uint8`
-output (`y_zero_point` dtype), since `cim.requantize`'s clamp is a signed
-range and cannot represent uint8's full span; a real, still-open gap, not
-a re-hidden version of the zero-point restriction above.
 
 ## What it refuses, and why refusing is the point
 
@@ -254,7 +263,6 @@ is worse than a refusal.
 | a `QLinearConv` with a non-positive `dilations` entry | not a sampling pattern any real accelerator (or numpy's own strided slicing) can express; a positive dilation is accepted (see above) |
 | a `QLinearConv` with a non-zero `w_zero_point` | its correction term is per-row (activation-dependent), not a fixed per-channel bias, so it is not one of the reshapes above |
 | a `QLinearConv` with a non-scalar `x_zero_point` or `y_zero_point` | per-tensor activation/output quantization is the near-universal convention, unlike per-channel weight scale |
-| a `QLinearConv` with a uint8 `y_zero_point` | `cim.requantize`'s clamp is a signed `effective_bits` range; it cannot represent a uint8 output's full `[0, 255]` span |
 | a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
 | more than one `QLinearConv` node | only a single, standalone convolution is imported; not a chain of them, and not one feeding a matmul |
 
@@ -356,12 +364,15 @@ else.
   odd derived scale (guaranteed no rounding tie), a hand-built exact-tie
   case documenting the known rounding-mode divergence, a per-channel-scale
   differential, a bias differential, asymmetric `x_zero_point` and
-  `y_zero_point` differentials, one refusal test per convolution-specific
-  row above (including the all-zero-but-per-channel-shaped
-  `w_zero_point` a real model ships), and a direct, `onnx`-free unit test
-  of `im2col_nchw` against an independent hand-written convolution loop.
-  Also validated, outside CI, against `squeezenet1.0-12-int8` (ONNX model
-  zoo) itself — see `docs/roadmap.md`'s M4 entry for the exact result.
+  `y_zero_point` differentials, a dilated-convolution differential with
+  deliberately asymmetric dilation/stride, a uint8-output differential
+  proving the `-128`/`+128` shift is exact at a non-edge `y_zero_point`,
+  one refusal test per convolution-specific row above (including the
+  all-zero-but-per-channel-shaped `w_zero_point` a real model ships), and
+  direct, `onnx`-free unit tests of `im2col_nchw` (including its dilation
+  path) against an independent hand-written convolution loop. Also
+  validated, outside CI, against `squeezenet1.0-12-int8` (ONNX model zoo)
+  itself — see `docs/roadmap.md`'s M4 entry for the exact result.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 - `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid
