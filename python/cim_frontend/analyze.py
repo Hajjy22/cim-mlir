@@ -57,9 +57,9 @@ whether it blocked compilation or was merely skipped here.
 import numpy as np
 
 from .onnx_import import (ACCEPTED_CONV_OP, ACCEPTED_OP, _check_opset,
-                          _int_attr, _int_list_attr, _positive_weight_scale,
-                          _scalar_zero_point, _str_attr, _tensor_names,
-                          _weight_zero_point_must_be_zero, _zero_point_is_zero)
+                          _positive_weight_scale, _scalar_zero_point,
+                          _tensor_names, _weight_zero_point_must_be_zero,
+                          _zero_point_is_zero)
 from .refusal import Refusal
 
 _NOTHING_EMITTED_SUFFIX = " Nothing emitted."
@@ -184,14 +184,31 @@ def _qlinear_conv_kn(graph, initializers, node):
 
     # ONNX stores a grouped conv's weight as [Cout, Cin/group, Kh, Kw] --
     # Cin here is already the real per-filter channel count, so k = Cin *
-    # Kh * Kw is correct regardless of `group`, even though this front end
-    # cannot yet emit IR to COMPILE a grouped or dilated convolution (see
-    # module docstring). group/dilation are read only to check that
-    # something read-able exists, not to gate the shape below.
-    _int_attr(node, "group", 1)
-    _int_list_attr(node, "dilations", [1, 1])
-
+    # Kh * Kw is correct regardless of `group` or `dilations`, even though
+    # this front end cannot yet emit IR to COMPILE a grouped or dilated
+    # convolution (see module docstring). Deliberately NOT read here at
+    # all: an earlier version of this function called _int_attr/
+    # _int_list_attr on them "to check that something read-able exists",
+    # but neither helper can actually fail that check -- both read the
+    # raw protobuf field for the requested type and silently return the
+    # type's zero value if the attribute is stored under a different
+    # AttributeProto type than expected, rather than raising. A call that
+    # cannot fail and whose result is discarded is not a check; it was
+    # dead code dressed up as one.
     return int(cin * kh * kw), int(cout)
+
+
+def _has_subgraph(node):
+    """True for a control-flow op (If/Loop/Scan/...) carrying a nested
+    GraphProto -- one whose own nodes `graph.node` never visits, since
+    ONNX stores a subgraph as an attribute payload, not as sibling nodes.
+    Checked by attribute TYPE (GRAPH/GRAPHS), not by op name, so this
+    covers any current or future op shaped that way, not just the three
+    named here."""
+    from onnx import AttributeProto
+
+    return any(a.type in (AttributeProto.GRAPH, AttributeProto.GRAPHS)
+              for a in node.attribute)
 
 
 def analyze_model(model, model_path="<model>"):
@@ -207,6 +224,17 @@ def analyze_model(model, model_path="<model>"):
     problems that make every node's classification untrustworthy -- today
     just an unusable opset import (`_check_opset`), the same check
     `import_model` itself runs first.
+
+    LIMIT TO THE HONESTY REQUIREMENT: only the TOP-LEVEL graph is walked.
+    A control-flow op (If/Loop/Scan) carries its branches as nested
+    GraphProto attributes, not as sibling nodes `graph.node` iterates --
+    any MatMulInteger/QLinearConv inside one is invisible to this walker,
+    not merely uninteresting the way a MaxPool is. Silently treating that
+    as "0 offloadable layers found there" would be exactly the confident-
+    but-partial number this module exists to avoid, so such a node's own
+    skip reason says its subgraph was never entered rather than reusing
+    the generic "not a weight-stationary op" wording -- see
+    `_has_subgraph`.
     """
     _check_opset(model)
 
@@ -222,6 +250,14 @@ def analyze_model(model, model_path="<model>"):
                 k, n = _matmul_integer_kn(model, initializers, node)
             elif node.op_type == ACCEPTED_CONV_OP:
                 k, n = _qlinear_conv_kn(graph, initializers, node)
+            elif _has_subgraph(node):
+                raise Refusal(
+                    f"'{node.op_type}' carries a nested subgraph (e.g. an "
+                    f"If/Loop/Scan branch) this walker does not enter; any "
+                    f"{ACCEPTED_OP}/{ACCEPTED_CONV_OP} inside it is "
+                    f"INVISIBLE to this report, not merely skipped -- it "
+                    f"is neither counted in 'layers' nor named anywhere "
+                    f"in 'skipped'.")
             else:
                 raise Refusal(
                     f"'{node.op_type}' is not {ACCEPTED_OP} or "

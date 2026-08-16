@@ -448,6 +448,23 @@ bool parseWorkloadDocument(const std::string &text, WorkloadDocument &doc,
       return false;
     if (!asUint32Field(elem, "n", where, layer.n, error))
       return false;
+    // k/n are a contraction dimension and an output-channel count; zero
+    // in either is not a degenerate-but-valid layer, it is a layer that
+    // cannot exist (a matmul with zero weights). Left unchecked,
+    // partitionBlockCount(0, n, ...) silently returns 0 blocks for that
+    // layer -- it would sail through as one of "layers_analyzed" while
+    // contributing nothing whatsoever to the placement result, the exact
+    // confident-but-partial number this schema's `skipped`/`note` fields
+    // exist to prevent everywhere else.
+    if (layer.k == 0 || layer.n == 0) {
+      if (error)
+        *error = where + ": k=" + std::to_string(layer.k) +
+                 ", n=" + std::to_string(layer.n) +
+                 " -- a layer must have a positive contraction dimension "
+                 "and a positive output-channel count; zero in either is "
+                 "not a real weight matrix";
+      return false;
+    }
     doc.layers.push_back(std::move(layer));
   }
 
