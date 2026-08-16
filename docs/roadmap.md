@@ -1730,6 +1730,57 @@ out of scope for v0.1 across the board, not just here.
     increases the placed `programs` count, with no network fetch or
     `onnx` dependency in the C++-only jobs.
 
+- **The three low-severity audit findings left open above, closed the
+  same way `autonomous_control` was: disclosure plus a pinning test,
+  applied uniformly rather than left as a known gap.** None of these
+  produced a wrong number before this — that is what made them
+  low-severity — but each was a claim (in a comment or in
+  `docs/target-format.md`) that nothing actually checked.
+  - **`cim.program`'s `cost_ns`/`cost_pj` are a provenance record, not a
+    live cost source, and the comment that set them said the opposite.**
+    `lib/Transforms/CIMPartition.cpp` sets them correctly from the target
+    file at emission time, but grepping every downstream pass, the
+    interpreter, and the runtime for a reader of either attribute finds
+    none — `cim-cost-report`, `cim-lower-to-target`'s `lowerProgram`, and
+    the interpreter's `runProgram` each independently re-parse the target
+    file instead. The comment on the line that sets them claimed the
+    opposite ("carries its own cost so later passes can reason about
+    reprogramming without a target lookup") — false, corrected in place.
+    `test/Transforms/cim-program-cost-attrs-are-unread.mlir` hand-writes a
+    `cim.program` with `cost_ns`/`cost_pj` set to `999999999` (a value no
+    real `cim-partition` run against `tiny-4x4.yaml` could ever produce)
+    and checks `cim-cost-report`'s own numbers are the target's, not the
+    IR's — mutation-tested by making the pass actually add the attribute's
+    value into its total and confirming the test goes red.
+  - **`tiles.persistence` (string) can no longer silently contradict
+    `tiles.persistent` (bool).** The string was documentation-only —
+    `docs/target-format.md` claimed it "drives the program/mvm cost
+    asymmetry", which was also false; `tiles.persistent` is the field
+    every pass that branches on volatility actually reads. Rather than
+    only disclosing the gap, `TargetYAMLParser.cpp` now refuses a target
+    file where both fields are present and disagree (including the
+    quieter version of the mistake: `persistence: nonvolatile` with
+    `persistent` left unset, which would otherwise silently keep its
+    default of `false`). Pinned by a new row in
+    `test/unit/parser_error_test.cpp`'s rejection table, and every shipped
+    target file already agrees by convention so nothing broke.
+  - **The `class:` enum is now pinned the same way `autonomous_control`
+    is.** Confirmed still true by grep (zero readers outside the parser
+    and `cim-bench dump-target`), but previously unpinned: every existing
+    pair of `tiny-*.yaml` fixtures that differ in `class:`
+    (`tiny-4x4.yaml` vs `tiny-4x4-4bit.yaml`) also differs in
+    `precision.output_effective_bits`, so no test could isolate `class:`
+    on its own. `test/targets/tiny-4x4-analog.yaml` is byte-identical to
+    `tiny-4x4.yaml` except `class:`, and
+    `test/Transforms/cim-class-is-unread.mlir` runs the same module
+    through the full eight-pass chain against both and diffs the outputs
+    byte for byte — mutation-tested twice: once against a mutation
+    (round-robin tile id) that turned out NOT to survive to final output
+    because `cim-placement` overwrites it regardless, which is itself a
+    useful negative result about where a real regression could hide, and
+    once against a mutation in `cim-lower-to-target`'s buffer-space choice
+    that does survive to final text, which correctly turned the test red.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

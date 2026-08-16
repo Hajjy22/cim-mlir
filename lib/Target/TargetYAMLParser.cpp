@@ -327,8 +327,30 @@ bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error) 
   if (spec.precision.outputEffectiveBits == 0)
     r.errors.push_back("precision.output_effective_bits must be greater than zero");
   if (!spec.tiles.persistence.empty() && spec.tiles.persistence != "volatile" &&
-      spec.tiles.persistence != "nonvolatile")
+      spec.tiles.persistence != "nonvolatile") {
     r.errors.push_back("tiles.persistence must be 'volatile' or 'nonvolatile'");
+  } else if (!spec.tiles.persistence.empty()) {
+    // tiles.persistence is a documentation-only string -- see
+    // TargetSpec.h's own comment -- nothing downstream reads it back;
+    // tiles.persistent (bool) is what cim-partition, the cost model, and
+    // every pass that branches on volatility actually consult. Left
+    // free-floating, the two fields could describe two different devices
+    // in the same file with nothing to catch it. Every shipped target
+    // file already keeps them in agreement by convention; this makes
+    // that convention load-bearing instead of merely followed, and also
+    // catches the quieter version of the same mistake -- an author who
+    // states intent via `persistence` but forgets the `persistent` bool
+    // that is actually load-bearing, which would otherwise silently keep
+    // its unset default (false) regardless of what `persistence` said.
+    const bool declaredNonvolatile = spec.tiles.persistence == "nonvolatile";
+    if (declaredNonvolatile != spec.tiles.persistent)
+      r.errors.push_back(
+          "tiles.persistence ('" + spec.tiles.persistence +
+          "') contradicts tiles.persistent (" +
+          (spec.tiles.persistent ? "true" : "false") +
+          "), which is the field the cost model actually reads -- fix one "
+          "of the two, or drop tiles.persistence entirely");
+  }
 
   if (!r.errors.empty()) {
     if (error) {

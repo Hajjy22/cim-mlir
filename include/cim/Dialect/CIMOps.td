@@ -89,6 +89,20 @@ def CIM_ProgramOp : CIM_Op<"program", [
              cost_ns = 12000 : i64, cost_pj = 480000 : i64, persistent = true
            } : (!cim.tile<256x256xi8>, memref<256x256xi8, #cim.space<host>>)
              -> !cim.resident<256x256xi8>
+
+    cost_ns/cost_pj are a PROVENANCE RECORD, not a live cost source: they
+    are set correctly by cim-partition from the target file at emission
+    time (spec Sec. 5.3 requires them), but no downstream pass reads them
+    back -- cim-cost-report, cim-lower-to-target's lowerProgram, and the
+    interpreter's runProgram each independently re-parse the target file
+    instead. See lib/Transforms/CIMPartition.cpp's own comment where
+    these are set, and test/Transforms/
+    cim-program-cost-attrs-are-unread.mlir, which pins this by hand-
+    writing a cim.program with a deliberately wrong cost_ns/cost_pj and
+    checking that cim-cost-report still reports the target file's real
+    numbers. Kept always-correct anyway, on the same discipline as a git
+    commit's own timestamp: a stale record is worse than no record, even
+    before anything reads it.
   }];
   let arguments = (ins
     CIM_TileType:$tile,

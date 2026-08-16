@@ -26,8 +26,18 @@ struct TileSpec {
   std::string weightDtype;      // e.g. "i8"
   std::string activationDtype;  // e.g. "i8"
   std::string accumulatorDtype; // e.g. "i32"
+  /// The field every pass that branches on volatility actually reads
+  /// (cim-partition writes it straight onto cim.program's own `persistent`
+  /// attribute; lib/Placement/CostReport.cpp's amortization curve shape
+  /// depends on it).
   bool persistent = false;
-  std::string persistence; // "volatile" | "nonvolatile"
+  /// "volatile" | "nonvolatile", optional. Documentation-only: no pass
+  /// reads this back -- `persistent` above is what actually drives cost-
+  /// model behavior. Kept only because it reads better in a target file
+  /// than a bare bool, and cross-checked against `persistent` by the
+  /// parser (TargetYAMLParser.cpp) when both are present, so the two
+  /// cannot silently describe two different devices.
+  std::string persistence;
 };
 
 struct ProgramCost {

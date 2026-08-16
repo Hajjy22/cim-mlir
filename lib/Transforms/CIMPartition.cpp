@@ -355,8 +355,21 @@ struct CIMPartitionPass : public CIMPartitionBase<CIMPartitionPass> {
           Value tile = b.create<TileAllocOp>(loc, tileType, device,
                                               b.getI64IntegerAttr(tileId));
 
-          // cim.program carries its own cost so later passes can reason about
-          // reprogramming without a target lookup (spec Sec. 5.3).
+          // cost_ns/cost_pj are required attributes (spec Sec. 5.3), so they
+          // are set here from the same TargetSpec this pass already parsed
+          // -- but NOT, despite what an earlier version of this comment
+          // claimed, so a later pass can "reason about reprogramming
+          // without a target lookup": no pass does. cim-cost-report,
+          // cim-lower-to-target's lowerProgram, and the interpreter's
+          // runProgram each independently re-parse the target file instead
+          // of reading these back (test/Transforms/
+          // cim-program-cost-attrs-are-unread.mlir pins this: a hand-
+          // written cim.program with a deliberately wrong cost_ns/cost_pj
+          // still reports the TARGET's numbers downstream). They exist
+          // here purely as a provenance record of what this pass believed
+          // the cost was at emission time, which is why they are always
+          // set correctly rather than left at a placeholder -- a stale
+          // record is worse than no record, even if nothing reads it yet.
           Value resident = b.create<ProgramOp>(
               loc, residentType, tile, weightBlock,
               b.getI64IntegerAttr(

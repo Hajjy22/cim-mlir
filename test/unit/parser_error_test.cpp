@@ -137,6 +137,16 @@ CIM_TEST(parser_rejects_every_malformed_document) {
       {"bad persistence",
        replaced("  persistence: nonvolatile", "  persistence: sometimes"),
        "persistence"},
+      // tiles.persistence is documentation-only -- no pass reads it back,
+      // tiles.persistent (bool) is what the cost model actually consults
+      // -- but a valid string that just disagrees with tiles.persistent
+      // must still be refused: a target file that describes two different
+      // devices in its own two persistence fields is exactly the class of
+      // "parses fine, means something else" bug this table exists to
+      // catch, not merely an unknown-enum-value typo like the case above.
+      {"persistence contradicts persistent",
+       replaced("  persistence: nonvolatile", "  persistence: volatile"),
+       "contradicts"},
 
       // --- bad scalars ---
       {"non-integer count", replaced("  count: 4", "  count: four"),
