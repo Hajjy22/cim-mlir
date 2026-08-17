@@ -63,6 +63,13 @@ ACCEPTED_OP = "MatMulInteger"
 # QLinearConv was introduced at the same opset.
 ACCEPTED_CONV_OP = "QLinearConv"
 
+# MaxPool has been in the default domain since opset 1; nothing here needs
+# MIN_OPSET raised on its account. Unlike QLinearConv/MatMulInteger, MaxPool
+# is plain (not "QLinear"): it carries no scale/zero-point of its own,
+# because max is scale-invariant -- see load_conv_pool_chain's own module
+# header.
+ACCEPTED_POOL_OP = "MaxPool"
+
 
 def _tensor_names(model):
     """Names of every initializer, i.e. every compile-time-constant tensor."""
@@ -1840,6 +1847,571 @@ def load_conv_chain(model):
 
 
 # ---------------------------------------------------------------------------
+# A chain of two or more QLinearConv nodes with a MaxPool optionally sitting
+# between any two consecutive layers -- the first non-matmul host op this
+# front end executes (docs/roadmap.md's MaxPool plan, PR B). Depends on
+# emit.emit_conv_chain_module's own `pool_params` (PR A's cim.reduce_max,
+# already landed, is what a pooling window actually executes on).
+#
+# WHY A SEPARATE DISCOVERY FUNCTION, NOT A GENERALIZATION OF
+# _discover_conv_chain IN PLACE
+# ============================================================================
+# _discover_conv_chain is shared by load_conv_chain and
+# load_conv_chain_matmul_chain, both already real, tested capabilities.
+# Generalizing it in place to also recognize an interposed MaxPool would
+# make every caller's own discovery pass through the pool-aware code path,
+# for no benefit to either existing caller (chaining a conv into further
+# matmul layers, with or without pooling in between, is not something a
+# real model has forced yet -- see this section's own scope note below). A
+# separate `_discover_conv_pool_chain` keeps that risk contained to this
+# one new capability.
+#
+# WHY MaxPool NEEDS NO SCALE/ZERO-POINT VALIDATION
+# ====================================================
+# Plain ONNX MaxPool (unlike QLinearConv) carries no quantization
+# parameters at all -- its schema has only kernel_shape/strides/pads/
+# dilations/ceil_mode/auto_pad/storage_order. Max is scale-invariant:
+# max(a*s, b*s) == max(a, b)*s for any positive scale s, so a pooling layer
+# needs no cim.requantize of its own -- the PREVIOUS conv layer's existing
+# bridge already produced a real int8 value, MaxPool folds int8 to int8
+# unchanged, and the NEXT conv reads it directly. This is also why a pool
+# does not change which conv layer is the chain's own "first" or "last" for
+# any of this function's own restrictions below: it passes the already
+# zero-centered int8 value through exactly, the same way a bridge with no
+# pool does.
+#
+# THE SIGNEDNESS TRAP, AND WHY IT IS THE COMPILER'S PROBLEM, NOT THIS
+# LOADER'S
+# ============================================================================
+# ONNX MaxPool on int8 compares SIGNED (max(5, -1) == 5, not -1's raw byte
+# pattern) -- confirmed by hand against onnx.reference before PR A was
+# written (see docs/roadmap.md's MaxPool entry). This loader does not need
+# to know that: it is entirely `cimrt_reduce_max`'s own concern (see its own
+# extensive doc comment in runtime/include/cimrt.h), already landed,
+# already pinned by a mutation test that would fail loudly if the signed
+# compare ever regressed to an unsigned one. This loader's only job is
+# producing the right SHAPE of IR; PR A already made that IR correct.
+#
+# SCOPE: strides >= 2 ONLY, BECAUSE THE ORACLE CANNOT EVALUATE strides == 1
+# ============================================================================
+# `_pool_geometry` below refuses strides == 1 on either axis outright.
+# `onnx.reference` -- the primary oracle every test in this front end is
+# checked against -- cannot evaluate an INTEGER MaxPool at strides == 1 AT
+# ALL: it pads with `np.nan` as its own "never wins the max" sentinel,
+# which `np.pad` refuses to place into an integer array, and raises
+# `ValueError: cannot convert float NaN to integer` for every kernel/shape/
+# pads combination tried at stride 1 (read from the installed package,
+# `onnx/reference/ops/_op_common_pool.py`). This is the SAME class of
+# oracle gap as `auto_pad=VALID`'s own refusal on a convolution (see
+# `_conv_geometry`'s own note): a bug in what can be VERIFIED, not a
+# limitation of what this front end can COMPILE. Padding itself stays in
+# scope, unlike the stride restriction: `-128` (INT8_MIN) is confirmed the
+# correct pad value by THREE independent implementations (onnx.reference,
+# onnxruntime, and a hand-written NumPy max-pool) agreeing exactly on an
+# all-negative int8 input with real padding, at strides >= 2.
+#
+# WHAT IS STILL REFUSED
+# =======================
+#   * `ceil_mode=1` -- im2col.py's shared `output_size()` (and
+#     emit_conv_chain_module's own pool geometry) are both floor-based;
+#     ceil is a genuinely different formula, not checked here.
+#   * `auto_pad` other than `NOTSET` -- the same onnx.reference
+#     shape-dependent-padding-formula bug `_conv_geometry` already refuses
+#     it for on a convolution.
+#   * `dilations` other than `(1, 1)` -- not checked against a real
+#     cim-opt/cim-run round trip; MaxPool's dilations attribute exists in
+#     the ONNX schema but is rare in practice, and adding it is a small,
+#     separate extension once a real model forces it (this front end's own
+#     "don't invent capability a real model hasn't forced" discipline, see
+#     load_qlinear_conv's own module header).
+#   * `storage_order=1` (column-major) -- this front end never produces
+#     MaxPool's own optional `Indices` output, so there is nothing for a
+#     non-default storage order to apply to; refused as a signal the caller
+#     expects something this loader does not produce.
+#   * A pool feeding (or fed by) a MatMulInteger layer, or a pool at the
+#     chain's own edges (before the first conv, or after the last) --
+#     load_conv_pool_chain's own scope is a pure QLinearConv chain with
+#     pooling strictly between two conv layers, matching
+#     emit_conv_chain_module's own `pool_params` restriction (a pool must
+#     have a real conv on both sides, to gather from and be gathered into).
+#     Composing pooling with the conv-to-matmul bridge (PR B/D of the
+#     "chain convolution layers" plan) is real, plausible follow-on work,
+#     not attempted here on the same discipline.
+# ---------------------------------------------------------------------------
+
+
+def _pool_geometry(node, where):
+    """kernel_shape/strides/pads/dilations for a MaxPool node, validated
+    the same restricted way `_conv_geometry` validates a QLinearConv's own
+    geometry -- see this section's own module header for why strides == 1,
+    ceil_mode == 1, and non-NOTSET auto_pad are all refused.
+
+    Returns (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+    pad_right, dilation_h, dilation_w) -- exactly `_conv_geometry`'s own
+    shape, so a pool's geometry composes with im2col.py's shared
+    `output_size()` and `emit.emit_conv_chain_module`'s own `pool_params`
+    convention without a second shape existing anywhere.
+    """
+    kernel_shape_attr = next(
+        (a for a in node.attribute if a.name == "kernel_shape"), None)
+    if kernel_shape_attr is None:
+        raise Refusal(
+            f"MaxPool has no kernel_shape attribute; it is mandatory per "
+            f"the ONNX spec, with no default. Nothing emitted.", where=where)
+    kernel_shape = [int(v) for v in kernel_shape_attr.ints]
+    if len(kernel_shape) != 2:
+        raise Refusal(
+            f"kernel_shape={kernel_shape} has {len(kernel_shape)} "
+            f"entries; a 2-D MaxPool needs exactly 2. Nothing emitted.",
+            where=where)
+    kh, kw = kernel_shape
+    if kh <= 0 or kw <= 0:
+        raise Refusal(
+            f"kernel_shape={kernel_shape}; both entries must be "
+            f"positive. Nothing emitted.", where=where)
+
+    ceil_mode = _int_attr(node, "ceil_mode", 0)
+    if ceil_mode != 0:
+        raise Refusal(
+            f"ceil_mode={ceil_mode}; only ceil_mode=0 (floor -- "
+            f"im2col.py's own output_size() convention) is imported. "
+            f"Nothing emitted.", where=where)
+
+    storage_order = _int_attr(node, "storage_order", 0)
+    if storage_order != 0:
+        raise Refusal(
+            f"storage_order={storage_order}; only row-major (0) is "
+            f"imported -- this front end never produces MaxPool's own "
+            f"Indices output, so a non-default storage order has "
+            f"nothing to apply to. Nothing emitted.", where=where)
+
+    auto_pad = _str_attr(node, "auto_pad", "NOTSET")
+    if auto_pad != "NOTSET":
+        raise Refusal(
+            f"auto_pad='{auto_pad}'; only 'NOTSET' (explicit `pads`) is "
+            f"imported, for the same onnx.reference shape-dependent-"
+            f"padding-formula reason _conv_geometry refuses it on a "
+            f"convolution. Nothing emitted.", where=where)
+
+    dilations = _int_list_attr(node, "dilations", [1, 1])
+    if len(dilations) != 2:
+        raise Refusal(
+            f"dilations={dilations} has {len(dilations)} entries; a 2-D "
+            f"MaxPool needs exactly 2. Nothing emitted.", where=where)
+    dilation_h, dilation_w = dilations
+    if dilation_h != 1 or dilation_w != 1:
+        raise Refusal(
+            f"dilations={dilations}; only (1, 1) is imported for a "
+            f"MaxPool -- see this section's own module header. Nothing "
+            f"emitted.", where=where)
+
+    pads = _int_list_attr(node, "pads", [0, 0, 0, 0])
+    if len(pads) != 4:
+        raise Refusal(
+            f"pads={pads} has {len(pads)} entries; a 2-D MaxPool needs "
+            f"exactly 4 (pad_top, pad_left, pad_bottom, pad_right). "
+            f"Nothing emitted.", where=where)
+    pad_top, pad_left, pad_bottom, pad_right = pads
+    if min(pad_top, pad_left, pad_bottom, pad_right) < 0:
+        raise Refusal(
+            f"pads={pads}; negative padding is not meaningful. Nothing "
+            f"emitted.", where=where)
+
+    strides = _int_list_attr(node, "strides", [1, 1])
+    if len(strides) != 2:
+        raise Refusal(
+            f"strides={strides} has {len(strides)} entries; a 2-D "
+            f"MaxPool needs exactly 2. Nothing emitted.", where=where)
+    stride_h, stride_w = strides
+    if stride_h < 2 or stride_w < 2:
+        raise Refusal(
+            f"strides={strides}; only strides >= 2 on both axes are "
+            f"imported. onnx.reference -- the primary oracle this front "
+            f"end is checked against -- cannot evaluate an integer "
+            f"MaxPool at strides == 1 at all (it raises 'ValueError: "
+            f"cannot convert float NaN to integer' -- see this section's "
+            f"own module header). This is a gap in what can be verified, "
+            f"not a limitation of what this front end can compile. "
+            f"Nothing emitted.", where=where)
+
+    return (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+           pad_right, dilation_h, dilation_w)
+
+
+def _discover_conv_pool_chain(graph, convs):
+    """Like `_discover_conv_chain`, but a single MaxPool node may sit
+    directly between two consecutive QLinearConv nodes in the chain:
+    conv_i's own "Y" feeds either conv_(i+1)'s own "X" directly (no pool,
+    exactly `_discover_conv_chain`'s own rule) or a single MaxPool node
+    whose own "Y" feeds conv_(i+1)'s own "X" (a pool step). A SEPARATE
+    function from `_discover_conv_chain`, not a generalization of it in
+    place -- see this section's own module header for why.
+
+    Returns `(chain, pool_after, consumers)`: `chain` is exactly
+    `_discover_conv_chain`'s own return -- the ordered QLinearConv nodes,
+    with `len(chain) == len(convs)` always (fewer would mean the given
+    convs do not form one single linear chain, raised HERE as a Refusal).
+    `pool_after[i]`, if present, is the MaxPool node between `chain[i]`
+    and `chain[i + 1]` (never present for `i == len(chain) - 1`, since
+    nothing follows the chain's own last layer here -- see this section's
+    own "pool at the chain's own edges" refusal note). `consumers` maps
+    every tensor name in the graph to the list of nodes that read it.
+    """
+    producer = {out: n for n in graph.node for out in n.output}
+    conv_ids = {id(n) for n in convs}
+    consumers = {}
+    for n in graph.node:
+        for inp in n.input:
+            if inp:
+                consumers.setdefault(inp, []).append(n)
+
+    def feeder_conv(x_name):
+        """The conv (in `convs`) that feeds `x_name`, directly or through
+        exactly one MaxPool hop -- or None if neither."""
+        prod = producer.get(x_name)
+        if prod is None:
+            return None
+        if prod.op_type == ACCEPTED_CONV_OP and id(prod) in conv_ids:
+            return prod
+        if prod.op_type == ACCEPTED_POOL_OP:
+            prod2 = producer.get(prod.input[0])
+            if (prod2 is not None and prod2.op_type == ACCEPTED_CONV_OP
+                    and id(prod2) in conv_ids):
+                return prod2
+        return None
+
+    starts = [n for n in convs if feeder_conv(n.input[0]) is None]
+    if len(starts) != 1:
+        raise Refusal(
+            f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
+            f"activation is not another {ACCEPTED_CONV_OP}'s output "
+            f"(directly, or through one {ACCEPTED_POOL_OP} hop); a "
+            f"single linear chain has exactly one such node (its own "
+            f"first layer) -- {len(starts)} means either a disconnected "
+            f"graph or more than one chain. Nothing emitted.")
+
+    chain = [starts[0]]
+    pool_after = {}
+    seen_ids = {id(starts[0])}
+    current = starts[0]
+    while len(chain) < len(convs):
+        out = current.output[0]
+        readers = consumers.get(out, [])
+        idx = len(chain) - 1
+
+        if (len(readers) == 1 and readers[0].op_type == ACCEPTED_CONV_OP
+                and readers[0].input[0] == out):
+            nxt = readers[0]
+        elif (len(readers) == 1 and readers[0].op_type == ACCEPTED_POOL_OP):
+            pool_node = readers[0]
+            pool_readers = consumers.get(pool_node.output[0], [])
+            if (len(pool_readers) != 1
+                    or pool_readers[0].op_type != ACCEPTED_CONV_OP
+                    or pool_readers[0].input[0] != pool_node.output[0]):
+                raise Refusal(
+                    f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}''s "
+                    f"own output is not read as exactly one "
+                    f"{ACCEPTED_CONV_OP}'s own activation "
+                    f"({len(pool_readers)} total reader(s) found). A chain "
+                    f"must be linear -- no branching, no extra consumers. "
+                    f"Nothing emitted.")
+            if (len(pool_node.output) > 1 and pool_node.output[1]
+                    and consumers.get(pool_node.output[1])):
+                raise Refusal(
+                    f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}' "
+                    f"has a consumed Indices output; this front end never "
+                    f"produces one. Nothing emitted.")
+            pool_after[idx] = pool_node
+            nxt = pool_readers[0]
+        else:
+            raise Refusal(
+                f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
+                f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
+                f"own activation, directly or through one "
+                f"{ACCEPTED_POOL_OP} hop ({len(readers)} total reader(s) "
+                f"found). A chain must be linear -- no branching, no "
+                f"extra consumers, no non-conv/non-pool reader before its "
+                f"own last layer. Nothing emitted.")
+
+        if id(nxt) in seen_ids:
+            raise Refusal(
+                f"the {ACCEPTED_CONV_OP} chain forms a cycle. Nothing "
+                f"emitted.")
+        chain.append(nxt)
+        seen_ids.add(id(nxt))
+        current = nxt
+
+    return chain, pool_after, consumers
+
+
+def load_conv_pool_chain(model):
+    """Two or more chained QLinearConv nodes, with a MaxPool optionally
+    sitting between any two consecutive layers, discovered via
+    `_discover_conv_pool_chain` (NOT node-list order). Every restriction
+    is exactly `load_conv_chain`'s own (see its docstring): layer 0's
+    weight is Cin-major, layer i >= 1's weight is CHANNEL-LAST (the same
+    dangerous line, the same named/mutation test precedent); only the
+    LAST conv layer may have an asymmetric y_zero_point, a per-channel
+    w_scale, or a bias; only the FIRST conv layer may have a non-zero
+    x_zero_point. A MaxPool between two layers changes neither of those --
+    see this section's own module header for why.
+
+    Returns (conv_nodes, weights2d, x_name, x_shape, conv_params,
+    x_zero_point, trailing_requantize, per_channel_requantize, bias,
+    uint8_output_shifted, bridge_scales, pool_params) where every entry
+    but the last is exactly `load_conv_chain`'s own (pass straight
+    through to `emit.emit_conv_chain_module`'s own same-named
+    parameters). `pool_params` is a `{bridge_index: geometry}` dict, one
+    entry per MaxPool actually present in the chain -- exactly
+    `emit_conv_chain_module`'s own `pool_params` parameter, pass it
+    straight through too.
+
+    Raises Refusal for anything outside this function's own scope: fewer
+    than two QLinearConv nodes, any node in the graph that is not a
+    QLinearConv or (between two consecutive QLinearConv nodes) a MaxPool,
+    a branching/cyclic/disconnected chain, a MaxPool outside this
+    function's own restricted geometry (see `_pool_geometry`), or
+    anything `load_conv_chain` would itself refuse on its own conv
+    layers.
+    """
+    from onnx import numpy_helper
+
+    _check_opset(model)
+    graph = model.graph
+    initializers = _tensor_names(model)
+
+    convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
+    pools = [n for n in graph.node if n.op_type == ACCEPTED_POOL_OP]
+    if len(convs) < 2:
+        raise Refusal(
+            f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); "
+            f"load_conv_pool_chain handles a chain of two or more. Use "
+            f"load_qlinear_conv for a standalone convolution, or "
+            f"load_conv_chain for a convolution chain with no pooling, "
+            f"instead. Nothing emitted.")
+    if not pools:
+        raise Refusal(
+            f"no {ACCEPTED_POOL_OP} node in the graph; use load_conv_chain "
+            f"for a pure {ACCEPTED_CONV_OP} chain instead. Nothing "
+            f"emitted.")
+
+    others = [n for n in graph.node
+             if n.op_type not in (ACCEPTED_CONV_OP, ACCEPTED_POOL_OP)]
+    if others:
+        kinds = sorted({n.op_type for n in others})
+        raise Refusal(
+            f"graph also contains {', '.join(kinds)}. A "
+            f"{ACCEPTED_CONV_OP} chain with pooling needs no bridge node "
+            f"between conv layers, and a {ACCEPTED_POOL_OP} needs no "
+            f"quantization node of its own (max is scale-invariant -- see "
+            f"this section's own module header). Nothing emitted.")
+
+    chain, pool_after, _unused_consumers = _discover_conv_pool_chain(
+        graph, convs)
+
+    # Every MaxPool actually present in the graph must be USED, at a
+    # position `_discover_conv_pool_chain` recognized -- otherwise a
+    # legitimate-looking pool sitting somewhere this loader does not
+    # expect (branching off the chain, say) would be silently ignored
+    # rather than refused.
+    used_pool_ids = {id(p) for p in pool_after.values()}
+    unused_pools = [p for p in pools if id(p) not in used_pool_ids]
+    if unused_pools:
+        raise Refusal(
+            f"{len(unused_pools)} {ACCEPTED_POOL_OP} node(s) are not "
+            f"positioned directly between two consecutive chain layers "
+            f"this loader discovered. Nothing emitted.")
+
+    if len(graph.output) != 1:
+        raise Refusal(
+            f"graph has {len(graph.output)} outputs; a chain must end in "
+            f"exactly one. Nothing emitted.")
+    if graph.output[0].name != chain[-1].output[0]:
+        raise Refusal(
+            f"the graph's output is not the chain's own last "
+            f"{ACCEPTED_CONV_OP}'s own output -- pooling after the "
+            f"chain's own last layer is not supported (see this "
+            f"section's own module header). Nothing emitted.")
+
+    n_layers = len(chain)
+    weights2d = []
+    conv_params = []
+    bridge_scales = []
+    pool_params = {}
+    x_name = None
+    x_shape = None
+    x_zero_point = 0
+    trailing_requantize = None
+    per_channel_requantize = None
+    bias = None
+    uint8_output_shifted = False
+    prev_cout = None
+
+    for i, node in enumerate(chain):
+        is_first = i == 0
+        is_last = i == n_layers - 1
+        where = f"node '{node.name or ACCEPTED_CONV_OP}' (layer {i})"
+
+        if len(node.input) < 8:
+            raise Refusal(
+                f"{ACCEPTED_CONV_OP} has {len(node.input)} inputs; x, "
+                f"x_scale, x_zero_point, w, w_scale, w_zero_point, y_scale "
+                f"and y_zero_point are all mandatory per the ONNX spec. "
+                f"Nothing emitted.", where=where)
+        (x_i, x_scale_name, x_zp_name, w_name, w_scale_name, w_zp_name,
+         y_scale_name, y_zp_name) = node.input[:8]
+        bias_name = node.input[8] if len(node.input) > 8 else ""
+
+        if not is_last and bias_name:
+            raise Refusal(
+                f"this node has a bias operand '{bias_name}', but only "
+                f"the LAST layer of a {ACCEPTED_CONV_OP} chain may have "
+                f"one -- an intermediate layer's own bridge is "
+                f"emit_conv_chain_module's unconditional scalar "
+                f"cim.requantize, with no cim.reduce_partial step. "
+                f"Nothing emitted.", where=where)
+        if w_name not in initializers:
+            raise Refusal(
+                f"the weight operand '{w_name}' is not a constant "
+                f"initializer. Nothing emitted.", where=where)
+        if x_i in initializers:
+            raise Refusal(
+                f"both operands are constant initializers. Nothing "
+                f"emitted.", where=where)
+
+        w_init = next(t for t in graph.initializer if t.name == w_name)
+        weight = numpy_helper.to_array(w_init)
+        if weight.dtype != np.int8:
+            raise Refusal(
+                f"the weight operand '{w_name}' has dtype {weight.dtype}. "
+                f"Nothing emitted.", where=where)
+        if weight.ndim != 4:
+            raise Refusal(
+                f"the weight operand '{w_name}' has rank {weight.ndim}; a "
+                f"2-D convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. "
+                f"Nothing emitted.", where=where)
+        cout, cin, kh, kw = weight.shape
+
+        if not is_first and cin != prev_cout:
+            raise Refusal(
+                f"layer {i}'s weight has Cin={cin}, but the activation "
+                f"feeding it (layer {i - 1}'s own output, pooled or not) "
+                f"has {prev_cout} channels -- pooling does not change "
+                f"channel count, so one conv's own output channel count "
+                f"must still match the next conv's own input channel "
+                f"count. Nothing emitted.", where=where)
+
+        x_scale = _positive_scalar_scale(graph, x_scale_name, node.name,
+                                         "x_scale")
+        w_scale = _positive_weight_scale(graph, w_scale_name, node.name,
+                                         "w_scale", cout)
+        y_scale = _positive_scalar_scale(graph, y_scale_name, node.name,
+                                         "y_scale")
+        layer_x_zp, _x_zp_dtype = _scalar_zero_point(
+            graph, x_zp_name, node.name, "x_zero_point",
+            allow_nonzero=is_first)
+        _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
+        layer_y_zp, y_zp_dtype = _scalar_zero_point(
+            graph, y_zp_name, node.name, "y_zero_point",
+            allow_nonzero=is_last)
+
+        if not is_last and isinstance(w_scale, np.ndarray):
+            raise Refusal(
+                f"w_scale has {w_scale.size} elements; only the LAST "
+                f"layer of a {ACCEPTED_CONV_OP} chain may have a "
+                f"per-channel w_scale. Nothing emitted.", where=where)
+        if not is_last and y_zp_dtype != np.int8:
+            raise Refusal(
+                f"y_zero_point is {y_zp_dtype}; an intermediate layer of "
+                f"a {ACCEPTED_CONV_OP} chain must declare an int8 "
+                f"output. Nothing emitted.", where=where)
+
+        (dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right,
+         stride_h, stride_w) = _conv_geometry(node, weight, where)
+        conv_params.append((kh, kw, stride_h, stride_w, pad_top, pad_bottom,
+                           pad_left, pad_right, dilation_h, dilation_w))
+
+        if is_first:
+            x_info = next((v for v in graph.input if v.name == x_i), None)
+            if x_info is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' is neither a graph "
+                    f"input nor a constant. Nothing emitted.", where=where)
+            if x_info.type.tensor_type.elem_type not in (_INT8, _UINT8):
+                raise Refusal(
+                    f"the activation operand '{x_i}' is not int8 or "
+                    f"uint8. Nothing emitted.", where=where)
+            shp = _shape_of(x_info)
+            if shp is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has a symbolic or "
+                    f"unknown shape. Nothing emitted.", where=where)
+            if len(shp) != 4:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has rank {len(shp)}; "
+                    f"a 2-D convolution's input is rank 4 [N, Cin, H, W]. "
+                    f"Nothing emitted.", where=where)
+            if shp[1] != cin:
+                raise Refusal(
+                    f"activation has Cin={shp[1]} but the weight is "
+                    f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+                    where=where)
+            x_name = x_i
+            x_shape = tuple(shp)
+            x_zero_point = layer_x_zp
+            weights2d.append(
+                np.ascontiguousarray(weight.reshape(cout, cin * kh * kw)))
+        else:
+            # Channel-last -- see load_conv_chain's own docstring, and
+            # emit_conv_chain_module's own -- the same dangerous line.
+            # This holds whether or not a pool sits on the bridge feeding
+            # this layer: a pool's own output is still NHWC-by-construction
+            # (it never permutes axes, only reduces H/W), so the flatten
+            # order this layer's own weight must match is unaffected by
+            # pooling.
+            weights2d.append(np.ascontiguousarray(
+                weight.transpose(0, 2, 3, 1).reshape(cout, kh * kw * cin)))
+
+        if is_last:
+            uint8_output_shifted = y_zp_dtype == np.uint8
+            zp_for_module = (layer_y_zp - 128 if uint8_output_shifted
+                            else layer_y_zp)
+            if isinstance(w_scale, np.ndarray):
+                derived_scales = y_scale / (x_scale * w_scale)
+                trailing_requantize = None
+                per_channel_requantize = [(float(s), zp_for_module)
+                                          for s in derived_scales]
+            else:
+                derived_scale = y_scale / (x_scale * w_scale)
+                trailing_requantize = (derived_scale, zp_for_module, 8)
+                per_channel_requantize = None
+            if bias_name:
+                bias = np.asarray(_initializer_or_refuse(
+                    graph, bias_name, node.name, "B")).astype(np.int64)
+                if bias.shape != (cout,):
+                    raise Refusal(
+                        f"bias 'B' has shape {list(bias.shape)}; expected "
+                        f"a single length-Cout ({cout}) int32 array, one "
+                        f"value per output channel. Nothing emitted.",
+                        where=where)
+                bias = bias.astype(np.int32)
+        else:
+            bridge_scales.append(y_scale / (x_scale * w_scale))
+
+        if not is_last and i in pool_after:
+            pool_node = pool_after[i]
+            pool_where = (f"node '{pool_node.name or ACCEPTED_POOL_OP}' "
+                         f"(pool after layer {i})")
+            pool_params[i] = _pool_geometry(pool_node, pool_where)
+
+        prev_cout = cout
+
+    return (chain, weights2d, x_name, x_shape, conv_params, x_zero_point,
+           trailing_requantize, per_channel_requantize, bias,
+           uint8_output_shifted, bridge_scales, pool_params)
+
+
+# ---------------------------------------------------------------------------
 # A chain of two or more QLinearConv nodes feeding one or more MatMulInteger
 # layers -- PR D of the "chain convolution layers" plan: a real
 # conv-stem-feeding-an-FC-head chain, the realistic full CNN shape. Built by
@@ -2309,26 +2881,30 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
                  activation_source="<supplied>"):
     """An ONNX model plus an activation vector -> MLIR text.
 
-    Dispatches on how many MatMulInteger and QLinearConv nodes the graph
-    has. Exactly one QLinearConv AND one or more MatMulInteger nodes goes
-    through load_conv_matmul_chain (the conv is layer 0). Two or more
-    QLinearConv AND one or more MatMulInteger nodes goes through
+    Dispatches on how many MatMulInteger, QLinearConv, and MaxPool nodes
+    the graph has. Exactly one QLinearConv AND one or more MatMulInteger
+    nodes goes through load_conv_matmul_chain (the conv is layer 0). Two
+    or more QLinearConv AND one or more MatMulInteger nodes goes through
     load_conv_chain_matmul_chain -- a real conv-stem-feeding-an-FC-head
     chain, PR D of the "chain convolution layers" plan, built by composing
     load_conv_chain's own conv-chain machinery with load_conv_matmul_
     chain's own conv-to-matmul bridge (see its own module section header).
-    Zero MatMulInteger nodes and two or more QLinearConv nodes goes
-    through load_conv_chain (a real, direct conv-to-conv chain -- see its
-    own module section header for why it needs no bridge node the way
+    Zero MatMulInteger nodes, two or more QLinearConv nodes, and at least
+    one MaxPool node goes through load_conv_pool_chain -- a conv chain
+    with pooling interleaved (docs/roadmap.md's MaxPool plan, PR B). Zero
+    MatMulInteger nodes, two or more QLinearConv nodes, and NO MaxPool
+    goes through load_conv_chain (a real, direct conv-to-conv chain -- see
+    its own module section header for why it needs no bridge node the way
     every other chain this front end accepts does). Zero MatMulInteger
     nodes and a single QLinearConv goes through load_qlinear_conv
     (standalone). Two or more MatMulInteger nodes and no QLinearConv go
     through load_matmul_chain; exactly one of either goes through the
     single-layer paths (load_matmul_integer, load_qlinear_conv). Anything
     else -- stray Cast/QuantizeLinear nodes around a single MatMulInteger,
-    for instance -- is refused by the relevant loader's own "graph also
-    contains ..." check, which already says the right thing for that
-    case.
+    a MaxPool feeding or fed by a MatMulInteger layer, a MaxPool around a
+    single QLinearConv, for instance -- is refused by the relevant
+    loader's own "graph also contains ..." check, which already says the
+    right thing for that case.
     """
     from onnx import TensorProto  # noqa: F401 (documents op_type below)
 
@@ -2336,6 +2912,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
                        if n.op_type == ACCEPTED_OP)
     conv_count = sum(1 for n in model.graph.node
                      if n.op_type == ACCEPTED_CONV_OP)
+    pool_count = sum(1 for n in model.graph.node
+                     if n.op_type == ACCEPTED_POOL_OP)
 
     if conv_count == 1 and matmul_count >= 1:
         (conv_node, matmul_nodes, weight2d, x_name, x_shape, conv_params,
@@ -2401,6 +2979,47 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             out_shape0, weight_syms=weight_syms, act_sym=act_sym,
             header=header, scales=bridge_scales,
             n_conv_layers=len(conv_nodes))
+
+    if matmul_count == 0 and conv_count >= 2 and pool_count >= 1:
+        (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
+         trailing_requantize, per_channel_requantize, bias,
+         uint8_output_shifted, bridge_scales, pool_params) = (
+            load_conv_pool_chain(model))
+        activation = _validate_conv_activation(activation, x_shape,
+                                               x_zero_point)
+
+        patches0, out_shape0 = im2col_nchw(activation, *conv_params[0])
+        n_batch, out_h, out_w = out_shape0
+
+        taken = set()
+        weight_syms = [sanitize_symbol(n.input[3], taken) for n in conv_nodes]
+        act_sym = sanitize_symbol(x_name, taken)
+
+        header = provenance(model_path, model_bytes, activation_source)
+        header += (
+            f"//   conv im2col (layer 0): N={n_batch} OutH={out_h} "
+            f"OutW={out_w} -- the whole chain's printed output rows stay "
+            f"in (n, oh, ow) row-major order (emit_conv_chain_module "
+            f"threads M through every layer, exactly like "
+            f"emit_chain_module), reshape to [N, OutH, OutW, Cout] then "
+            f"transpose(0, 3, 1, 2) for ONNX's own [N, Cout, OutH, OutW] "
+            f"layout. {len(pool_params)} MaxPool layer(s) interleaved -- "
+            f"see load_conv_pool_chain's own module header.\n")
+        if uint8_output_shifted:
+            header += (
+                f"//   NOTE: the last layer's y_zero_point is uint8, so "
+                f"its true output is uint8 too -- but cim.requantize's "
+                f"clamp is SIGNED. Every printed value below is "
+                f"(true_uint8_value - 128), EXACTLY (see "
+                f"load_qlinear_conv's own uint8_output_shifted note): add "
+                f"128 back to recover the real QLinearConv output.\n")
+        return emit_conv_chain_module(
+            weights2d, conv_params, patches0, out_shape0,
+            weight_syms=weight_syms, act_sym=act_sym, header=header,
+            scales=bridge_scales, last_bias=bias,
+            last_trailing_requantize=trailing_requantize,
+            last_per_channel_requantize=per_channel_requantize,
+            pool_params=pool_params)
 
     if matmul_count == 0 and conv_count >= 2:
         (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,

@@ -348,6 +348,60 @@ output there — here, no conv layer is ever the graph's own output, since
 even the last one feeds the bridge into a matmul, never the graph
 directly.
 
+## `MaxPool` between convolutions
+
+A `MaxPool` node may sit directly between any two consecutive layers of a
+`QLinearConv` chain (two or more, above) — the first *non-matmul host op*
+this front end executes at all, rather than merely analyzes (see
+`analyze.py`, below). Unlike every quantized op documented so far, plain
+ONNX `MaxPool` carries no scale or zero point of its own: max is
+scale-invariant (`max(a·s, b·s) == max(a, b)·s` for any positive `s`), so
+a pooling layer needs no `cim.requantize` of its own — the *previous*
+conv layer's existing bridge already produced a real `int8` value,
+`MaxPool` folds `int8` to `int8` unchanged, and the *next* conv reads it
+directly.
+
+Emitted the same way a conv-to-conv gather is: `memref.expand_shape` the
+bridged activation into a 4-D `[N, H, W, C]` view, a padded buffer, and
+`Kh * Kw` fully static, non-unit-stride `memref.subview` taps — except the
+taps are folded by **one `cim.reduce_max`** call instead of being copied
+into columns of a matmul's patches buffer, since there is no matmul here
+at all. `cim.reduce_max` is the compiler's own first executable
+non-matmul primitive (docs/roadmap.md); it compares **signed**, matching
+what ONNX `MaxPool` on `int8` actually computes (`max(5, -1) == 5`, not
+`-1`'s raw byte pattern) — the sibling `cim.reduce_partial` is
+deliberately sign-agnostic (a wrapping add is bit-identical either way),
+so this is not a free choice.
+
+The pad value is **`-128`** (`INT8_MIN`), not `0` — a convolution's own
+correct pad value is wrong here, since `0` can beat a real negative
+activation value it should lose to. Confirmed by three independent
+implementations (`onnx.reference`, `onnxruntime`, and a hand-written
+NumPy max-pool) agreeing exactly on an all-negative `int8` input with real
+padding.
+
+**Scope is narrower than a convolution's own padding/stride support:**
+only `strides >= 2` on both axes, `ceil_mode` absent or `0`, and
+`auto_pad == "NOTSET"` are imported. The stride restriction exists because
+`onnx.reference` — the primary oracle every test in this front end is
+checked against — cannot evaluate an *integer* `MaxPool` at `strides == 1`
+at all: it pads with `np.nan` as its own "never wins the max" sentinel,
+which `np.pad` refuses to place into an integer array, and raises
+`ValueError: cannot convert float NaN to integer` for every kernel/shape/
+pads combination tried at stride 1. That is a gap in what can be
+*verified*, not a limitation of what this front end can *compile* — the
+same class of oracle bug already documented for `auto_pad=VALID` on a
+convolution, above. Padding itself stays fully in scope even though the
+stride restriction exists: `-128` is confirmed correct at `strides >= 2`,
+including with real padding.
+
+A pool must sit strictly between two real convolution layers — not
+before the first, not after the last, and not adjacent to a matmul layer
+— matching `emit_conv_chain_module`'s own `pool_params` restriction (a
+pool needs a real conv on both sides, to gather from and be gathered
+into). Composing pooling with the conv-to-matmul bridge is real,
+plausible follow-on work, not attempted here.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the
@@ -377,6 +431,10 @@ is worse than a refusal.
 | a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
 | two or more `QLinearConv` nodes that do not form a single linear chain | branching, disconnected, or cyclic — `load_conv_chain` needs a strict producer/consumer line, not a DAG |
 | a non-`QLinearConv` node inside a `QLinearConv` chain | a conv-to-conv edge needs no bridge node at all (see above); anything else in that position is unsupported |
+| a `MaxPool` with `strides == 1` on either axis | `onnx.reference` cannot evaluate an integer `MaxPool` at stride 1 at all — a gap in what can be verified, not what can be compiled (see above) |
+| a `MaxPool` with `ceil_mode == 1` | this front end's output-size formula (shared with every convolution) is floor-based |
+| a `MaxPool` with `auto_pad` other than `NOTSET` | same `onnx.reference` shape-dependent-padding bug as `QLinearConv`'s own `auto_pad` refusal, above |
+| a `MaxPool` outside a `QLinearConv` chain, or at its own edges | pooling needs a real convolution on both sides, to gather from and be gathered into |
 
 ## The activation is required
 
@@ -523,6 +581,26 @@ else.
   conv chain, no conv layer here ever gets that generality), a non-zero
   `x_zero_point` on a non-first conv layer, and a `uint8` output on the
   last conv layer.
+- `test/python/test_onnx_frontend_conv_pool_chain.py` — the `MaxPool`
+  counterpart: an independent, hand-written NumPy `MaxPool` oracle
+  (checked against `onnx.reference` itself first, at the only strides the
+  primary oracle can evaluate at all), a two-conv-one-pool differential, a
+  padded-pool differential (against a negative-heavy activation, so an
+  incorrect pad value would win a max it should lose), an overlapping-
+  window (`kernel > stride`) differential, the full conv-pool-conv-pool-
+  conv shape, a batched (N > 1) differential, an anti-vacuity check that a
+  perturbation in the conv layer *after* the pool is actually caught, and
+  refusal tests for `strides == 1`, `ceil_mode == 1`, a non-`NOTSET`
+  `auto_pad`, a pool at the chain's own edge, a stray non-conv/non-pool
+  node, and (a dispatch regression guard) a pure pool-free conv chain
+  still routing to `load_conv_chain`.
+- `test/Run/reduce-max.mlir` — `cim.reduce_max` end to end through the
+  shipped binaries, in the exact shape a `MaxPool` kernel window uses
+  (several strided `memref.subview` taps of one padded buffer, folded by a
+  single variadic op), with operands chosen so a signed compare, an
+  unsigned byte compare, and an add (`cim.reduce_partial` by mistake) all
+  disagree in both elements — this test cannot pass by luck under any of
+  those three wrong implementations.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 - `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid

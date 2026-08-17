@@ -521,6 +521,190 @@ def conv_chain_model(weights, x_shape, x_scale=1.0, x_zero_point=0,
     return model
 
 
+def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
+                          x_zero_point=0, x_dtype=TensorProto.INT8,
+                          w_scales=None, y_scales=None, strides=None,
+                          pads=None, dilations=None, last_bias=None,
+                          last_y_zero_point=0, last_y_dtype=TensorProto.INT8,
+                          check=True):
+    """`conv_chain_model`, with a MaxPool optionally sitting between any
+    two consecutive QLinearConv layers -- the way
+    cim_frontend.onnx_import.load_conv_pool_chain reads (see its own
+    module section header). Every parameter but `pools` is EXACTLY
+    `conv_chain_model`'s own (see its docstring); this function is built
+    by inserting one optional MaxPool node into that function's own
+    per-layer loop, not by reimplementing it, so the two cannot silently
+    drift apart on what a "layer" looks like.
+
+    `pools` is a `{bridge_index: dict}` mapping -- bridge_index i means
+    "a MaxPool sits between layer i's own Y and layer i+1's own X",
+    exactly `cim_frontend.emit.emit_conv_chain_module`'s own
+    `pool_params` bridge-index convention. Each dict may set
+    `kernel_shape` (required, a `(kh, kw)` pair), `strides` (default
+    `(2, 2)` -- NOT `(1, 1)`, since load_conv_pool_chain refuses
+    `strides == 1` outright, see its own module header; a test that wants
+    to exercise that refusal passes `strides=(1, 1)` explicitly), `pads`
+    (default `(0, 0, 0, 0)`), `dilations` (default `(1, 1)`), and
+    `ceil_mode` (default 0).
+    """
+    weights = [np.asarray(w) for w in weights]
+    n_layers = len(weights)
+    if n_layers < 2:
+        raise ValueError("conv_pool_chain_model needs at least two conv "
+                         "layers")
+    for i in pools:
+        if not (0 <= i < n_layers - 1):
+            raise ValueError(
+                f"pools has an entry for bridge {i}, which is out of "
+                f"range for {n_layers} layers (0 <= bridge < "
+                f"{n_layers - 1})")
+    if w_scales is None:
+        w_scales = [1.0] * n_layers
+    if y_scales is None:
+        y_scales = [1.0] * n_layers
+    if strides is None:
+        strides = [(1, 1)] * n_layers
+    if pads is None:
+        pads = [(0, 0, 0, 0)] * n_layers
+    if dilations is None:
+        dilations = [(1, 1)] * n_layers
+    for name, seq in (("w_scales", w_scales), ("y_scales", y_scales),
+                      ("strides", strides), ("pads", pads),
+                      ("dilations", dilations)):
+        if len(seq) != n_layers:
+            raise ValueError(f"{name} must have one entry per layer "
+                             f"({n_layers}), got {len(seq)}")
+
+    n, cin0, h0, w0 = x_shape
+    if weights[0].shape[1] != cin0:
+        raise ValueError(
+            f"x_shape's Cin ({cin0}) does not match layer 0's own Cin "
+            f"({weights[0].shape[1]})")
+    for i in range(1, n_layers):
+        if weights[i].shape[1] != weights[i - 1].shape[0]:
+            raise ValueError(
+                f"layer {i}'s Cin ({weights[i].shape[1]}) does not match "
+                f"layer {i - 1}'s Cout ({weights[i - 1].shape[0]})")
+
+    x_name = "X"
+    x_np_dtype = np.int8 if x_dtype == TensorProto.INT8 else np.uint8
+    nodes = []
+    initializers = []
+    cur_name = x_name
+    cur_h, cur_w = h0, w0
+    first_x_dtype = x_dtype
+    layer_y_dtype = TensorProto.INT8
+
+    for i, w in enumerate(weights):
+        cout, cin, kh, kw = w.shape
+        stride_h, stride_w = strides[i]
+        pad_top, pad_left, pad_bottom, pad_right = pads[i]
+        dilation_h, dilation_w = dilations[i]
+        dilated_kh = (kh - 1) * dilation_h + 1
+        dilated_kw = (kw - 1) * dilation_w + 1
+        out_h = (cur_h + pad_top + pad_bottom - dilated_kh) // stride_h + 1
+        out_w = (cur_w + pad_left + pad_right - dilated_kw) // stride_w + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError(
+                f"layer {i}: non-positive output size ({out_h}, {out_w}) "
+                f"for the given x_shape/weights/strides/pads/dilations")
+
+        is_first = i == 0
+        is_last = i == n_layers - 1
+        layer_x_scale = x_scale if is_first else 1.0
+        layer_x_zp = x_zero_point if is_first else 0
+        layer_x_np_dtype = x_np_dtype if is_first else np.int8
+
+        layer_y_scale = y_scales[i]
+        layer_y_zp = last_y_zero_point if is_last else 0
+        layer_y_dtype = last_y_dtype if is_last else TensorProto.INT8
+        layer_y_np_dtype = (np.int8 if layer_y_dtype == TensorProto.INT8
+                            else np.uint8)
+
+        w_scale_arr = np.asarray(w_scales[i], dtype=np.float32)
+        if w_scale_arr.ndim == 0:
+            w_scale_arr = w_scale_arr.reshape(())
+
+        p = f"L{i}_"
+        initializers += [
+            numpy_helper.from_array(w, name=p + "W"),
+            numpy_helper.from_array(
+                np.array(layer_x_scale, dtype=np.float32), name=p + "xs"),
+            numpy_helper.from_array(
+                np.array(layer_x_zp, dtype=layer_x_np_dtype),
+                name=p + "xzp"),
+            numpy_helper.from_array(w_scale_arr, name=p + "ws"),
+            numpy_helper.from_array(
+                np.array(0, dtype=np.int8), name=p + "wzp"),
+            numpy_helper.from_array(
+                np.array(layer_y_scale, dtype=np.float32), name=p + "ys"),
+            numpy_helper.from_array(
+                np.array(layer_y_zp, dtype=layer_y_np_dtype),
+                name=p + "yzp"),
+        ]
+        node_inputs = [cur_name, p + "xs", p + "xzp", p + "W", p + "ws",
+                      p + "wzp", p + "ys", p + "yzp"]
+        if is_last and last_bias is not None:
+            initializers.append(numpy_helper.from_array(
+                np.asarray(last_bias, dtype=np.int32), name=p + "B"))
+            node_inputs.append(p + "B")
+        out_name = f"L{i}_Y"
+        nodes.append(helper.make_node(
+            "QLinearConv", node_inputs, [out_name], name=f"conv{i}",
+            strides=[stride_h, stride_w],
+            pads=[pad_top, pad_left, pad_bottom, pad_right],
+            dilations=[dilation_h, dilation_w]))
+
+        cur_name = out_name
+        cur_h, cur_w = out_h, out_w
+
+        if i in pools:
+            pool_kwargs = pools[i]
+            pkh, pkw = pool_kwargs["kernel_shape"]
+            p_stride_h, p_stride_w = pool_kwargs.get("strides", (2, 2))
+            p_pad_top, p_pad_left, p_pad_bottom, p_pad_right = (
+                pool_kwargs.get("pads", (0, 0, 0, 0)))
+            p_dilation_h, p_dilation_w = pool_kwargs.get(
+                "dilations", (1, 1))
+            ceil_mode = pool_kwargs.get("ceil_mode", 0)
+            p_dilated_kh = (pkh - 1) * p_dilation_h + 1
+            p_dilated_kw = (pkw - 1) * p_dilation_w + 1
+            pool_out_h = ((cur_h + p_pad_top + p_pad_bottom - p_dilated_kh)
+                         // p_stride_h + 1)
+            pool_out_w = ((cur_w + p_pad_left + p_pad_right - p_dilated_kw)
+                         // p_stride_w + 1)
+            if pool_out_h <= 0 or pool_out_w <= 0:
+                raise ValueError(
+                    f"bridge {i}'s pool: non-positive output size "
+                    f"({pool_out_h}, {pool_out_w})")
+            pool_out_name = f"L{i}_pool"
+            pool_kwargs_onnx = dict(
+                kernel_shape=[pkh, pkw], strides=[p_stride_h, p_stride_w],
+                pads=[p_pad_top, p_pad_left, p_pad_bottom, p_pad_right],
+                dilations=[p_dilation_h, p_dilation_w])
+            if ceil_mode:
+                pool_kwargs_onnx["ceil_mode"] = ceil_mode
+            nodes.append(helper.make_node(
+                "MaxPool", [cur_name], [pool_out_name], name=f"pool{i}",
+                **pool_kwargs_onnx))
+            cur_name = pool_out_name
+            cur_h, cur_w = pool_out_h, pool_out_w
+
+    last_cout = weights[-1].shape[0]
+    graph = helper.make_graph(
+        nodes, "conv_pool_chain",
+        [helper.make_tensor_value_info(x_name, first_x_dtype, list(x_shape))],
+        [helper.make_tensor_value_info(
+            cur_name, layer_y_dtype, [n, last_cout, cur_h, cur_w])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
                                   x_scale=1.0, x_zero_point=0,
                                   x_dtype=TensorProto.INT8,

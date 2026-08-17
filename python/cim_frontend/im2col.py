@@ -60,30 +60,59 @@ which genuinely cannot be expressed this way.
 import numpy as np
 
 
-def _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right):
-    """Zero-pad the H and W axes of an [N, C, H, W] array.
+def output_size(in_size, kernel, pad_lo, pad_hi, stride, dilation=1):
+    """The ONNX spec's own output-size formula, shared by every caller that
+    needs it -- a convolution's im2col below, AND (im2col.py has no
+    MaxPool code of its own, but this function is what onnx_import.py's
+    pool geometry validation and emit.py's pool-layer emission both call)
+    a MaxPool window, since ONNX defines both ops' spatial output size
+    with the identical formula:
+    `floor((in + pad_lo + pad_hi - dilation*(kernel-1) - 1) / stride) + 1`.
+    Factored into one place so a convolution's and a pool's own output
+    size cannot silently drift apart -- the same "one copy, not two"
+    discipline `_conv_geometry`'s own factoring in onnx_import.py already
+    follows for the rest of a layer's geometry.
+    """
+    dilated = (kernel - 1) * dilation + 1
+    padded = in_size + pad_lo + pad_hi
+    return (padded - dilated) // stride + 1
 
-    Zero is the correct pad value ONLY because onnx_import.py requires
-    x_zero_point == 0 before ever calling this: in a symmetric-int8
-    quantized tensor, the quantized value 0 IS the logical zero a
-    convolution's implicit padding is supposed to contribute. A non-zero
-    zero point would need the pad value to be x_zero_point instead, which
-    is exactly the case onnx_import.py's own refusal exists to avoid ever
-    reaching this function with.
+
+def _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right, pad_value=0):
+    """Pad the H and W axes of an [N, C, H, W] array with `pad_value`.
+
+    Zero is the correct pad value for a CONVOLUTION's implicit padding
+    ONLY because onnx_import.py requires x_zero_point == 0 before ever
+    calling this for that purpose: in a symmetric-int8 quantized tensor,
+    the quantized value 0 IS the logical zero a convolution's implicit
+    padding is supposed to contribute. A non-zero zero point would need
+    the pad value to be x_zero_point instead, which is exactly the case
+    onnx_import.py's own refusal exists to avoid ever reaching this
+    function with.
+
+    A MaxPool's implicit padding needs a DIFFERENT pad value: the most
+    negative representable value (-128 for int8), so a padded position
+    never wins a max against a real one -- confirmed correct by three
+    independent implementations (onnx.reference, onnxruntime, and a
+    hand-written NumPy max-pool) agreeing exactly on an all-negative int8
+    input with real padding; see docs/roadmap.md's MaxPool entry.
+    `pad_value` is a parameter, not a second copy of this function, for
+    exactly that reason: the gather/output-size math is identical between
+    the two ops, only the fill value differs.
     """
     if pad_top == pad_bottom == pad_left == pad_right == 0:
         return x
     n, c, h, w = x.shape
-    padded = np.zeros(
+    padded = np.full(
         (n, c, h + pad_top + pad_bottom, w + pad_left + pad_right),
-        dtype=x.dtype)
+        pad_value, dtype=x.dtype)
     padded[:, :, pad_top:pad_top + h, pad_left:pad_left + w] = x
     return padded
 
 
 def im2col_nchw(x, kh, kw, stride_h, stride_w,
                 pad_top, pad_bottom, pad_left, pad_right,
-                dilation_h=1, dilation_w=1):
+                dilation_h=1, dilation_w=1, pad_value=0):
     """[N, C, H, W] -> ([N*OutH*OutW, C*Kh*Kw] patches, (N, OutH, OutW)).
 
     Row `m` of the returned patches matrix is output position
@@ -97,13 +126,12 @@ def im2col_nchw(x, kh, kw, stride_h, stride_w,
 
     `dilation_h`/`dilation_w` (default 1, ordinary convolution) space the
     Kh*Kw taps `dilation` elements apart instead of adjacent -- see this
-    module's own "DILATION IS A SAMPLING PATTERN" note. The output-size
-    formula matches the ONNX spec's own
-    `floor((input + pad - dilation*(kernel-1) - 1) / stride) + 1`
-    algebraically: `dilated_kh = (kh-1)*dilation_h + 1` is the span an
-    already-dilated kernel covers, so `(hp - dilated_kh)/stride + 1`
-    is the same expression rearranged around that span instead of the
-    kernel size directly.
+    module's own "DILATION IS A SAMPLING PATTERN" note. The output size is
+    `output_size()` above, called once per spatial axis.
+
+    `pad_value` (default 0, a convolution's own correct value -- see
+    `_pad_nchw`'s own docstring) is threaded straight through; a caller
+    gathering a MaxPool window instead passes -128.
 
     Built as an explicit loop over output positions rather than a strided-
     view trick: this is import-time, one-shot, non-performance-critical
@@ -125,7 +153,8 @@ def im2col_nchw(x, kh, kw, stride_h, stride_w,
         raise ValueError(
             f"dilation must be positive, got ({dilation_h}, {dilation_w})")
 
-    xp = _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right)
+    xp = _pad_nchw(x, pad_top, pad_bottom, pad_left, pad_right,
+                   pad_value=pad_value)
     hp, wp = xp.shape[2], xp.shape[3]
     dilated_kh = (kh - 1) * dilation_h + 1
     dilated_kw = (kw - 1) * dilation_w + 1
@@ -135,8 +164,8 @@ def im2col_nchw(x, kh, kw, stride_h, stride_w,
             f"({kh}, {kw}) at dilation ({dilation_h}, {dilation_w}) -- is "
             f"larger than the padded input ({hp}, {wp})")
 
-    out_h = (hp - dilated_kh) // stride_h + 1
-    out_w = (wp - dilated_kw) // stride_w + 1
+    out_h = output_size(h, kh, pad_top, pad_bottom, stride_h, dilation_h)
+    out_w = output_size(w, kw, pad_left, pad_right, stride_w, dilation_w)
     if out_h <= 0 or out_w <= 0:
         raise ValueError(
             f"non-positive output size ({out_h}, {out_w}) for input "

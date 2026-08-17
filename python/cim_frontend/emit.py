@@ -29,6 +29,8 @@ this module's output against `build_module` byte for byte.
 
 import numpy as np
 
+from .im2col import output_size
+
 # MLIR symbol names are [A-Za-z_$.][A-Za-z0-9_$.]* -- ONNX tensor names are
 # not, and routinely contain '/', ':' and '-'.
 _SAFE_FIRST = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$.")
@@ -483,7 +485,7 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                            scales=None, n_conv_layers=None, last_bias=None,
                            last_trailing_requantize=None,
                            last_per_channel_requantize=None,
-                           effective_bits=8):
+                           effective_bits=8, pool_params=None):
     """Two or more chained QLinearConv layers -- a REAL MLIR-level im2col
     for every layer after the first, docs/roadmap.md's "chain convolution
     layers" plan, part 2.
@@ -595,6 +597,47 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     original raw-int32-final-accumulator behavior exactly (for either
     kind of final layer).
 
+    `pool_params`, if given, is a `{bridge_index: (kh, kw, stride_h,
+    stride_w, pad_top, pad_bottom, pad_left, pad_right, dilation_h,
+    dilation_w)}` dict -- the SAME 10-tuple shape as one `conv_params[i]`
+    entry, reusing it rather than inventing a second shape, since a
+    MaxPool window's own geometry is validated the same way a
+    convolution's is (see im2col.py's shared `output_size`). `bridge_index`
+    i (0 <= i < n_conv_layers - 1, i.e. strictly inside the convolutional
+    portion of the chain -- pooling into or out of a plain matmul layer is
+    not supported here) means "insert a MaxPool between layer i's own
+    bridge and layer i+1's own gather". A pool at bridge i is emitted
+    right after that bridge's `cim.requantize` (which still runs
+    unconditionally -- MaxPool carries no quantization of its own, so it
+    consumes that requantize's own int8 output directly and needs no
+    `scales[i]` entry of its own beyond it) and BEFORE layer i+1 does its
+    own gather, as:
+      1. `memref.expand_shape` the bridged `[M_i, Cout_i]` activation into
+         4-D `[N, H_i, W_i, Cout_i]` -- identical to a conv layer's own
+         first gather step.
+      2. A padded 4-D buffer filled with **-128** (`INT8_MIN`), not 0 --
+         the correct MaxPool pad value (see im2col.py's `_pad_nchw`
+         docstring for the three-implementation confirmation), so a
+         padded position never wins a max against a real one.
+      3. `Kh*Kw` static-stride `memref.subview` taps of that padded
+         buffer, fed DIRECTLY as `cim.reduce_max`'s variadic operands --
+         no per-tap slab copy into a patches buffer the way a conv
+         layer's gather needs: `cim.reduce_max`'s own verifier constrains
+         only shape and element type, and the interpreter's gather walks
+         arbitrary strides already, so the taps compose as-is (confirmed
+         against a real cim-opt/cim-run round trip before this parameter
+         existed -- see test/Run/reduce-max.mlir). One `cim.reduce_max`
+         call folds all `Kh*Kw` taps into a single fresh 4-D allocation.
+      4. `memref.collapse_shape` that 4-D result back to 2-D `[pool_M,
+         Cout_i]` -- the shape layer i+1's own subsequent processing
+         (gather or, if it were a matmul, a flat activation) expects.
+    `M`/`H`/`W` after a pool are the pool's own output size, threaded into
+    every later computation the normal way -- the chain's `layer_shapes`
+    precompute and the main emission loop both apply a bridge's pool (if
+    any) before computing the NEXT layer's own geometry from it. Default
+    `None` (no pooling anywhere) leaves every layer's own bridge exactly
+    as before this parameter existed.
+
     Deallocation follows emit_chain_module's own established convention
     (only `%a0` and the final PRINTED buffer get an explicit
     `memref.dealloc` -- `%out{n-1}` itself if no `last_*` tail ran, or
@@ -636,6 +679,17 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             "accumulator directly, exactly like emit_chain_module, since "
             "MatMulInteger's own \"Y\" IS the raw accumulator by the op's "
             "own definition, needing no further tail.")
+    if pool_params is None:
+        pool_params = {}
+    for i in pool_params:
+        if not (0 <= i < n_conv_layers - 1):
+            raise ValueError(
+                f"pool_params has an entry for bridge {i}, but a pool is "
+                f"only supported strictly inside the convolutional portion "
+                f"of the chain (0 <= bridge < n_conv_layers - 1 = "
+                f"{n_conv_layers - 1}) -- layer {i + 1} must itself be a "
+                f"convolution for its own gather to consume the pooled "
+                f"activation. Nothing emitted.")
     if weight_syms is None:
         weight_syms = [f"w{i}" for i in range(n_layers)]
     if len(weight_syms) != n_layers:
@@ -701,14 +755,33 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     layer_shapes = [(m0, out_h, out_w)]
     ph, pw = out_h, out_w
     for i in range(1, n_conv_layers):
+        # A pool on bridge (i - 1) -- between layer i-1's own bridge and
+        # layer i's own gather -- changes (ph, pw) BEFORE layer i's own
+        # geometry is applied to them; see this function's own
+        # `pool_params` docstring.
+        if (i - 1) in pool_params:
+            (pkh, pkw, p_stride_h, p_stride_w, p_pad_top, p_pad_bottom,
+             p_pad_left, p_pad_right, p_dilation_h, p_dilation_w) = (
+                pool_params[i - 1])
+            pool_out_h = output_size(ph, pkh, p_pad_top, p_pad_bottom,
+                                     p_stride_h, p_dilation_h)
+            pool_out_w = output_size(pw, pkw, p_pad_left, p_pad_right,
+                                     p_stride_w, p_dilation_w)
+            if pool_out_h <= 0 or pool_out_w <= 0:
+                raise ValueError(
+                    f"bridge {i - 1}'s pool: non-positive output size "
+                    f"({pool_out_h}, {pool_out_w}) for input ({ph}, {pw}), "
+                    f"kernel ({pkh}, {pkw}), stride ({p_stride_h}, "
+                    f"{p_stride_w}), pad ({p_pad_top}, {p_pad_bottom}, "
+                    f"{p_pad_left}, {p_pad_right})")
+            ph, pw = pool_out_h, pool_out_w
+
         (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
          pad_right, dilation_h, dilation_w) = conv_params[i]
-        dilated_kh = (kh - 1) * dilation_h + 1
-        dilated_kw = (kw - 1) * dilation_w + 1
-        hp = ph + pad_top + pad_bottom
-        wp = pw + pad_left + pad_right
-        next_out_h = (hp - dilated_kh) // stride_h + 1
-        next_out_w = (wp - dilated_kw) // stride_w + 1
+        next_out_h = output_size(ph, kh, pad_top, pad_bottom, stride_h,
+                                 dilation_h)
+        next_out_w = output_size(pw, kw, pad_left, pad_right, stride_w,
+                                 dilation_w)
         if next_out_h <= 0 or next_out_w <= 0:
             raise ValueError(
                 f"layer {i}: non-positive output size "
@@ -779,6 +852,13 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     # takes a scalar, not a splat attribute) -- hoisted once rather than
     # redeclared per layer, since the value is always the same.
     lines.append("  %zeroI8 = arith.constant 0 : i8")
+    # Same idea for a pool's own fill value -- INT8_MIN, so a padded
+    # position never wins a max (see this function's own `pool_params`
+    # docstring) -- but only declared when at least one pool actually
+    # runs, so a chain with no pooling emits byte-identical text to
+    # before this parameter existed.
+    if pool_params:
+        lines.append("  %negI8 = arith.constant -128 : i8")
 
     act_val = "%a0"
     cur_m, cur_k = m0, k0
@@ -820,6 +900,92 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             f"{float(scales[i])!r} : f32, zero_point = 0 : i32, "
             f"effective_bits = 8 : i32}}")
         lines.append(f"    : memref<{cur_m}x{cout}xi32> -> memref<{cur_m}x{cout}xi8>")
+
+        if i in pool_params:
+            # A MaxPool between this bridge and layer i+1's own gather --
+            # see this function's own `pool_params` docstring for the full
+            # design. Reassigns `bridged`/`cur_m`/`cur_h`/`cur_w` in
+            # place, so everything below (the matmul branch, and the
+            # conv-gather branch's own expand_shape) sees the POOLED
+            # activation and its own, already-updated spatial size,
+            # exactly as if layer i's bridge had produced it directly.
+            (pkh, pkw, p_stride_h, p_stride_w, p_pad_top, p_pad_bottom,
+             p_pad_left, p_pad_right, p_dilation_h, p_dilation_w) = (
+                pool_params[i])
+            pool_cin = cout  # pooling preserves channel count.
+
+            pexp_ty = f"memref<{n_batch}x{cur_h}x{cur_w}x{pool_cin}xi8>"
+            pexp = fresh("poolExp")
+            lines.append(
+                f"  {pexp} = memref.expand_shape {bridged} [[0, 1, 2], "
+                f"[3]] : memref<{cur_m}x{pool_cin}xi8> into {pexp_ty}")
+
+            pool_out_h = output_size(cur_h, pkh, p_pad_top, p_pad_bottom,
+                                     p_stride_h, p_dilation_h)
+            pool_out_w = output_size(cur_w, pkw, p_pad_left, p_pad_right,
+                                     p_stride_w, p_dilation_w)
+            php = cur_h + p_pad_top + p_pad_bottom
+            pwp = cur_w + p_pad_left + p_pad_right
+
+            ppadded_ty = f"memref<{n_batch}x{php}x{pwp}x{pool_cin}xi8>"
+            ppadded = fresh("poolPadded")
+            lines.append(f"  {ppadded} = memref.alloc() : {ppadded_ty}")
+            lines.append(
+                f"  linalg.fill ins(%negI8 : i8) outs({ppadded} : "
+                f"{ppadded_ty})")
+
+            pinner_stride = [php * pwp * pool_cin, pwp * pool_cin,
+                             pool_cin, 1]
+            pinner_off = p_pad_top * pwp * pool_cin + p_pad_left * pool_cin
+            pinner_ty = (f"memref<{n_batch}x{cur_h}x{cur_w}x{pool_cin}xi8, "
+                        f"strided<{pinner_stride}, offset: {pinner_off}>>")
+            pinner = fresh("poolPaddedInner")
+            lines.append(
+                f"  {pinner} = memref.subview {ppadded}[0, {p_pad_top}, "
+                f"{p_pad_left}, 0] [{n_batch}, {cur_h}, {cur_w}, "
+                f"{pool_cin}] [1, 1, 1, 1] : {ppadded_ty} to {pinner_ty}")
+            lines.append(
+                f"  memref.copy {pexp}, {pinner} : {pexp_ty} to {pinner_ty}")
+
+            pool_m = n_batch * pool_out_h * pool_out_w
+            pooled4d_ty = (f"memref<{n_batch}x{pool_out_h}x{pool_out_w}x"
+                          f"{pool_cin}xi8>")
+            tap_operands = []
+            tap_types = []
+            for th in range(pkh):
+                for tw in range(pkw):
+                    h_off = th * p_dilation_h
+                    w_off = tw * p_dilation_w
+                    tap_stride = [php * pwp * pool_cin,
+                                 pwp * pool_cin * p_stride_h,
+                                 pool_cin * p_stride_w, 1]
+                    tap_off = h_off * pwp * pool_cin + w_off * pool_cin
+                    tap_ty = (f"memref<{n_batch}x{pool_out_h}x"
+                             f"{pool_out_w}x{pool_cin}xi8, "
+                             f"strided<{tap_stride}, offset: {tap_off}>>")
+                    tap = fresh("poolTap")
+                    lines.append(
+                        f"  {tap} = memref.subview {ppadded}[0, {h_off}, "
+                        f"{w_off}, 0] [{n_batch}, {pool_out_h}, "
+                        f"{pool_out_w}, {pool_cin}] [1, {p_stride_h}, "
+                        f"{p_stride_w}, 1] : {ppadded_ty} to {tap_ty}")
+                    tap_operands.append(tap)
+                    tap_types.append(tap_ty)
+
+            pooled = fresh("poolMax")
+            lines.append(
+                f"  {pooled} = cim.reduce_max {', '.join(tap_operands)} : "
+                f"({', '.join(tap_types)}) -> {pooled4d_ty}")
+
+            pooled2d_ty = f"memref<{pool_m}x{pool_cin}xi8>"
+            pooled2d = fresh("poolCollapsed")
+            lines.append(
+                f"  {pooled2d} = memref.collapse_shape {pooled} "
+                f"[[0, 1, 2], [3]] : {pooled4d_ty} into {pooled2d_ty}")
+
+            bridged = pooled2d
+            cur_m = pool_m
+            cur_h, cur_w = pool_out_h, pool_out_w
 
         if i + 1 >= n_conv_layers:
             # A plain MatMulInteger layer: the bridged activation is

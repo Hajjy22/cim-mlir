@@ -2337,6 +2337,76 @@ out of scope for v0.1 across the board, not just here.
   1` on those grounds rather than ship a capability that cannot be
   differential-tested.
 
+- **`QLinearConv -> MaxPool -> QLinearConv` chaining (PR B of the MaxPool
+  plan).** The front-end half of the previous entry: `cim.reduce_max`
+  existed and executed, but nothing emitted it. This is the piece that
+  makes it reachable from a real model -- a `MaxPool` node interleaved
+  between any two consecutive layers of a `QLinearConv` chain, the
+  early-layer shape of a real small classification CNN
+  `test/python/onnx_fixtures.py`'s own `small_multi_layer_cnn_model` had
+  already anticipated for cost analysis but never executed.
+
+  A new `load_conv_pool_chain` loader (a SEPARATE function from
+  `_discover_conv_chain`/`load_conv_chain`, not a generalization of them
+  in place, so the two existing, already-tested chain loaders are
+  untouched) discovers a linear chain where each hop is either a direct
+  conv-to-conv edge or exactly one `MaxPool` node between two convs.
+  `emit_conv_chain_module` gained a `pool_params` parameter (a
+  `{bridge_index: geometry}` dict, keyed the same way as `conv_params`)
+  emitting, per pooled bridge: the existing bridge `cim.requantize`
+  (unconditional, unchanged -- `MaxPool` is scale-invariant and needs no
+  quantization of its own), `memref.expand_shape`, a `-128`-padded 4-D
+  buffer, and `Kh*Kw` static-stride `memref.subview` taps fed **directly**
+  as `cim.reduce_max`'s variadic operands -- no per-tap slab copy into a
+  patches buffer the way the conv-chain gather needs, since
+  `cim.reduce_max`'s own verifier constrains only shape, not contiguity
+  (confirmed against a real `cim-opt`/`cim-run` round trip, matching an
+  independent NumPy oracle exactly, before this was written into
+  `emit.py`). `im2col.py` gained a shared `output_size()` formula and a
+  `pad_value` parameter (default 0, a convolution's own correct value),
+  used by both the convolution and the pool paths so the two cannot
+  silently drift on what "output size" means.
+
+  **Scope: `strides >= 2` only**, `ceil_mode` absent or 0, `auto_pad ==
+  NOTSET` -- `strides == 1` is refused explicitly *because*
+  `onnx.reference` cannot evaluate it (the previous entry's own finding),
+  not because the compiler cannot compile it, with the refusal message
+  saying exactly that. The same "verifiability, not compilability" framing
+  already established for `auto_pad=VALID` on a convolution. Padding
+  itself stays fully in scope -- `-128` is confirmed correct at `strides
+  >= 2` by three independent implementations.
+
+  **Verification leaned harder on independent oracles than usual, because
+  the primary one is known buggy here.** `test/python/
+  test_onnx_frontend_conv_pool_chain.py` carries its own hand-written
+  NumPy `MaxPool` oracle (`_independent_maxpool_nchw`, built without
+  reusing `im2col.py`'s own `output_size()`/pad helpers -- reusing them
+  would test the pipeline against itself), itself first checked against
+  `onnx.reference` at the strides the primary oracle CAN evaluate, before
+  ever being used to check this front end's own output. Every correctness
+  test still runs through the real `cim-opt`/`cim-run` pipeline: a basic
+  conv-pool-conv chain, a padded pool (against a negative-heavy
+  activation, so an incorrect pad value would win a max it should lose),
+  overlapping pooling windows (`kernel > stride`), the full conv-pool-
+  conv-pool-conv shape, batching, and an anti-vacuity check that a
+  perturbation in the conv layer *after* the pool is actually caught.
+
+  Mutation-tested: flipping the `-128` pad constant to `0` in `emit.py`
+  turns the padded-pool differential red with a visibly wrong number, not
+  a crash; making the loader skip a `bridge_scales` entry on a pooled
+  bridge (simulating the bug of treating a pool as if it consumed one)
+  turns every multi-bridge differential red with a `scales must have one
+  entry per bridge` `ValueError` -- a loud, immediate failure rather than
+  a silent wrong answer either way. Both reverted and reconfirmed green.
+
+  Not attempted here, on the same "don't invent capability a real model
+  hasn't forced" discipline as everywhere else in this front end: pooling
+  composed with the conv-to-matmul bridge (a pool adjacent to a matmul
+  layer, or before the first/after the last conv), `MaxPool` dilation
+  other than `(1, 1)`, and `Relu`/`GlobalAveragePool`/`Concat` (still
+  genuinely blocked on missing dialect-level primitives -- see the
+  previous entry's own "Explicitly out of scope" list).
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).
