@@ -2065,6 +2065,52 @@ out of scope for v0.1 across the board, not just here.
   no crash, no diagnostic -- and produces a completely different result
   from `onnx.reference`, confirmed by hand for both.
 
+- **Interpreter: execute `memref.expand_shape`/`memref.collapse_shape`
+  (PR A of the "chain convolution layers" plan).** Generic, not
+  convolution-specific, and has no dependency on the conv->matmul chaining
+  entry above -- lands independently, the same shape of change as the
+  existing precedent for `linalg.fill` (added specifically so the
+  interpreter could execute `cim-partition`'s own zero-padding). Scoped
+  narrowly, on purpose: both ops are executed only against a contiguous,
+  offset-0 source (`isContiguousFromZero`, `lib/Interpreter/
+  Interpreter.cpp`) -- exactly what a fresh `memref.alloc()`'s own result
+  looks like, and the only shape either op's one real use (reinterpreting
+  a chain bridge's freshly allocated activation buffer between a rank-2
+  matmul shape and a rank-4 im2col gather shape, for a future MLIR-level
+  im2col) ever needs. Reinterpreting a genuinely strided view (e.g. a
+  `memref.subview`'s own result) is refused, not guessed at: it would need
+  real affine-map reasoning this interpreter does not do. One templated
+  handler (`runReassociativeReshape`) covers both ops -- they share one
+  ODS base class (`MemRef_ReassociativeReshapeOp`) with identical
+  `getSrc()`/`getResult()`/`getResultType()` accessors, so there is
+  nothing for two separate handlers to duplicate.
+
+  Verified against the real `cim-opt`/`cim-run` round trip by hand before
+  being written down as permanent tests (the same discipline every
+  previous feature in this section has followed): a probe confirmed the
+  exact failure this feature closes (`error: operation not supported by
+  the cim interpreter: memref.expand_shape`) before any code was written,
+  and confirmed both the plain round-trip case and the harder
+  composition PR C will actually need -- `expand_shape` into a 4-D
+  `[N, H, W, C]` view, a static non-unit-stride `subview` picking one
+  tap, `memref.copy` into a fresh contiguous slab, `collapse_shape` back
+  to 2-D, then a real matmul -- produce exactly the hand-computed answer,
+  not merely "something."
+
+  Landed as three permanent regression tests in `test/mlir/
+  pipeline_e2e_test.cpp` (reusing that file's existing `compileSource`
+  harness, which runs the real `cim-detect`/`cim-partition`/interpreter
+  chain rather than a shortcut): the round-trip case, the tap-gather
+  composition case, and a refusal case (an `expand_shape` fed a
+  `memref.subview`'s strided result). Mutation-tested: disabling the
+  contiguity check does not merely fail to error -- the module that
+  should be refused runs to completion instead, exactly the "silently
+  accepted, should have been refused" failure this check exists to
+  prevent, turning the refusal test red for the right reason. Verified
+  clean under the same MLIR+ASan+UBSan configuration `mlir-asan`'s CI job
+  uses (`-DCIM_SANITIZER=address,undefined -DCIM_ENABLE_WERROR=ON`),
+  clang-tidy (clang-18 tree, zero findings), and cppcheck (zero findings).
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

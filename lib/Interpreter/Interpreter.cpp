@@ -68,6 +68,28 @@ struct MemRefValue {
   }
 };
 
+/// True iff `v`'s shape/strides describe a contiguous, offset-0 view --
+/// exactly what a fresh memref.alloc()'s own MemRefValue looks like, and
+/// nothing else. runReassociativeReshape (below) is scoped to this case
+/// only: reinterpreting a genuinely strided view (e.g. one coming from
+/// memref.subview) would need real affine-map reasoning this interpreter
+/// does not do -- and does not need to, since the one real use this
+/// feature has (reinterpreting a chain bridge's own freshly allocated
+/// activation buffer between a rank-2 matmul shape and a rank-4 im2col
+/// gather shape, see docs/roadmap.md's "chain convolution layers" plan)
+/// never reshapes anything but a fresh allocation.
+bool isContiguousFromZero(const MemRefValue &v) {
+  if (v.offsetElems != 0)
+    return false;
+  int64_t expected = 1;
+  for (int64_t d = static_cast<int64_t>(v.sizes.size()) - 1; d >= 0; --d) {
+    if (v.strides[d] != expected)
+      return false;
+    expected *= v.sizes[d];
+  }
+  return true;
+}
+
 struct Resident {
   cimrt_tile_id tile = 0;
   int64_t rows = 0;
@@ -156,6 +178,41 @@ private:
   LogicalResult runRequantize(RequantizeOp op);
   LogicalResult runArithConstant(arith::ConstantOp op);
   LogicalResult runScfFor(scf::ForOp op);
+
+  /// memref.expand_shape and memref.collapse_shape share one ODS base
+  /// class (MemRef_ReassociativeReshapeOp) with identical getSrc()/
+  /// getResult()/getResultType() accessors, so one templated handler
+  /// covers both -- defined here, inline, rather than out-of-line like
+  /// every sibling run* method: this is the only template in the class,
+  /// and a single-TU build needs the full definition visible at its
+  /// instantiation point (inside execute()'s TypeSwitch, further down
+  /// this file) rather than merely declared.
+  template <typename ReassociativeReshapeOp>
+  LogicalResult runReassociativeReshape(ReassociativeReshapeOp op) {
+    auto it = memrefs.find(op.getSrc());
+    if (it == memrefs.end())
+      return op.emitError("reshape of an unknown buffer");
+    const MemRefValue &src = it->second;
+    if (!isContiguousFromZero(src))
+      return op.emitError(
+          "cim interpreter: memref.expand_shape/collapse_shape only model "
+          "a contiguous, offset-0 source (e.g. a fresh memref.alloc()'s "
+          "own result) -- reinterpreting a genuinely strided view would "
+          "need real affine-map reasoning this interpreter does not do");
+    FailureOr<MemRefValue> result =
+        viewFromType(op.getResultType(), src.alloc);
+    if (failed(result))
+      return op.emitError(
+          "cim interpreter: memref.expand_shape/collapse_shape's result "
+          "must have a fully static shape and a whole-byte element type");
+    if (result->numElements() != src.numElements())
+      return op.emitError(
+          "cim interpreter: memref.expand_shape/collapse_shape's result "
+          "element count does not match its source's (internal error -- "
+          "the verifier should already have caught this)");
+    memrefs[op.getResult()] = *result;
+    return success();
+  }
 
   const InterpreterOptions &options;
   llvm::raw_ostream &out;
@@ -1091,6 +1148,8 @@ LogicalResult Interpreter::execute(Operation *op) {
         return runAlloc(o, llvm::cast<MemRefType>(o.getType()));
       })
       .Case<memref::SubViewOp>([&](auto o) { return runSubView(o); })
+      .Case<memref::ExpandShapeOp, memref::CollapseShapeOp>(
+          [&](auto o) { return runReassociativeReshape(o); })
       .Case<memref::CopyOp>([&](auto o) { return runMemRefCopy(o); })
       .Case<linalg::FillOp>([&](auto o) { return runLinalgFill(o); })
       .Case<memref::CastOp>([&](memref::CastOp o) -> LogicalResult {

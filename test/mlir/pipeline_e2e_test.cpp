@@ -1210,3 +1210,153 @@ CIM_TEST(placement_never_changes_values_with_a_weight_repeated_in_one_body) {
   checkRepeatedWeightLoopValues("repeated-weight-loop (placed)", placed,
                                 weights, acts, 4, 4);
 }
+
+//===----------------------------------------------------------------------===//
+// memref.expand_shape / memref.collapse_shape (interpreter support)
+//
+// The first, dependency-free piece of docs/roadmap.md's "chain convolution
+// layers" plan (PR A of that plan): a real MLIR-level im2col for a chained
+// convolution needs to reinterpret a chain bridge's freshly allocated
+// activation buffer between a rank-2 matmul shape and a rank-4 im2col
+// gather shape, and gather each Kh*Kw tap via a static, non-unit-stride
+// memref.subview. Neither op the reinterpretation needs
+// (memref.expand_shape/collapse_shape) was executable by this interpreter
+// before this -- confirmed by hand: `cim-opt ... | cim-run ...` on a probe
+// module failed with "operation not supported by the cim interpreter:
+// memref.expand_shape" before this test's own feature landed. Both tests
+// below were hand-verified against the real cim-opt/cim-run round trip
+// (and the exact arithmetic checked by hand) before being written down as
+// permanent regression tests.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(expand_and_collapse_shape_round_trip_computes_the_right_answer) {
+  // 2x4 -> 1x2x4 -> 2x4, then matmul -- proves the reshape is a real,
+  // value-preserving reinterpretation, not a no-op that happens to work
+  // only because nothing downstream reads the intermediate rank-3 shape.
+  const std::string source = R"mlir(
+memref.global "private" constant @w : memref<3x4xi8> = dense<[[1,2,3,4],[5,6,7,8],[9,10,11,12]]>
+memref.global "private" constant @a : memref<2x4xi8> = dense<[[1,0,1,0],[0,1,0,1]]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {
+  %w = memref.get_global @w : memref<3x4xi8>
+  %aInit = memref.get_global @a : memref<2x4xi8>
+  %a = memref.alloc() : memref<2x4xi8>
+  memref.copy %aInit, %a : memref<2x4xi8> to memref<2x4xi8>
+  %aExp = memref.expand_shape %a [[0, 1], [2]] : memref<2x4xi8> into memref<1x2x4xi8>
+  %aCol = memref.collapse_shape %aExp [[0, 1], [2]] : memref<1x2x4xi8> into memref<2x4xi8>
+  %out = memref.alloc() : memref<2x3xi32>
+  linalg.matmul_transpose_b ins(%aCol, %w : memref<2x4xi8>, memref<3x4xi8>)
+    outs(%out : memref<2x3xi32>)
+  %u = memref.cast %out : memref<2x3xi32> to memref<*xi32>
+  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+  memref.dealloc %a : memref<2x4xi8>
+  memref.dealloc %out : memref<2x3xi32>
+  return
+}
+)mlir";
+
+  std::string error;
+  RunResult result = compileSource(source, /*withPlacement=*/false, &error);
+  CIM_EXPECT(error.empty());
+  if (!error.empty())
+    return;
+  CIM_EXPECT_EQ(result.prints.size(), 1u);
+  if (result.prints.empty())
+    return;
+  // a @ w^T by hand: row0=[1,0,1,0].{w rows}=[4,12,20];
+  // row1=[0,1,0,1].{w rows}=[6,14,22].
+  const std::vector<int32_t> want = {4, 12, 20, 6, 14, 22};
+  CIM_EXPECT(result.prints.front() == want);
+}
+
+CIM_TEST(expand_shape_composes_with_a_strided_subview_tap_gather) {
+  // The exact composition a real MLIR-level im2col tap gather needs:
+  // expand_shape into a 4-D [N, H, W, C] view, a static non-unit-stride
+  // subview picking one dilated/strided tap, memref.copy into a fresh
+  // contiguous slab (real pipeline: one slab per Kh*Kw tap of the patches
+  // buffer), then collapse_shape back to 2-D for the matmul.
+  const std::string source = R"mlir(
+memref.global "private" constant @w : memref<2x2xi8> = dense<[[1,1],[1,1]]>
+memref.global "private" constant @a : memref<8x2xi8> = dense<[[1,2],[3,4],[5,6],[7,8],[9,10],[11,12],[13,14],[15,16]]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {
+  %w = memref.get_global @w : memref<2x2xi8>
+  %aInit = memref.get_global @a : memref<8x2xi8>
+  %a = memref.alloc() : memref<8x2xi8>
+  memref.copy %aInit, %a : memref<8x2xi8> to memref<8x2xi8>
+  %aExp = memref.expand_shape %a [[0, 1, 2], [3]] : memref<8x2xi8> into memref<1x4x2x2xi8>
+  %tap = memref.subview %aExp[0, 0, 0, 0] [1, 2, 2, 2] [1, 2, 1, 1]
+    : memref<1x4x2x2xi8> to memref<1x2x2x2xi8, strided<[16, 8, 2, 1]>>
+  %tapSlab = memref.alloc() : memref<1x2x2x2xi8>
+  memref.copy %tap, %tapSlab : memref<1x2x2x2xi8, strided<[16, 8, 2, 1]>> to memref<1x2x2x2xi8>
+  %tapC = memref.collapse_shape %tapSlab [[0, 1, 2], [3]] : memref<1x2x2x2xi8> into memref<4x2xi8>
+  %out = memref.alloc() : memref<4x2xi32>
+  linalg.matmul_transpose_b ins(%tapC, %w : memref<4x2xi8>, memref<2x2xi8>)
+    outs(%out : memref<4x2xi32>)
+  %u = memref.cast %out : memref<4x2xi32> to memref<*xi32>
+  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()
+  memref.dealloc %a : memref<8x2xi8>
+  memref.dealloc %tapSlab : memref<1x2x2x2xi8>
+  memref.dealloc %out : memref<4x2xi32>
+  return
+}
+)mlir";
+
+  std::string error;
+  RunResult result = compileSource(source, /*withPlacement=*/false, &error);
+  CIM_EXPECT(error.empty());
+  if (!error.empty())
+    return;
+  CIM_EXPECT_EQ(result.prints.size(), 1u);
+  if (result.prints.empty())
+    return;
+  // The tap picks source rows {0,1} and {4,5} (h=0 and h=2, stride 2 on
+  // the H axis), i.e. [[1,2],[3,4],[9,10],[11,12]]; w is all-ones, so
+  // matmul_transpose_b's output is each row's own sum, duplicated across
+  // both output columns -- checked by hand against the real interpreter
+  // before this was written down.
+  const std::vector<int32_t> want = {3, 3, 7, 7, 19, 19, 23, 23};
+  CIM_EXPECT(result.prints.front() == want);
+}
+
+CIM_TEST(expand_shape_of_a_non_contiguous_source_is_refused) {
+  // Scoped deliberately narrow: reinterpreting a genuinely strided view
+  // (here, a memref.subview's own result, offset by one row) would need
+  // real affine-map reasoning this interpreter does not do -- and refuses
+  // rather than silently mis-reading the buffer. No cim-detect/cim-partition
+  // in this test: the check under test fires purely on the interpreter's
+  // own memref bookkeeping, so there is nothing to offload.
+  const std::string source = R"mlir(
+memref.global "private" constant @a : memref<4x2xi8> = dense<[[1,2],[3,4],[5,6],[7,8]]>
+func.func private @cim_print_i32(memref<*xi32>)
+func.func @main() {
+  %aInit = memref.get_global @a : memref<4x2xi8>
+  %a = memref.alloc() : memref<4x2xi8>
+  memref.copy %aInit, %a : memref<4x2xi8> to memref<4x2xi8>
+  %sub = memref.subview %a[1, 0] [2, 2] [1, 1]
+    : memref<4x2xi8> to memref<2x2xi8, strided<[2, 1], offset: 2>>
+  %bad = memref.expand_shape %sub [[0, 1], [2]]
+    : memref<2x2xi8, strided<[2, 1], offset: 2>> into memref<1x2x2xi8, strided<[4, 2, 1], offset: 2>>
+  memref.dealloc %a : memref<4x2xi8>
+  return
+}
+)mlir";
+
+  DialectRegistry registry;
+  registry.insert<cim::CIMDialect, func::FuncDialect, memref::MemRefDialect,
+                  arith::ArithDialect, linalg::LinalgDialect,
+                  scf::SCFDialect>();
+  MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(source, &context);
+  CIM_EXPECT(static_cast<bool>(module));
+  if (!module)
+    return;
+
+  std::string captured;
+  llvm::raw_string_ostream stream(captured);
+  cim::InterpreterOptions options;
+  options.targetYAMLPath = tinyTarget();
+  options.out = &stream;
+  CIM_EXPECT(failed(cim::run(*module, "main", options)));
+}
