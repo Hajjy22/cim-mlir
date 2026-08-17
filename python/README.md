@@ -237,6 +237,47 @@ it is not a reshape of anything above), and a non-scalar `x_zero_point`/
 `y_zero_point` (per-tensor activation/output quantization is the
 near-universal convention, unlike per-channel weight scale).
 
+## A convolution feeding matmul layers
+
+A `QLinearConv` immediately followed by one or more `MatMulInteger` layers
+— a convolution stem feeding a fully-connected head, a real CNN shape —
+is imported as a chain, the first real step toward compiling a whole
+network rather than one isolated layer. This is tractable without any new
+MLIR emission: the convolution is always layer 0, so its activation is
+still the literal graph input and `im2col` still runs once in Python
+exactly as it does standalone; everything after that reuses the
+already-proven `MatMulInteger` chain bridge unchanged. Chaining a
+*second* convolution is a materially different, larger problem — the
+next layer's activation would only exist as an MLIR value once the first
+layer's compiled code actually runs, and the interpreter cannot even
+execute the index arithmetic a naive im2col loop would need — and is not
+supported by this front end.
+
+The bridge between the conv and the first matmul is `Transpose(perm=[0,
+2, 3, 1]) -> Reshape([M, Cout])`, **required in the graph, not merely
+tolerated**. This was not a design choice made for its own sake: ONNX's
+own `MatMulInteger` reference kernel does N-D numpy-broadcast matmul
+rather than requiring 2-D operands, so a graph that wires a
+`QLinearConv`'s raw `[N, Cout, OutH, OutW]` output directly into a
+`MatMulInteger` node does not error — it silently contracts whatever axes
+happen to line up (e.g. `OutW` against `Cout`, if they happen to be
+equal), a genuinely different, wrong function, confirmed by hand before
+this loader was written. The explicit `Transpose`/`Reshape` pair makes
+the `.onnx` file itself a faithful, standards-compliant statement of the
+same function this compiler emits — the `(n, oh, ow)`-row-major × `Cout`
+flatten `im2col.py`'s own patches layout already commits to.
+
+A chained convolution is narrower than a standalone one: `emit_chain_
+module`'s bridge is one unconditional scalar `cim.requantize` with
+`zero_point` hardcoded at 0, so a chained conv requires `y_zero_point ==
+0` (declared `int8`, not `uint8` — there is no caller downstream to apply
+the standalone path's documented `+128` shift before the next matmul
+reads the value), a single scalar `w_scale` (no per-channel), and no
+bias. Lifting any of these needs `emit_chain_module` itself to grow a
+per-channel/bias-aware bridge, not just the loader — not attempted here,
+on the same "don't invent capability a real model hasn't forced" basis
+the rest of this section follows.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the
@@ -373,6 +414,19 @@ else.
   path) against an independent hand-written convolution loop. Also
   validated, outside CI, against `squeezenet1.0-12-int8` (ONNX model zoo)
   itself — see `docs/roadmap.md`'s M4 entry for the exact result.
+- `test/python/test_onnx_frontend_conv_matmul_chain.py` — the
+  conv-feeding-matmuls counterpart: a single-matmul differential, a
+  two-matmul differential with a strided/padded conv and a real bridge
+  scale, a batched (N > 1) differential, an anti-vacuity check that a
+  perturbation in the matmul layer (not the conv) is actually caught, and
+  refusal tests for a missing/wrong Transpose-Reshape bridge, more than
+  one convolution, a non-zero or `uint8` conv output, a per-channel
+  `w_scale`, and a conv bias — including one case, found by mutation-
+  testing the missing-bridge refusal, where a substring match on the
+  literal word "Transpose" would have passed for the wrong reason (a
+  *different*, later check also happens to print that word while
+  describing a mislabeled node), fixed by matching the specific guard's
+  own wording instead.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 - `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid

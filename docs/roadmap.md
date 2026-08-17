@@ -1960,6 +1960,111 @@ out of scope for v0.1 across the board, not just here.
   new warnings), the full lit/ctest/pytest suite, clang-tidy (clang-18
   tree, zero findings), and cppcheck (zero findings).
 
+- **Chain a `QLinearConv` into `MatMulInteger` layers: the first real step
+  of "full CNN compilation," the multi-layer counterpart to a single
+  convolution.** Full CNN compilation splits into two genuinely
+  different-sized problems: chaining conv layers (extends the proven
+  `MatMulInteger` chain precedent) and executing non-matmul host ops
+  (MaxPool/Softmax/etc., which needs real execution semantics this
+  codebase does not have anywhere yet -- neither the interpreter nor the
+  `real-target-e2e` `mlir-opt` pass list has any linalg-lowering/
+  bufferization stage). This entry is the first, tractable half only.
+
+  Staged from a plan built on three rounds of hands-on research (three
+  parallel codebase explorations, then a design pass that hand-verified
+  its core recommendation against the real, checked-in `cim-opt`/`cim-run`
+  toolchain rather than just reading code -- see that research's own
+  finding, quoted below). Landed as the smallest real capability step:
+  the convolution is always chain layer 0, so its activation is still the
+  literal graph input and `im2col_nchw` still runs once in Python exactly
+  as it does for a standalone conv -- everything after that reuses the
+  already-proven `MatMulInteger` chain bridge (`emit_chain_module`)
+  completely unchanged. Chaining a SECOND convolution is a materially
+  larger, separate problem, not started here: the next layer's activation
+  would only exist as an MLIR value once the first layer's compiled code
+  actually runs, and `lib/Interpreter/Interpreter.cpp`'s `execute()` is a
+  closed `TypeSwitch` that cannot even execute the index arithmetic
+  (`arith.addi`/`muli`, `scf.if`) a naive loop-based im2col would need --
+  confirmed by compiling a probe module through the real binaries and
+  reading the exact failure (`error: operation not supported by the cim
+  interpreter: memref.expand_shape`). A follow-up design exists for that
+  harder half (unroll the spatial gather over `Kh*Kw` kernel taps, each
+  one static non-unit-stride `memref.subview`/`memref.copy`, no `scf.for`
+  and no arithmetic -- `memref.subview` already supports a static
+  non-unit stride generically) but is not implemented.
+
+  **A genuine correctness gap found during implementation, not anticipated
+  by the design.** The original plan assumed a `QLinearConv`'s raw ONNX
+  output could feed a `MatMulInteger` node directly, mirroring how
+  `MatMulInteger`-to-`MatMulInteger` bridges need no reshape. Confirmed by
+  hand to be wrong: ONNX's own `MatMulInteger` reference kernel does
+  N-D numpy-broadcast matmul rather than requiring 2-D operands, so a
+  graph wiring a conv's raw `[N, Cout, OutH, OutW]` output straight into a
+  `MatMulInteger` does not error -- it silently contracts whatever axes
+  happen to align (e.g. `OutW` against `Cout`, if they happen to be
+  equal), a genuinely different, wrong function, not a shape error. This
+  is precisely the "confident wrong number" failure class this project
+  refuses to ship, caught only by testing the actual `onnx.reference`
+  behavior rather than assuming ONNX semantics from the spec's prose.
+  Fixed by requiring an explicit `Transpose(perm=[0, 2, 3, 1]) ->
+  Reshape([M, Cout])` bridge in the graph -- not merely tolerated, refused
+  if absent or wrong -- making the `.onnx` file itself a faithful,
+  standards-compliant statement of the same function this compiler emits.
+  Confirmed exact by hand: the full `QLinearConv -> Transpose -> Reshape
+  -> MatMulInteger` graph's own `onnx.reference` evaluation matches the
+  conv's raw NCHW output manually transposed/reshaped and matrix-
+  multiplied, to the element.
+
+  `python/cim_frontend/onnx_import.py` gains `load_conv_matmul_chain`
+  (validates the conv, the `Transpose`/`Reshape` bridge, and any further
+  `MatMulInteger` layers via the existing `_validate_bridge`) and a
+  factored-out `_conv_geometry` helper (group/dilations/auto_pad/
+  kernel_shape/pads/strides), now shared by `load_qlinear_conv` too rather
+  than duplicated -- two copies of that validation drifting apart is
+  exactly the failure class analyze.py's own uint8-`y_zero_point`
+  regression was (this same M4 section, Phase 1 hardening entry), so one
+  copy, called from both places, instead of a second one that could go
+  stale relative to the first. `import_model`'s dispatch gains a
+  `conv_count >= 1 and matmul_count >= 1` branch (matching the standalone
+  conv branch's own `conv_count >= 1`, not `== 1` -- so a graph with too
+  many convolutions still reaches the right loader's own refusal, not a
+  wrong one via a dispatch gap that would have missed it entirely).
+
+  Deliberately narrower than a standalone conv or a standalone chain,
+  because `emit_chain_module`'s bridge is one unconditional scalar
+  `cim.requantize` with `zero_point` hardcoded at 0: a chained conv
+  requires `y_zero_point == 0` (declared `int8`, not `uint8` -- there is
+  no caller downstream of a chain to apply the standalone path's
+  documented `+128` shift before the next matmul reads the value), a
+  single scalar `w_scale` (no per-channel), and no bias. Lifting any of
+  these needs `emit_chain_module` itself to grow a per-channel/bias-aware
+  bridge, not just the loader -- not attempted here, on the same "don't
+  invent capability a real model hasn't forced" discipline this section's
+  own convolution entries have followed throughout.
+
+  Verified against the real compiled pipeline (`cim-opt`/`cim-run`, not
+  Python math alone): a single-matmul differential, a two-matmul
+  differential with a strided/padded conv and a real (non-1.0) bridge
+  scale, a batched (N > 1) differential, and an anti-vacuity check that a
+  perturbation in the MATMUL layer (not the conv) is actually caught.
+  Mutation-tested, and one of those mutations found a second, independent
+  bug -- in the TEST, not the implementation: disabling the "conv output
+  must be read by exactly one Transpose" check did not turn
+  `test_refuses_a_missing_transpose_reshape_bridge` red, because a LATER
+  check (the `perm` validation) also happens to print the literal word
+  "Transpose" in its own message while actually describing a mislabeled
+  `MatMulInteger` node -- so the test's original bare `match="Transpose"`
+  passed for the wrong reason, exactly the "a check that fails for the
+  wrong reason is still a bug" principle this project applies to its own
+  compiler elsewhere, just this time caught in the test suite itself.
+  Fixed by matching the specific guard's own wording
+  (`"not read by exactly one Transpose"`) instead of a substring any
+  nearby message could satisfy. The perm check and the `y_zero_point`
+  check were also mutation-tested against real compiled numbers, not just
+  "does the test fail": disabling either one compiles and runs cleanly --
+  no crash, no diagnostic -- and produces a completely different result
+  from `onnx.reference`, confirmed by hand for both.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

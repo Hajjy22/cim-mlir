@@ -227,6 +227,146 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     return model
 
 
+def conv_matmul_chain_model(conv_weight, x_shape, matmul_weights,
+                            x_scale=1.0, w_scale=1.0, y_scale=1.0,
+                            x_zero_point=0, x_dtype=TensorProto.INT8,
+                            strides=(1, 1), pads=(0, 0, 0, 0),
+                            dilations=(1, 1), bridge_scales=None,
+                            check=True):
+    """A QLinearConv (layer 0) feeding one or more MatMulInteger layers,
+    bridged the way cim_frontend.onnx_import.load_conv_matmul_chain reads:
+    Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]) between the conv and
+    the first matmul -- REQUIRED, not just tolerated, because ONNX's own
+    MatMulInteger reference kernel does N-D broadcast matmul rather than
+    requiring 2-D operands, so wiring the conv's raw [N, Cout, OutH, OutW]
+    output directly into a MatMulInteger would silently contract the wrong
+    axes (confirmed by hand -- see load_conv_matmul_chain's own module
+    section header) rather than erroring. Contrast with the
+    Cast/QuantizeLinear pair matmul_chain_model emits BETWEEN matmul
+    layers, still used here for every bridge after the first (QLinearConv
+    already quantizes its own output in-node, so no Cast/QuantizeLinear
+    bridge exists between the conv and the first matmul).
+
+    `conv_weight` is [Cout, Cin, Kh, Kw] (ONNX layout, as qlinear_conv_model
+    takes). `matmul_weights` is a list of [K_i, N_i] arrays (ONNX layout,
+    as matmul_chain_model takes), with K_0 == conv_weight's own Cout.
+    `bridge_scales`, if given, is a list of `len(matmul_weights) - 1`
+    floats for the bridges BETWEEN matmul layers (never between the conv
+    and the first matmul -- that bridge's scale is always derived from
+    `y_scale / (x_scale * w_scale)`, exactly as a standalone QLinearConv's
+    own `trailing_requantize` is).
+
+    Unlike qlinear_conv_model's own general y_zero_point/w_scale/bias
+    support, this fixture always uses y_zero_point=0, a scalar w_scale,
+    and no bias on the conv layer -- load_conv_matmul_chain requires
+    exactly that for a convolution chained into further layers (see its
+    own module section header).
+    """
+    conv_weight = np.asarray(conv_weight)
+    cout, cin, kh, kw = conv_weight.shape
+    n, x_cin, h, w = x_shape
+    if x_cin != cin:
+        raise ValueError(
+            f"x_shape's Cin ({x_cin}) does not match conv_weight's Cin "
+            f"({cin})")
+    matmul_weights = [np.asarray(w) for w in matmul_weights]
+    if matmul_weights[0].shape[0] != cout:
+        raise ValueError(
+            f"matmul_weights[0]'s K ({matmul_weights[0].shape[0]}) does "
+            f"not match the conv's own Cout ({cout})")
+    if bridge_scales is None:
+        bridge_scales = [1.0] * (len(matmul_weights) - 1)
+    if len(bridge_scales) != len(matmul_weights) - 1:
+        raise ValueError(
+            f"bridge_scales must have one entry per inter-matmul bridge "
+            f"(len(matmul_weights) - 1 = {len(matmul_weights) - 1}), got "
+            f"{len(bridge_scales)}")
+
+    stride_h, stride_w = strides
+    dilation_h, dilation_w = dilations
+    pad_top, pad_left, pad_bottom, pad_right = pads
+    dilated_kh = (kh - 1) * dilation_h + 1
+    dilated_kw = (kw - 1) * dilation_w + 1
+    out_h = (h + pad_top + pad_bottom - dilated_kh) // stride_h + 1
+    out_w = (w + pad_left + pad_right - dilated_kw) // stride_w + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"non-positive output size ({out_h}, {out_w}) for the given "
+            f"x_shape/conv_weight/strides/pads/dilations")
+
+    x_name = "X"
+    x_np_dtype = np.int8 if x_dtype == TensorProto.INT8 else np.uint8
+    initializers = [
+        numpy_helper.from_array(conv_weight, name="conv_W"),
+        numpy_helper.from_array(np.array(x_scale, dtype=np.float32),
+                                name="conv_xs"),
+        numpy_helper.from_array(np.array(x_zero_point, dtype=x_np_dtype),
+                                name="conv_xzp"),
+        numpy_helper.from_array(np.array(w_scale, dtype=np.float32),
+                                name="conv_ws"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8),
+                                name="conv_wzp"),
+        numpy_helper.from_array(np.array(y_scale, dtype=np.float32),
+                                name="conv_ys"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8),
+                                name="conv_yzp"),
+    ]
+    conv_node = helper.make_node(
+        "QLinearConv",
+        [x_name, "conv_xs", "conv_xzp", "conv_W", "conv_ws", "conv_wzp",
+         "conv_ys", "conv_yzp"],
+        ["conv_y"], name="conv0", strides=list(strides),
+        pads=list(pads), dilations=list(dilations))
+    transpose_node = helper.make_node(
+        "Transpose", ["conv_y"], ["conv_y_nhwc"], perm=[0, 2, 3, 1],
+        name="transpose0")
+    m = n * out_h * out_w
+    initializers.append(numpy_helper.from_array(
+        np.array([m, cout], dtype=np.int64), name="reshape0_shape"))
+    reshape_node = helper.make_node(
+        "Reshape", ["conv_y_nhwc", "reshape0_shape"], ["conv_y_flat"],
+        name="reshape0")
+
+    nodes = [conv_node, transpose_node, reshape_node]
+    cur = "conv_y_flat"
+    for i, mw in enumerate(matmul_weights):
+        w_name = f"mmW{i}"
+        y_name = f"mmY{i}"
+        initializers.append(numpy_helper.from_array(mw, name=w_name))
+        nodes.append(helper.make_node("MatMulInteger", [cur, w_name],
+                                      [y_name], name=f"mm{i}"))
+        if i < len(matmul_weights) - 1:
+            float_name, q_name = f"mmf{i}", f"mmq{i}"
+            scale_name, zp_name = f"mmscale{i}", f"mmzp{i}"
+            initializers.append(numpy_helper.from_array(
+                np.array(bridge_scales[i], dtype=np.float32),
+                name=scale_name))
+            initializers.append(numpy_helper.from_array(
+                np.array(0, dtype=np.int8), name=zp_name))
+            nodes.append(helper.make_node(
+                "Cast", [y_name], [float_name], to=TensorProto.FLOAT,
+                name=f"mmcast{i}"))
+            nodes.append(helper.make_node(
+                "QuantizeLinear", [float_name, scale_name, zp_name],
+                [q_name], name=f"mmquant{i}"))
+            cur = q_name
+
+    n_last = matmul_weights[-1].shape[1]
+    graph = helper.make_graph(
+        nodes, "conv_matmul_chain",
+        [helper.make_tensor_value_info(x_name, x_dtype, list(x_shape))],
+        [helper.make_tensor_value_info(
+            f"mmY{len(matmul_weights) - 1}", TensorProto.INT32,
+            [m, n_last])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def small_multi_layer_cnn_model(seed=0, check=True):
     """Three QLinearConv layers with two MaxPool ops between them --
     conv/pool/conv/pool/conv, loosely the early-layer shape of a real
