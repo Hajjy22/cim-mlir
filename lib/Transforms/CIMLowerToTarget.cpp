@@ -838,6 +838,28 @@ private:
       return lowerDealloc(o);
     if (auto o = dyn_cast<memref::SubViewOp>(op))
       return lowerSubview(o);
+
+    // A cim.* op with no case above is a REAL gap, not something to pass
+    // through. Everything around it gets rewritten into cimrt calls, so a
+    // survivor would be left dangling among lowered code and reach
+    // mlir-translate as an unknown dialect op -- failing far from its
+    // cause, or worse, being silently dropped by a later pass.
+    //
+    // Reached today by cim.reduce_max, which the interpreter executes but
+    // this compiled path has no lowering for yet: PR A deliberately scoped
+    // that op to cim-run. Saying so here is what keeps "the real-target
+    // path does not support this yet" a loud, located error rather than a
+    // mystery downstream. Written as a dialect check rather than a
+    // per-op list so the NEXT op added to the dialect inherits the same
+    // protection without anyone having to remember this file.
+    if (op->getDialect() == op->getContext()->getLoadedDialect<CIMDialect>())
+      return op->emitError(
+                 "cim-lower-to-target has no lowering for this op, so it "
+                 "would survive into the translated output unlowered: ")
+             << op->getName()
+             << " (the cim-run interpreter may still support it; this is "
+                "the compiled real-target path only)";
+
     // Not a cim op and not memref.dealloc/memref.subview: none of this
     // pass' concern (memref.alloc, memref.get_global, arith.constant, a
     // cim_print_* call, ...) -- left exactly as it was.

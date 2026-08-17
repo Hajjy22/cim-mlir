@@ -82,12 +82,17 @@ typedef struct cimrt_device_info {
  *   reduce_adds_issued counts every cimrt_reduce_add CALL, charged at
  *   costs.reduce_partial -- note "call", not "cim.reduce_partial op": an
  *   N-operand reduce lowers to N-1 calls, and cim-cost-report weights its
- *   own static side identically so the two can be compared directly. */
+ *   own static side identically so the two can be compared directly.
+ *   reduce_maxes_issued counts every cimrt_reduce_max CALL the same way,
+ *   charged at costs.reduce_max -- a SEPARATE entry from
+ *   costs.reduce_partial on purpose, because a compare-and-select is a
+ *   different hardware step from an add. */
 typedef struct cimrt_profile {
   uint64_t programs_issued;
   uint64_t mvms_issued;
   uint64_t requantizes_issued;
   uint64_t reduce_adds_issued;
+  uint64_t reduce_maxes_issued;
   uint64_t bytes_transferred;
   double estimated_energy_pj;
   double estimated_latency_ns;
@@ -259,6 +264,40 @@ cimrt_status cimrt_reduce_add(cimrt_device *dev, cimrt_buffer *out,
 cimrt_status cimrt_reduce_add_inplace(cimrt_device *dev, cimrt_buffer *acc,
                                        const cimrt_buffer *rhs, size_t count,
                                        uint32_t bits);
+
+/* Elementwise SIGNED maximum of two device-space buffers into a third:
+ * out[i] = max(a[i], b[i]) over `count` signed integers of `bits`-wide
+ * elements each. Same operand rules as cimrt_reduce_add above: `out` must
+ * not alias `a` or `b`, and `bits` must be a positive multiple of 8.
+ *
+ * THE COMPARISON IS SIGNED, AND THAT DISTINGUISHES IT FROM ITS SIBLING.
+ * cimrt_reduce_add can and does ignore signedness -- a wrapping add is
+ * bit-identical whether its operands are read as signed or unsigned, which
+ * is why its loop can memcpy into uint64_t and add. A maximum has no such
+ * freedom: as unsigned bytes an int8 -1 is 0xFF and would beat 5, so a max
+ * copy-pasted from that loop compiles, runs, and quietly returns -1 where
+ * ONNX MaxPool returns 5. This function therefore sign-extends both
+ * operands through the same `signExtend` helper cimrt_requantize already
+ * uses, and compares as int64_t. test/unit/cimrt_test.cpp pins it with an
+ * operand pair chosen so BOTH elements flip under the unsigned reading.
+ *
+ * cim.reduce_max's job: one kernel tap per operand, so a Kh*Kw pooling
+ * window is one op lowering to N-1 chained calls here -- the identical
+ * left-to-right fold shape cimrt_reduce_add uses, and the interpreter's
+ * runReduceMax mirrors.
+ *
+ * Counted by cimrt_profile_stop into reduce_maxes_issued, charged against
+ * costs.reduce_max (NOT costs.reduce_partial: a compare-and-select is a
+ * different hardware step from an add, and the shipped target files give
+ * the two entries deliberately different values so a miswiring shows up as
+ * a wrong number). cim-cost-report weights its static side by the same
+ * N-1, so both sides of test/mlir/cost_report_e2e_test.cpp's differential
+ * count the same events -- preserving the invariant this ABI's
+ * reduce_add note records: every op the runtime can execute is charged
+ * against the target's cost table. */
+cimrt_status cimrt_reduce_max(cimrt_device *dev, cimrt_buffer *out,
+                               const cimrt_buffer *a, const cimrt_buffer *b,
+                               size_t count, uint32_t bits);
 
 /* --- sync --- */
 cimrt_status cimrt_barrier(cimrt_device *dev);

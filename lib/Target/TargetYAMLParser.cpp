@@ -304,6 +304,11 @@ bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error) 
                   spec.costs.reducePartial.latencyNs);
   r.requireDouble("costs.reduce_partial.energy_pj",
                   spec.costs.reducePartial.energyPj);
+  // Required, on exactly the same reasoning as reduce_partial above: an
+  // N-operand cim.reduce_max lowers to N-1 real cimrt_reduce_max calls, so
+  // leaving this unset would silently cost a whole pooling window at zero.
+  r.requireDouble("costs.reduce_max.latency_ns", spec.costs.reduceMax.latencyNs);
+  r.requireDouble("costs.reduce_max.energy_pj", spec.costs.reduceMax.energyPj);
   r.optionalDouble("costs.standby_leakage_uw_per_tile",
                    spec.costs.standbyLeakageUwPerTile);
 

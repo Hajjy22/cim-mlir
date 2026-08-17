@@ -118,6 +118,15 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.reducePartialLatencyNs = static_cast<double>(counts.reduceAdds) *
                                      spec.costs.reducePartial.latencyNs;
 
+    // Charged against costs.reduce_max, NOT costs.reduce_partial above --
+    // the shipped targets give the two entries deliberately different
+    // values precisely so this distinction is visible in the numbers.
+    report.reduceMaxes = counts.reduceMaxes;
+    report.reduceMaxEnergyPj = static_cast<double>(counts.reduceMaxes) *
+                                spec.costs.reduceMax.energyPj;
+    report.reduceMaxLatencyNs = static_cast<double>(counts.reduceMaxes) *
+                                 spec.costs.reduceMax.latencyNs;
+
     // Transfers: an entire declared cost class that this report used to
     // omit silently, while costs.transfer.energy_pj_per_byte sat in every
     // shipped target file as a required field. Only the host<->device
@@ -139,10 +148,12 @@ struct CIMCostReportPass : public CIMCostReportBase<CIMCostReportPass> {
     report.totalEnergyPj = report.programEnergyPj + report.mvmEnergyPj +
                             report.requantizeEnergyPj +
                             report.reducePartialEnergyPj +
+                            report.reduceMaxEnergyPj +
                             report.transferEnergyPj;
     report.totalLatencyNs = report.programLatencyNs + report.mvmLatencyNs +
                              report.requantizeLatencyNs +
                              report.reducePartialLatencyNs +
+                             report.reduceMaxLatencyNs +
                              report.transferLatencyNs;
 
     report.installPrograms = counts.installPrograms;

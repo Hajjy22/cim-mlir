@@ -76,12 +76,29 @@ struct ReducePartialCost {
   double energyPj = 0.0;
 };
 
+// One cim.reduce_max chained compare's cost -- same fixed-per-call shape as
+// reduce_partial above, charged once per cimrt_reduce_max call an N-operand
+// cim.reduce_max lowers to (N-1 calls; see CostReportUtils.cpp).
+//
+// Modeled separately from reduce_partial, rather than folded into it,
+// because a compare-and-select is a different hardware step from an add:
+// on a digital target they are different datapath elements, and on an
+// analog one a max has no in-array realization at all. Charging a pooling
+// window against the adder's cost entry would publish a number that reads
+// as measured and is not -- the same reasoning the requantize and
+// reduce_partial entries above already record for themselves.
+struct ReduceMaxCost {
+  double latencyNs = 0.0;
+  double energyPj = 0.0;
+};
+
 struct CostModel {
   ProgramCost program;
   MvmCost mvm;
   TransferCost transfer;
   RequantizeCost requantize;
   ReducePartialCost reducePartial;
+  ReduceMaxCost reduceMax;
   double standbyLeakageUwPerTile = 0.0;
 };
 

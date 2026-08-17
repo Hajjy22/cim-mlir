@@ -319,6 +319,10 @@ int main(int argc, char **argv) {
                 spec.costs.reducePartial.latencyNs);
     std::printf("costs.reduce_partial.energy_pj=%.10g\n",
                 spec.costs.reducePartial.energyPj);
+    std::printf("costs.reduce_max.latency_ns=%.10g\n",
+                spec.costs.reduceMax.latencyNs);
+    std::printf("costs.reduce_max.energy_pj=%.10g\n",
+                spec.costs.reduceMax.energyPj);
     std::printf("costs.transfer.bandwidth_gbps=%.10g\n",
                 spec.costs.transfer.bandwidthGbps);
     std::printf("costs.transfer.energy_pj_per_byte=%.10g\n",

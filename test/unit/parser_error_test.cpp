@@ -52,6 +52,9 @@ costs:
   reduce_partial:
     latency_ns: 3
     energy_pj: 6
+  reduce_max:
+    latency_ns: 4
+    energy_pj: 9
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5

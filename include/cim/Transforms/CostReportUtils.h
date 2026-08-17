@@ -54,6 +54,13 @@ struct IRCostCounts {
   /// emitted by cim-partition, but not IR-invalid) costs zero, since it
   /// lowers to a plain forward with no add at all.
   uint64_t reduceAdds = 0;
+  /// The same weighted (numOperands - 1) count for cim.reduce_max sites,
+  /// kept separate from reduceAdds because the two are charged against
+  /// different target-file entries (costs.reduce_max vs
+  /// costs.reduce_partial -- a compare-and-select is a different hardware
+  /// step from an add; see ReduceMaxCost in include/cim/Target/TargetSpec.h).
+  /// A Kh*Kw pooling window is one op site weighted by Kh*Kw-1 calls.
+  uint64_t reduceMaxes = 0;
   /// Weighted bytes moved by cim.copy sites that actually cross the
   /// host/device boundary -- the transfers `costs.transfer` describes and
   /// the ones lowerCimCopy routes through cimrt (and so charges).

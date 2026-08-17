@@ -126,39 +126,83 @@ LogicalResult MvmOp::verify() {
 // ReducePartialOp
 //===----------------------------------------------------------------------===//
 
-LogicalResult ReducePartialOp::verify() {
-  if (getPartials().empty())
-    return emitOpError("expects at least one partial sum to reduce");
+/// The shape/element-type contract shared by every elementwise reduction in
+/// this dialect (cim.reduce_partial, cim.reduce_max): N operands that are
+/// memrefs of identical SHAPE and identical integer element type, folding
+/// into one result of that same shape and element type.
+///
+/// Deliberately says nothing about layout: operands are routinely strided
+/// views of one underlying buffer (a pooling window's Kh*Kw taps are exactly
+/// that), and the interpreter's gather/scatter walk arbitrary strides
+/// already. Only the shape has to agree.
+///
+/// One implementation called from both verifiers rather than a copy in each,
+/// on the same reasoning as _conv_geometry and _discover_conv_chain in the
+/// Python front end: two copies of one rule drift, and a verifier that has
+/// silently stopped checking what its sibling checks is exactly the kind of
+/// gap this project's tests exist to prevent. `singular`/`plural` and
+/// `elementTypeNoun` keep each op's diagnostics in its own vocabulary --
+/// cim.reduce_partial's wording is load-bearing, pinned character-for-character
+/// by test/Dialect/CIM/invalid.mlir.
+static LogicalResult verifyElementwiseReduction(Operation *op,
+                                                ValueRange operands,
+                                                Value result,
+                                                llvm::StringRef singular,
+                                                llvm::StringRef plural,
+                                                llvm::StringRef elementTypeNoun) {
+  if (operands.empty())
+    return op->emitOpError("expects at least one ") << singular << " to reduce";
 
-  // Rule 4: all operands must have identical shape, and be an integer
-  // accumulator type -- reducing i8 partial sums would defeat the point of
-  // accumulating in i32 in the first place.
-  auto firstType = llvm::dyn_cast<MemRefType>(getPartials().front().getType());
+  auto firstType = llvm::dyn_cast<MemRefType>(operands.front().getType());
   if (!firstType)
-    return emitOpError("partial sums must be memrefs");
+    return op->emitOpError() << plural << " must be memrefs";
 
-  for (Value partial : getPartials()) {
-    auto type = llvm::dyn_cast<MemRefType>(partial.getType());
+  for (Value operand : operands) {
+    auto type = llvm::dyn_cast<MemRefType>(operand.getType());
     if (!type)
-      return emitOpError("partial sums must be memrefs");
+      return op->emitOpError() << plural << " must be memrefs";
     if (type.getShape() != firstType.getShape())
-      return emitOpError("all partial sums must have identical shape");
+      return op->emitOpError("all ") << plural << " must have identical shape";
     if (type.getElementType() != firstType.getElementType())
-      return emitOpError("all partial sums must have identical element type");
+      return op->emitOpError("all ")
+             << plural << " must have identical element type";
   }
 
   if (!llvm::isa<IntegerType>(firstType.getElementType()))
-    return emitOpError("partial sums must have an integer accumulator type");
+    return op->emitOpError() << plural << " must have " << elementTypeNoun;
 
-  auto resultType = llvm::dyn_cast<MemRefType>(getResult().getType());
+  auto resultType = llvm::dyn_cast<MemRefType>(result.getType());
   if (!resultType)
-    return emitOpError("result must be a memref");
+    return op->emitOpError("result must be a memref");
   if (resultType.getShape() != firstType.getShape())
-    return emitOpError("result shape must match the partial sums");
+    return op->emitOpError("result shape must match the ") << plural;
   if (resultType.getElementType() != firstType.getElementType())
-    return emitOpError("result element type must match the partial sums");
+    return op->emitOpError("result element type must match the ") << plural;
 
   return success();
+}
+
+LogicalResult ReducePartialOp::verify() {
+  // Rule 4: all operands must have identical shape, and be an integer
+  // accumulator type -- reducing i8 partial sums would defeat the point of
+  // accumulating in i32 in the first place.
+  return verifyElementwiseReduction(*this, getPartials(), getResult(),
+                                    "partial sum", "partial sums",
+                                    "an integer accumulator type");
+}
+
+//===----------------------------------------------------------------------===//
+// ReduceMaxOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ReduceMaxOp::verify() {
+  // Same contract as ReducePartialOp above -- see verifyElementwiseReduction.
+  // "element type" rather than "accumulator type": a max neither widens nor
+  // accumulates, it selects, so an i8 window maxing to i8 is the normal case
+  // here (a MaxPool's output dtype is its input dtype), not a mistake the way
+  // an i8 partial sum would be.
+  return verifyElementwiseReduction(*this, getInputs(), getResult(), "input",
+                                    "inputs", "an integer element type");
 }
 
 //===----------------------------------------------------------------------===//

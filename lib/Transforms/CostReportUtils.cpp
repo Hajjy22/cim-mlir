@@ -95,6 +95,23 @@ mlir::cim::IRCostCounts mlir::cim::countWeightedOps(ModuleOp module) {
     counts.reduceAdds += static_cast<uint64_t>(counted->first) * addsPerFiring;
   });
 
+  module.walk([&](mlir::cim::ReduceMaxOp op) {
+    FailureOr<std::pair<int64_t, int>> counted = weightedCount(op);
+    if (failed(counted)) {
+      ++counts.unknownReduceSites;
+      return;
+    }
+    // Identical N-1 weighting to reduce_partial above, for the identical
+    // reason: a Kh*Kw pooling window is ONE op site that issues Kh*Kw-1
+    // cimrt_reduce_max calls, and the runtime counts calls. Charged into
+    // its own counter, not reduceAdds, because the two are billed against
+    // different target-file cost entries.
+    const size_t numInputs = op.getInputs().size();
+    const uint64_t maxesPerFiring =
+        numInputs > 0 ? static_cast<uint64_t>(numInputs - 1) : 0;
+    counts.reduceMaxes += static_cast<uint64_t>(counted->first) * maxesPerFiring;
+  });
+
   module.walk([&](mlir::cim::CopyOp op) {
     FailureOr<std::pair<int64_t, int>> counted = weightedCount(op);
     if (failed(counted)) {

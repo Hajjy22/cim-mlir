@@ -674,6 +674,12 @@
          -&gt; memref&lt;256xi32, #cim.space&lt;near&gt;&gt;</code></pre>
       </div>
       <div class="op">
+        <h4>cim.reduce_max</h4>
+        <p>Elementwise <em>signed</em> maximum over N same-shaped buffers — a MaxPool's kernel window, one operand per tap, folded by N−1 runtime calls exactly like <code>cim.reduce_partial</code>. Operands may be arbitrarily strided views of one buffer, so a pooling window needs no per-tap copy. The signedness is load-bearing: ONNX MaxPool on int8 gives <code>max(5, −1) = 5</code>, while a raw byte compare would give −1.</p>
+        <pre><code>%m = cim.reduce_max %t0, %t1, %t2
+     : (memref&lt;9x3xi8&gt;, memref&lt;9x3xi8&gt;, memref&lt;9x3xi8&gt;) -&gt; memref&lt;9x3xi8&gt;</code></pre>
+      </div>
+      <div class="op">
         <h4>cim.requantize</h4>
         <p>Narrows a wide accumulator back to the target's effective bits, with rounding half away from zero and a signed clamp. The arithmetic is done by the runtime, not re-emitted as IR, so there is only ever one implementation of the formula.</p>
         <pre><code>%q = cim.requantize %sum {scale = 0.00392 : f32, zero_point = 0 : i32,

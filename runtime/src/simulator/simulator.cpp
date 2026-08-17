@@ -483,6 +483,42 @@ cimrt_status cimrt_reduce_add_inplace(cimrt_device *dev, cimrt_buffer *acc,
   return CIMRT_OK;
 }
 
+cimrt_status cimrt_reduce_max(cimrt_device *dev, cimrt_buffer *out,
+                              const cimrt_buffer *a, const cimrt_buffer *b,
+                              size_t count, uint32_t bits) {
+  if (!dev || !out || !a || !b)
+    return CIMRT_ERR_INVALID_ARG;
+  if (out == a || out == b)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: out must not alias a or b.
+  const uint32_t bytes = bitsToBytes(bits);
+  if (bytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (a->data.size() != count * bytes || b->data.size() != count * bytes ||
+      out->data.size() != count * bytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  for (size_t i = 0; i < count; ++i) {
+    // SIGN-EXTEND, then compare as int64_t. This is the one line where this
+    // function must NOT follow cimrt_reduce_add's lead: that function reads
+    // both operands as raw uint64_t because a wrapping add is bit-identical
+    // either way, but a maximum is not. As unsigned bytes an int8 -1 is
+    // 0xFF and would beat 5; ONNX MaxPool on int8 compares signed and
+    // returns 5. Same helper cimrt_requantize uses, for the same reason.
+    const int64_t lhs = signExtend(a->data.data() + i * bytes, bytes);
+    const int64_t rhs = signExtend(b->data.data() + i * bytes, bytes);
+    const int64_t winner = lhs > rhs ? lhs : rhs;
+
+    // Truncating store, matching cimrt_reduce_add's own: `winner` is one of
+    // the two inputs unchanged, so it always fits `bytes` and this narrows
+    // nothing -- unlike an add, a max cannot leave its operands' range.
+    const uint64_t raw = static_cast<uint64_t>(winner);
+    std::memcpy(out->data.data() + i * bytes, &raw, bytes);
+  }
+
+  dev->cost.recordReduceMax();
+  return CIMRT_OK;
+}
+
 cimrt_status cimrt_barrier(cimrt_device *dev) {
   if (!dev)
     return CIMRT_ERR_INVALID_ARG;
@@ -512,6 +548,8 @@ cimrt_status cimrt_profile_stop(cimrt_device *dev, cimrt_profile *out) {
   out->mvms_issued = now.mvmsIssued - baseline.mvmsIssued;
   out->requantizes_issued = now.requantizesIssued - baseline.requantizesIssued;
   out->reduce_adds_issued = now.reduceAddsIssued - baseline.reduceAddsIssued;
+  out->reduce_maxes_issued =
+      now.reduceMaxesIssued - baseline.reduceMaxesIssued;
   out->bytes_transferred = now.bytesTransferred - baseline.bytesTransferred;
   out->estimated_energy_pj = now.energyPj - baseline.energyPj;
   out->estimated_latency_ns = now.latencyNs - baseline.latencyNs;

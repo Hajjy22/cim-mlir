@@ -51,6 +51,16 @@ struct CostReport {
   double reducePartialEnergyPj = 0.0;
   double reducePartialLatencyNs = 0.0;
 
+  /// Same story again for cim.reduce_max's chained cimrt_reduce_max calls
+  /// (a MaxPool's kernel window). Kept separate from reducePartialAdds
+  /// rather than summed into it because they are charged against different
+  /// target-file entries -- costs.reduce_max vs costs.reduce_partial -- so
+  /// merging them would make a pooling-heavy and an adder-heavy module
+  /// indistinguishable in the report.
+  uint64_t reduceMaxes = 0;
+  double reduceMaxEnergyPj = 0.0;
+  double reduceMaxLatencyNs = 0.0;
+
   /// Bytes moved by cim.copy sites that cross the host/device boundary,
   /// and the energy `costs.transfer.energy_pj_per_byte` charges for them.
   /// Same "only cim-cost-report can count this" story as requantizes and

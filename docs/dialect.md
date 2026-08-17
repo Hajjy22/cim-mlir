@@ -10,7 +10,7 @@ CMake target emits `Dialects/CIMDialect.md` from the `.td` sources).
 - `include/cim/Dialect/CIMDialect.td` — dialect definition, base classes
 - `include/cim/Dialect/CIMAttrs.td` — `#cim.space`, `#cim.persistence`
 - `include/cim/Dialect/CIMTypes.td` — `!cim.tile`, `!cim.resident`, `!cim.device`
-- `include/cim/Dialect/CIMOps.td` — all nine ops
+- `include/cim/Dialect/CIMOps.td` — all ten ops
 
 Until the ODS-generated docs are wired into the build output, see
 `docs/abstraction.md` for the hardware model these ops encode,

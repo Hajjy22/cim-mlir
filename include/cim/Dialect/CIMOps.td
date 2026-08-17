@@ -148,12 +148,53 @@ def CIM_MvmOp : CIM_Op<"mvm", []> {
 //===----------------------------------------------------------------------===//
 
 def CIM_ReducePartialOp : CIM_Op<"reduce_partial", []> {
-  let summary = "Sum partial MVM outputs when a logical weight matrix spans multiple tiles";
-  // TODO(spec Sec.5.3, rule 4): all operands must be identical shape and i32.
+  let summary = "Elementwise wrapping integer sum of N same-shaped buffers";
+  let description = [{
+    Named for its original and still primary use -- summing partial MVM
+    outputs when a logical weight matrix spans multiple tiles -- but the
+    op itself is a plain elementwise add over N same-shaped integer
+    memrefs, with no multi-tile assumption in either its verifier or its
+    interpreted semantics. The ONNX front end already relies on that
+    generality for a bias broadcast-add
+    (`emit.py`'s `_emit_bias_and_requantize`), which is not a partial MVM
+    output at all, and `runReducePartial`'s own device discovery has an
+    explicit fallback for that no-`cim.mvm`-producer case. The summary
+    says what it computes rather than only what first motivated it, so a
+    reader does not infer a restriction the code does not have.
+  }];
   let arguments = (ins Variadic<AnyMemRef>:$partials);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = "$partials attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1; // TODO(rule 4)
+}
+
+def CIM_ReduceMaxOp : CIM_Op<"reduce_max", []> {
+  let summary = "Elementwise SIGNED integer maximum of N same-shaped buffers";
+  let description = [{
+    The windowed max a MaxPool needs, expressed exactly the way
+    cim.reduce_partial expresses a windowed sum: N same-shaped integer
+    memrefs folded elementwise into one result. Each operand is one
+    kernel tap -- a fully static, non-unit-stride `memref.subview` of a
+    padded activation covering every output position for that tap -- so
+    a Kh*Kw pooling window is ONE op, with no loop and no index
+    arithmetic (neither of which this project's interpreter can execute).
+    Operands may be arbitrarily strided views of the same underlying
+    buffer; only their SHAPE and element type must agree, and the result
+    is always a fresh contiguous allocation.
+
+    THE COMPARISON IS SIGNED, AND THAT IS NOT A FREE CHOICE. ONNX
+    MaxPool on int8 compares signed: max(5, -1) is 5. The sibling
+    cimrt_reduce_add is deliberately sign-agnostic, because a wrapping
+    add is bit-identical whether its operands are read as signed or
+    unsigned -- so a max copy-pasted from it would compare raw bytes,
+    compile, run, and quietly return -1 instead of 5. See
+    cimrt_reduce_max, which sign-extends via the same `signExtend`
+    helper cimrt_requantize already uses.
+  }];
+  let arguments = (ins Variadic<AnyMemRef>:$inputs);
+  let results = (outs AnyMemRef:$result);
+  let assemblyFormat = "$inputs attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

@@ -70,6 +70,7 @@ struct RuntimeCounts {
   uint64_t mvms = 0;
   uint64_t requantizes = 0;
   uint64_t reduceAdds = 0;
+  uint64_t reduceMaxes = 0;
   bool found = false;
 };
 
@@ -92,6 +93,10 @@ RuntimeCounts parseRuntimeCounts(const std::string &text) {
   const size_t reduceAddsPos = text.find("reduce_adds=", pos);
   counts.reduceAdds = static_cast<uint64_t>(std::strtoull(
       text.c_str() + reduceAddsPos + std::strlen("reduce_adds="), nullptr,
+      10));
+  const size_t reduceMaxesPos = text.find("reduce_maxes=", pos);
+  counts.reduceMaxes = static_cast<uint64_t>(std::strtoull(
+      text.c_str() + reduceMaxesPos + std::strlen("reduce_maxes="), nullptr,
       10));
   return counts;
 }
@@ -249,6 +254,47 @@ func.func @main() {
 }
 )mlir";
 
+/// A matmul plus a hand-written cim.reduce_max over three STRIDED taps of
+/// one buffer -- the shape a MaxPool's kernel window compiles to. Three
+/// operands means N-1 = 2 cimrt_reduce_max calls, so this distinguishes
+/// "counted the op site" (would predict 1) from "counted the calls"
+/// (predicts 2), the same weighting reduce_partial already uses.
+///
+/// The matmul is required, not decorative: cim-partition is what emits the
+/// cim.device_open every cimrt_* call needs, and a pooling layer always
+/// follows a convolution in a real network anyway.
+const char *kMaxReduced = R"mlir(
+memref.global "private" constant @w : memref<2x2xi8> = dense<1>
+memref.global "private" constant @a : memref<1x2xi8> = dense<2>
+memref.global "private" constant @src : memref<1x6xi8> = dense<[[5, -1, 3, -128, 0, 7]]>
+func.func private @cim_print_i8(memref<*xi8>)
+func.func @main() {
+  %w = memref.get_global @w : memref<2x2xi8>
+  %aInit = memref.get_global @a : memref<1x2xi8>
+  %a = memref.alloc() : memref<1x2xi8>
+  memref.copy %aInit, %a : memref<1x2xi8> to memref<1x2xi8>
+  %out = memref.alloc() : memref<1x2xi32>
+  linalg.matmul_transpose_b ins(%a, %w : memref<1x2xi8>, memref<2x2xi8>)
+    outs(%out : memref<1x2xi32>)
+  %sInit = memref.get_global @src : memref<1x6xi8>
+  %s = memref.alloc() : memref<1x6xi8>
+  memref.copy %sInit, %s : memref<1x6xi8> to memref<1x6xi8>
+  %t0 = memref.subview %s[0, 0] [1, 2] [1, 3]
+    : memref<1x6xi8> to memref<1x2xi8, strided<[6, 3], offset: 0>>
+  %t1 = memref.subview %s[0, 1] [1, 2] [1, 3]
+    : memref<1x6xi8> to memref<1x2xi8, strided<[6, 3], offset: 1>>
+  %t2 = memref.subview %s[0, 2] [1, 2] [1, 3]
+    : memref<1x6xi8> to memref<1x2xi8, strided<[6, 3], offset: 2>>
+  %m = cim.reduce_max %t0, %t1, %t2
+    : (memref<1x2xi8, strided<[6, 3], offset: 0>>,
+       memref<1x2xi8, strided<[6, 3], offset: 1>>,
+       memref<1x2xi8, strided<[6, 3], offset: 2>>) -> memref<1x2xi8>
+  %u = memref.cast %m : memref<1x2xi8> to memref<*xi8>
+  func.call @cim_print_i8(%u) : (memref<*xi8>) -> ()
+  return
+}
+)mlir";
+
 /// One weight block, loop-invariant across 3 iterations. Without placement
 /// the single textual cim.program still fires on every runtime iteration
 /// (weight 3); with placement it is hoisted above the loop (weight 1). This
@@ -352,6 +398,12 @@ void expectDifferentialAgrees(const char *label, const std::string &source,
   // Note both sides count cimrt_reduce_add CALLS (N-1 per N-operand
   // cim.reduce_partial), not op sites -- see CostReportUtils.cpp.
   CIM_EXPECT_EQ(d.predicted.reduceAdds, d.actual.reduceAdds);
+  // And the same again for cim.reduce_max, charged against its OWN target
+  // entry (costs.reduce_max) rather than the adder's. Zero on every module
+  // in this file that has no pooling window, so each existing case doubles
+  // as a "still zero" check; cost_report_matches_runtime_on_a_max_reduced_
+  // module is what makes it nonzero on both sides.
+  CIM_EXPECT_EQ(d.predicted.reduceMaxes, d.actual.reduceMaxes);
 
   // WHY `bytes` IS NOT COMPARED HERE, THOUGH BOTH SIDES REPORT ONE
   // =============================================================
@@ -445,6 +497,26 @@ CIM_TEST(cost_report_matches_runtime_on_a_reduced_module) {
   // for free" looks like from the outside.
   expectDifferentialAgrees("two-k-tiles", kTwoKTiles, /*withPlacement=*/true);
   expectDifferentialAgrees("two-k-tiles-unplaced", kTwoKTiles,
+                           /*withPlacement=*/false);
+}
+
+CIM_TEST(cost_report_matches_runtime_on_a_max_reduced_module) {
+  // The cim.reduce_max counterpart of the reduce_partial test above, and
+  // the reason the static side had to learn about this op at all.
+  //
+  // A new cimrt_* call that records cost but has NO static counterpart is
+  // not a missing feature, it is a silent regression: the report would
+  // under-count a pooling window's whole cost while the runtime charged it,
+  // and this differential -- which asserts the two sides count the same
+  // events -- is exactly what catches that. Confirmed by mutation: deleting
+  // the ReduceMaxOp walk from CostReportUtils.cpp makes this test fail with
+  // a predicted 0 against an executed 2, the same shape of failure the
+  // reduce_partial case showed before runReducePartial started routing
+  // through cimrt.
+  //
+  // Three operands, so both sides must report 2 CALLS, not 1 op site.
+  expectDifferentialAgrees("max-reduced", kMaxReduced, /*withPlacement=*/true);
+  expectDifferentialAgrees("max-reduced-unplaced", kMaxReduced,
                            /*withPlacement=*/false);
 }
 

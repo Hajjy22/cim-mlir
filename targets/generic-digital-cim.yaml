@@ -37,6 +37,14 @@ costs:
   reduce_partial:
     latency_ns: 8         # summing two already-computed partials, not a MAC
     energy_pj: 30
+  # PLACEHOLDER, not measured: no hardware data exists for a
+  # compare-and-select datapath on any of these targets. Deliberately
+  # DIFFERENT from reduce_partial above so that charging a pooling
+  # window against the adder's entry by mistake shows up as a wrong
+  # number instead of an identical one.
+  reduce_max:
+    latency_ns: 6
+    energy_pj: 22
   transfer:
     bandwidth_gbps: 25.6
     energy_pj_per_byte: 2.1

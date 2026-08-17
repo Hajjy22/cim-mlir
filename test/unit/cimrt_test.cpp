@@ -580,6 +580,144 @@ CIM_TEST(cimrt_reduce_add_rejects_invalid_arguments) {
 }
 
 //===----------------------------------------------------------------------===//
+// reduce_max: the pooling sibling of reduce_add. Same operand rules, same
+// N-1-chained-calls shape -- but a SIGNED compare, which is the one thing
+// it must not inherit from reduce_add's deliberately sign-agnostic loop.
+//===----------------------------------------------------------------------===//
+
+CIM_TEST(cimrt_reduce_max_compares_signed_not_raw_bytes) {
+  // THE test for this op. Both operand pairs are chosen so the signed and
+  // unsigned readings disagree on EVERY element, so a byte-compare
+  // implementation cannot pass by luck on a subset:
+  //
+  //   max(5, -1)     -> signed: 5     unsigned bytes: 0x05 vs 0xFF -> -1
+  //   max(3, -128)   -> signed: 3     unsigned bytes: 0x03 vs 0x80 -> -128
+  //
+  // ONNX MaxPool on int8 gives the signed answer (verified directly against
+  // onnx.reference), which is what a pooling layer compiled through
+  // cim.reduce_max has to reproduce.
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+
+  const std::vector<int64_t> lhs = {5, 3};
+  const std::vector<int64_t> rhs = {-1, -128};
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size(), CIMRT_SPACE_NEAR, &a.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, rhs.size(), CIMRT_SPACE_NEAR, &b.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size(), CIMRT_SPACE_NEAR, &out.buf),
+                CIMRT_OK);
+  const std::vector<uint8_t> packedA = packSigned(lhs, 1);
+  const std::vector<uint8_t> packedB = packSigned(rhs, 1);
+  CIM_EXPECT_EQ(cimrt_write(a.buf, 0, packedA.data(), packedA.size()), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(b.buf, 0, packedB.data(), packedB.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(
+      cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, lhs.size(), /*bits=*/8),
+      CIMRT_OK);
+
+  std::vector<uint8_t> raw(lhs.size(), 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 1);
+  CIM_EXPECT_EQ(got[0], 5); // NOT -1
+  CIM_EXPECT_EQ(got[1], 3); // NOT -128
+}
+
+CIM_TEST(cimrt_reduce_max_supports_wider_element_widths) {
+  // Same `bits`-generic contract as reduce_add: not hardcoded to the i8 a
+  // MaxPool actually uses today.
+  Device dev;
+  const std::vector<int64_t> lhs = {100, -2147483648LL, 7};
+  const std::vector<int64_t> rhs = {-100, -1, 7};
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &a.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, rhs.size() * 4, CIMRT_SPACE_NEAR, &b.buf),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(
+      cimrt_alloc(dev.dev, lhs.size() * 4, CIMRT_SPACE_NEAR, &out.buf),
+      CIMRT_OK);
+  const std::vector<uint8_t> packedA = packSigned(lhs, 4);
+  const std::vector<uint8_t> packedB = packSigned(rhs, 4);
+  CIM_EXPECT_EQ(cimrt_write(a.buf, 0, packedA.data(), packedA.size()), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_write(b.buf, 0, packedB.data(), packedB.size()), CIMRT_OK);
+
+  CIM_EXPECT_EQ(
+      cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, lhs.size(), /*bits=*/32),
+      CIMRT_OK);
+
+  std::vector<uint8_t> raw(lhs.size() * 4, 0);
+  CIM_EXPECT_EQ(cimrt_read(out.buf, 0, raw.data(), raw.size()), CIMRT_OK);
+  const std::vector<int64_t> got = unpackSigned(raw, 4);
+  CIM_EXPECT_EQ(got[0], 100);
+  CIM_EXPECT_EQ(got[1], -1); // INT32_MIN loses to -1 under a signed compare
+  CIM_EXPECT_EQ(got[2], 7);  // ties are stable
+}
+
+CIM_TEST(cimrt_reduce_max_rejects_invalid_arguments) {
+  // Identical operand contract to cimrt_reduce_add: no nulls, no aliasing
+  // of `out` with either input, `bits` a positive multiple of 8, and sizes
+  // that match `count`.
+  Device dev;
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &a.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &b.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &out.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_reduce_max(nullptr, out.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, nullptr, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, nullptr, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, nullptr, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // out must not alias either input.
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, a.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, b.buf, a.buf, b.buf, 2, 32),
+                CIMRT_ERR_INVALID_ARG);
+  // bits must be a positive multiple of 8.
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, 2, 5),
+                CIMRT_ERR_INVALID_ARG);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, 2, 0),
+                CIMRT_ERR_INVALID_ARG);
+  // count must match the allocated sizes.
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, 4, 32),
+                CIMRT_ERR_SHAPE_MISMATCH);
+}
+
+CIM_TEST(cimrt_reduce_max_is_charged_against_its_own_cost_entry) {
+  // The invariant cimrt.h's reduce_add note records -- every op the runtime
+  // can execute is charged against the target's cost table -- extended to
+  // this op. Charged at costs.reduce_max, NOT costs.reduce_partial: the
+  // shipped targets give the two entries deliberately different values, so
+  // a miswiring to the adder's entry would show up here as a wrong number
+  // rather than an identical one.
+  Device dev;
+  CIM_EXPECT_EQ(dev.status, CIMRT_OK);
+  Buffer a, b, out;
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &a.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &b.buf), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_alloc(dev.dev, 8, CIMRT_SPACE_NEAR, &out.buf), CIMRT_OK);
+
+  CIM_EXPECT_EQ(cimrt_profile_start(dev.dev), CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, 2, 32),
+                CIMRT_OK);
+  CIM_EXPECT_EQ(cimrt_reduce_max(dev.dev, out.buf, a.buf, b.buf, 2, 32),
+                CIMRT_OK);
+  cimrt_profile prof{};
+  CIM_EXPECT_EQ(cimrt_profile_stop(dev.dev, &prof), CIMRT_OK);
+
+  CIM_EXPECT_EQ(prof.reduce_maxes_issued, 2u);
+  // Counted separately from the adder, which never fired here.
+  CIM_EXPECT_EQ(prof.reduce_adds_issued, 0u);
+  CIM_EXPECT(prof.estimated_latency_ns > 0.0);
+  CIM_EXPECT(prof.estimated_energy_pj > 0.0);
+}
+
+//===----------------------------------------------------------------------===//
 // reduce_add_inplace: the capabilities.partial_sum_in_place-gated sibling
 // of reduce_add above -- same arithmetic, folded into the first operand's
 // own storage instead of a third buffer.

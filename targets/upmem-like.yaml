@@ -35,6 +35,14 @@ costs:
   reduce_partial:
     latency_ns: 20        # summing two already-computed partials, not a MAC
     energy_pj: 60
+  # PLACEHOLDER, not measured: no hardware data exists for a
+  # compare-and-select datapath on any of these targets. Deliberately
+  # DIFFERENT from reduce_partial above so that charging a pooling
+  # window against the adder's entry by mistake shows up as a wrong
+  # number instead of an identical one.
+  reduce_max:
+    latency_ns: 16
+    energy_pj: 45
   transfer:
     bandwidth_gbps: 6.4  # DIMM-local bandwidth is the bottleneck resource
     energy_pj_per_byte: 6.8

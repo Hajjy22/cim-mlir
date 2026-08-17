@@ -31,6 +31,7 @@ public:
     uint64_t mvmsIssued = 0;
     uint64_t requantizesIssued = 0;
     uint64_t reduceAddsIssued = 0;
+    uint64_t reduceMaxesIssued = 0;
     uint64_t bytesTransferred = 0;
     double energyPj = 0.0;
     double latencyNs = 0.0;
@@ -39,9 +40,10 @@ public:
   explicit CostAccumulator(const TargetSpec &targetSpec) : spec(targetSpec) {}
 
   Snapshot snapshot() const {
-    return Snapshot{programsIssued,   mvmsIssued, requantizesIssued,
-                    reduceAddsIssued, bytesTransferred, energyPj,
-                    latencyNs};
+    return Snapshot{programsIssued,    mvmsIssued,
+                    requantizesIssued, reduceAddsIssued,
+                    reduceMaxesIssued, bytesTransferred,
+                    energyPj,          latencyNs};
   }
 
   void recordProgram() {
@@ -71,6 +73,21 @@ public:
     ++reduceAddsIssued;
     latencyNs += spec.costs.reducePartial.latencyNs;
     energyPj += spec.costs.reducePartial.energyPj;
+  }
+
+  /// One cimrt_reduce_max call -- NOT one cim.reduce_max op, on exactly the
+  /// same N-1-calls-per-N-operand reasoning as recordReduceAdd above.
+  ///
+  /// Charged against costs.reduce_max, NOT costs.reduce_partial: a
+  /// compare-and-select is a different hardware step from an add (see
+  /// ReduceMaxCost in include/cim/Target/TargetSpec.h). The shipped target
+  /// files give the two entries deliberately different values so that
+  /// charging a pooling window against the adder's entry by mistake is a
+  /// visibly wrong number rather than an invisible one.
+  void recordReduceMax() {
+    ++reduceMaxesIssued;
+    latencyNs += spec.costs.reduceMax.latencyNs;
+    energyPj += spec.costs.reduceMax.energyPj;
   }
 
   void recordTransfer(uint64_t bytes) {
@@ -107,6 +124,7 @@ public:
   uint64_t getMvmsIssued() const { return mvmsIssued; }
   uint64_t getRequantizesIssued() const { return requantizesIssued; }
   uint64_t getReduceAddsIssued() const { return reduceAddsIssued; }
+  uint64_t getReduceMaxesIssued() const { return reduceMaxesIssued; }
   uint64_t getBytesTransferred() const { return bytesTransferred; }
   double getEstimatedEnergyPj() const { return energyPj; }
   double getEstimatedLatencyNs() const { return latencyNs; }
@@ -117,6 +135,7 @@ private:
   uint64_t mvmsIssued = 0;
   uint64_t requantizesIssued = 0;
   uint64_t reduceAddsIssued = 0;
+  uint64_t reduceMaxesIssued = 0;
   uint64_t bytesTransferred = 0;
   double energyPj = 0.0;
   double latencyNs = 0.0;

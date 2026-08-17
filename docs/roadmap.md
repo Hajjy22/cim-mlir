@@ -2243,6 +2243,100 @@ out of scope for v0.1 across the board, not just here.
   convention) crashes immediately with a clear `TypeError`, not a silent
   wrong number.
 
+- **`cim.reduce_max`: the first executable non-matmul primitive (PR A of
+  the MaxPool plan).** Every capability up to here compiled layers that
+  reduce to a matmul. Executing a *host op* -- MaxPool, Relu, pooling,
+  concat -- was named out of scope in every prior planning round because
+  "the interpreter has no execution semantics for it and the pass
+  pipeline has no linalg-lowering stage." This entry closes that for the
+  windowed-maximum case, which is what a MaxPool needs.
+
+  Deliberately NOT a `linalg.generic` with an `arith.maxsi` body: the
+  interpreter has no region-body evaluator and no `arith` support beyond
+  `arith.constant`, so that route would have meant building an expression
+  interpreter. `cim.reduce_max` instead clones `cim.reduce_partial`'s
+  exact shape -- variadic, shape-and-rank-generic over same-shaped
+  integer memrefs, N operands folding to N-1 chained runtime calls -- so
+  a Kh*Kw pooling window is ONE op with no loop and no index arithmetic.
+  It passes through `cim-detect`/`cim-partition` untouched, since both
+  key only on `linalg::LinalgOp`s carrying `cim.candidate`.
+
+  **The one genuinely dangerous line, established by probe before any
+  code was written.** ONNX `MaxPool` on int8 compares SIGNED
+  (`max(5, -1) == 5`, verified directly against `onnx.reference`), but
+  the sibling `cimrt_reduce_add` is deliberately sign-*agnostic* -- a
+  wrapping add is bit-identical whether its operands are read as signed
+  or unsigned, which is why its loop memcpys into `uint64_t`. A max
+  copy-pasted from it would compare raw bytes, compile, run, and quietly
+  return -1 where ONNX returns 5. `cimrt_reduce_max` therefore
+  sign-extends through the same `signExtend` helper `cimrt_requantize`
+  already uses. Pinned by an operand pair (`[5, 3]` vs `[-1, -128]`)
+  chosen so BOTH elements flip under the unsigned reading, at the ABI
+  level and again end-to-end in `test/Run/reduce-max.mlir`;
+  mutation-tested by removing the sign extension, which turns both red.
+
+  **Two assumptions were probed, not assumed, before implementation**
+  (both held, so neither fallback was needed): `linalg.fill` with a
+  negative `i8` constant (`-128`, the pad value a MaxPool needs so
+  padding never wins the max) executes correctly through the real
+  interpreter; and a reduction accepts operands that are strided
+  `memref.subview`s of the SAME shape but DIFFERENT layouts. The second
+  is what lets a pooling window feed its taps in directly -- the
+  conv-chain path's per-tap slab-copy-and-`collapse_shape` exists only
+  because `memref.collapse_shape` requires contiguity, and a reduction's
+  `gather()` does not.
+
+  **Cost accounting was the half that a first draft of the plan missed,
+  and it is not optional.** `cimrt.h`'s own `reduce_add` note records the
+  invariant this project established in Phase 0: *every op the runtime
+  can execute is charged against the target's cost table*, with the
+  static report and the runtime profile asserted equal by
+  `test/mlir/cost_report_e2e_test.cpp`. A new cost-recording `cimrt_*`
+  call with no static counterpart is therefore a silent regression, not
+  a missing feature. So this lands with the full set: `costs.reduce_max`
+  as a REQUIRED target-file entry (all 12 shipped targets updated, with
+  a dedicated `missing_reduce_max_cost_is_rejected` parser test), a
+  `reduce_maxes_issued` profile counter, a `ReduceMaxOp` walk in
+  `CostReportUtils.cpp` weighted by the same N-1, and a new
+  `cost_report_matches_runtime_on_a_max_reduced_module` differential.
+  Mutation-tested: deleting the static walk fails that test with a
+  predicted 0 against an executed 2 -- the same signature the
+  `reduce_partial` work originally taught this project to look for.
+
+  Charged against its own `costs.reduce_max` rather than folded into
+  `costs.reduce_partial`, because a compare-and-select is a different
+  datapath element from an adder (and has no in-array realization at all
+  on an analog target). The shipped targets give the two entries
+  deliberately DIFFERENT placeholder values so that a miswiring to the
+  adder's entry shows up as a wrong number instead of an identical one;
+  each file marks them as placeholders, since no hardware measurement of
+  this step exists.
+
+  Also closes an unrelated latent gap found on the way:
+  `CIMLowerToTarget.cpp`'s `lowerOp` silently passed ANY unrecognized op
+  through, so a `cim.*` op with no lowering would have survived among
+  fully-lowered code and failed far from its cause. It now errors,
+  written as a dialect check so every future op inherits the protection
+  (`test/Transforms/cim-lower-to-target-unhandled-cim-op.mlir`).
+  `cim.reduce_max` is interpreter-only for now; the compiled real-target
+  path says so out loud rather than mystifying downstream.
+
+  **A real bug found in this project's own primary oracle, recorded so it
+  is not rediscovered.** `onnx.reference` cannot evaluate integer
+  `MaxPool` at `strides == 1` at all -- it raises `ValueError: cannot
+  convert float NaN to integer`, because
+  `onnx/reference/ops/_op_common_pool.py` pads with `np.nan` as its
+  "never wins the max" sentinel, which `np.pad` cannot place into an
+  integer array. It raises rather than returning a wrong number, so it is
+  a blocked oracle rather than a silent hazard. At `strides >= 2` --
+  including with real padding -- it works and agrees exactly with both
+  `onnxruntime` and an independent hand-written `-128`-padded NumPy
+  max-pool, which is what confirms `-128` is the right pad value. The
+  same class of oracle defect this project already documented for
+  `auto_pad=VALID`; the follow-up front-end work will refuse `strides ==
+  1` on those grounds rather than ship a capability that cannot be
+  differential-tested.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

@@ -199,6 +199,10 @@ std::string formatCostReport(const CostReport &report,
     os << "  reduce_partial total: " << report.reducePartialAdds << " adds  "
        << formatTime(report.reducePartialLatencyNs) << "  "
        << formatEnergy(report.reducePartialEnergyPj) << "\n";
+  if (report.reduceMaxes > 0)
+    os << "  reduce_max total: " << report.reduceMaxes << " maxes  "
+       << formatTime(report.reduceMaxLatencyNs) << "  "
+       << formatEnergy(report.reduceMaxEnergyPj) << "\n";
   if (report.transferBytes > 0 || report.hostToHostCopies > 0) {
     os << "  transfer total: " << report.transferBytes << " bytes  "
        << formatTime(report.transferLatencyNs) << "  "
@@ -244,6 +248,7 @@ std::string toJson(const CostReport &report, const std::string &label) {
   os << "  \"mvms\": " << report.mvms << ",\n";
   os << "  \"requantizes\": " << report.requantizes << ",\n";
   os << "  \"reduce_partial_adds\": " << report.reducePartialAdds << ",\n";
+  os << "  \"reduce_maxes\": " << report.reduceMaxes << ",\n";
   // Host<->device cim.copy traffic only. NOT comparable to cimrt_profile's
   // `bytes`, which additionally includes the weight/activation staging
   // lowerProgram and lowerMvm perform through cimrt_write with no cim.copy

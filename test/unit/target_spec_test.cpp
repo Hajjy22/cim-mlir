@@ -75,6 +75,9 @@ costs:
   reduce_partial:
     latency_ns: 3
     energy_pj: 6
+  reduce_max:
+    latency_ns: 4
+    energy_pj: 9
   transfer:
     bandwidth_gbps: 8.0
     energy_pj_per_byte: 1.5
@@ -249,6 +252,22 @@ CIM_TEST(missing_reduce_partial_cost_is_rejected) {
   std::string error;
   CIM_EXPECT(!parseText(doc, spec, &error));
   CIM_EXPECT(error.find("costs.reduce_partial") != std::string::npos);
+}
+
+CIM_TEST(missing_reduce_max_cost_is_rejected) {
+  // costs.reduce_max is required, the same as reduce_partial: an N-operand
+  // cim.reduce_max lowers to N-1 real cimrt_reduce_max calls, so leaving
+  // this unset would silently cost a whole pooling window at zero. Its own
+  // entry rather than reduce_partial's, because a compare-and-select is a
+  // different hardware step from an add (ReduceMaxCost, TargetSpec.h).
+  std::string doc = validDocument();
+  const std::string from =
+      "  reduce_max:\n    latency_ns: 4\n    energy_pj: 9\n";
+  doc.erase(doc.find(from), from.size());
+  TargetSpec spec;
+  std::string error;
+  CIM_EXPECT(!parseText(doc, spec, &error));
+  CIM_EXPECT(error.find("costs.reduce_max") != std::string::npos);
 }
 
 CIM_TEST(unknown_target_class_is_rejected) {
