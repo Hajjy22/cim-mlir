@@ -402,17 +402,17 @@ pool needs a real conv on both sides, to gather from and be gathered
 into). Composing pooling with the conv-to-matmul bridge is real,
 plausible follow-on work, not attempted here.
 
-**A module with pooling in it runs under `cim-run` today, but does not
-yet compile into a real-target binary.** `cim.reduce_max` has a compiled
-`cim-lower-to-target` lowering (`lowerReduceMax`), but that lowering
-refuses a non-contiguous operand outright rather than silently mis-staging
-it — and this front end's own pooling-window gather feeds `cim.reduce_max`
-exactly that shape (non-unit-stride `memref.subview` taps, no per-tap
-contiguous copy; see `emit_conv_chain_module`'s own `pool_params`
-docstring). Staging a strided tap as if it were contiguous would copy the
-wrong bytes rather than fail loudly — the class of bug this project
-refuses to ship — so the compiled path declines instead, with a diagnostic
-naming exactly why. See `docs/roadmap.md`'s `lowerReduceMax` entry.
+**A module with pooling in it now compiles into a real-target binary, not
+just `cim-run`.** `cim.reduce_max` has a compiled `cim-lower-to-target`
+lowering (`lowerReduceMax`) that MATERIALIZES a non-contiguous operand —
+a fresh `memref.alloc` + `memref.copy` from the strided view — rather than
+staging it directly, since `byteSizeOf`/`hostPointer` both assume a
+contiguous memref and this front end's own pooling-window gather feeds
+`cim.reduce_max` exactly the opposite (non-unit-stride `memref.subview`
+taps, no per-tap contiguous copy of its own; see
+`emit_conv_chain_module`'s own `pool_params` docstring). Verified against
+a real compiled binary, over the real 4-tap 2x2-window shape, before this
+was automated. See `docs/roadmap.md`'s `lowerReduceMax` entry.
 
 ## What it refuses, and why refusing is the point
 

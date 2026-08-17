@@ -1,0 +1,71 @@
+// Sibling of check-reduce-max.mlir.in, configured the same way (see
+// check.mlir.in's own header and test/real-target/CMakeLists.txt) into
+// reduce-max-strided-correct.mlir (EXPECTED_VALUE=40) and
+// reduce-max-strided-wrong.mlir (EXPECTED_VALUE=99).
+//
+// check-reduce-max.mlir.in proves cimrt_reduce_max's own signed-compare
+// contract for CONTIGUOUS operands. This file proves the other half:
+// lowerReduceMax's own materialization of a NON-CONTIGUOUS operand
+// (lib/Transforms/CIMLowerToTarget.cpp) -- the shape a real MaxPool's
+// pooling-window gather actually produces
+// (python/cim_frontend/emit.py's own pool_params emission feeds Kh*Kw
+// strided taps directly into cim.reduce_max, no per-tap contiguous copy
+// of its own).
+//
+// THE SHAPE IS THE REAL ONE, NOT A TOY: a padded [N=1, H=3, W=3, C=2]
+// buffer (im2col.py's own NHWC pooling-window convention) and four
+// strided [1, 1, 1, 2] taps -- the top-left 2x2 window of a 3x3 grid,
+// exactly what a kh=2, kw=2 MaxPool gathers. Values are chosen so the
+// window's own diagonal is the most negative pair in the grid, making a
+// signed max, an unsigned byte compare, and a chained add (i.e.
+// cimrt_reduce_add wired in by mistake) all disagree:
+//
+//   channel 0 window values: 10, 20, 40, -1  -> signed max = 40
+//   channel 1 window values: -50, -40, -20, -128 -> signed max = -20
+//
+// EXPECTED_VALUE=40 checks channel 0 only (element 0 of the result, after
+// collapsing back to 2-D) -- an unsigned byte compare would instead pick
+// -1's raw byte (0xFF, the largest UNSIGNED value among 10/20/40/255),
+// and a chained add would reach 10+20+40+(-1) = 69. Neither is 40.
+func.func @run_check() {
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+  %sInit = memref.get_global @src : memref<1x3x3x2xi8>
+  %s = memref.alloc() : memref<1x3x3x2xi8>
+  memref.copy %sInit, %s : memref<1x3x3x2xi8> to memref<1x3x3x2xi8>
+
+  %tap00 = memref.subview %s[0, 0, 0, 0] [1, 1, 1, 2] [1, 1, 1, 1]
+     : memref<1x3x3x2xi8> to memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 0>>
+  %tap01 = memref.subview %s[0, 0, 1, 0] [1, 1, 1, 2] [1, 1, 1, 1]
+     : memref<1x3x3x2xi8> to memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 2>>
+  %tap10 = memref.subview %s[0, 1, 0, 0] [1, 1, 1, 2] [1, 1, 1, 1]
+     : memref<1x3x3x2xi8> to memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 6>>
+  %tap11 = memref.subview %s[0, 1, 1, 0] [1, 1, 1, 2] [1, 1, 1, 1]
+     : memref<1x3x3x2xi8> to memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 8>>
+
+  // Fed DIRECTLY into cim.reduce_max, unmaterialized -- exactly what
+  // emit.py's own pool_params emission does. lowerReduceMax's own
+  // materialization (memref.alloc + memref.copy per non-contiguous
+  // operand) is entirely automatic from here; nothing in this source
+  // does it by hand, unlike the probe that verified this design before
+  // it was written into the pass.
+  %r = cim.reduce_max %tap00, %tap01, %tap10, %tap11
+     : (memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 0>>,
+        memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 2>>,
+        memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 6>>,
+        memref<1x1x1x2xi8, strided<[18, 6, 2, 1], offset: 8>>)
+       -> memref<1x1x1x2xi8>
+
+  %c0 = arith.constant 0 : index
+  %got = memref.load %r[%c0, %c0, %c0, %c0] : memref<1x1x1x2xi8>
+  %expected = arith.constant @EXPECTED_VALUE@ : i8
+  %ok = arith.cmpi eq, %got, %expected : i8
+  cf.assert %ok, "real-target e2e: cim.reduce_max over strided (materialized) operands did not match the expected value"
+  memref.dealloc %s : memref<1x3x3x2xi8>
+  memref.dealloc %r : memref<1x1x1x2xi8>
+  return
+}
+memref.global "private" constant @src : memref<1x3x3x2xi8> = dense<[[
+  [[10, -50], [20, -40], [30, -30]],
+  [[40, -20], [-1, -128], [50, -10]],
+  [[60, 0], [70, 10], [80, 20]]
+]]>

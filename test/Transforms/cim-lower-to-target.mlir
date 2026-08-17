@@ -427,28 +427,49 @@ func.func @reduce_max_needs_a_device(%p0: memref<4xi8>, %p1: memref<4xi8>) -> me
 
 // -----
 
-// THE hazard this op's own lowering exists to refuse rather than silently
-// mis-stage: a non-contiguous (non-unit-stride) memref.subview operand --
-// exactly the shape a MaxPool's own pooling-window gather produces
+// THE hazard this op's own lowering has to get right: a non-contiguous
+// (non-unit-stride) memref.subview operand -- exactly the shape a
+// MaxPool's own pooling-window gather produces
 // (python/cim_frontend/emit.py's own pool_params emission feeds Kh*Kw
 // strided taps directly into cim.reduce_max, no per-tap contiguous copy).
-// byteSizeOf/hostPointer both assume an identity layout; staging this
-// operand as though it were contiguous would silently copy the wrong
-// bytes, so it is refused instead, with a diagnostic naming exactly why.
+// byteSizeOf/hostPointer both assume an identity layout, so staging this
+// operand directly would silently copy the wrong bytes -- lowerReduceMax
+// instead MATERIALIZES it first: a fresh identity-layout memref.alloc,
+// filled by a memref.copy FROM the strided view, staged from THAT, and
+// freed immediately after (its only reader). The compiled counterpart of
+// non_identity_rank1_slice_is_materialized above, for reduce_max's own
+// operand list rather than a device-value subview consumer.
+//
 // Verified against a real compiled binary before this test was written
-// (see docs/roadmap.md's cim.reduce_max compiled-lowering entry): a
-// contiguous pair of the SAME [5, 3] vs [-1, -128] operands
-// test/Run/reduce-max.mlir pins lowers and runs correctly end to end;
-// only the strided shape is refused.
-func.func @reduce_max_refuses_a_strided_operand(%src: memref<1x4xi8>) -> memref<1x2xi8> {
+// (see docs/roadmap.md's lowerReduceMax entry): a hand-built module using
+// this EXACT alloc+copy sequence, over the real 4-tap 2x2-pooling-window
+// shape, ran through the full compiled pipeline and computed the correct
+// per-channel max.
+// CHECK-LABEL: func.func @reduce_max_materializes_a_strided_operand
+func.func @reduce_max_materializes_a_strided_operand(%src: memref<1x4xi8>) -> memref<1x2xi8> {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
   %tapA = memref.subview %src[0, 0] [1, 2] [1, 2]
      : memref<1x4xi8> to memref<1x2xi8, strided<[4, 2], offset: 0>>
   %tapB = memref.subview %src[0, 1] [1, 2] [1, 2]
      : memref<1x4xi8> to memref<1x2xi8, strided<[4, 2], offset: 1>>
-  // expected-error @+1 {{this cim.reduce_max operand is a non-contiguous}}
+  // Both taps are materialized up front (the operand-validation loop
+  // runs before any staging call), each into its own fresh buffer.
+  // CHECK: %[[MATA:.*]] = memref.alloc() : memref<1x2xi8>
+  // CHECK: memref.copy %{{.*}}, %[[MATA]] : memref<1x2xi8, strided<[4, 2]>> to memref<1x2xi8>
+  // CHECK: %[[MATB:.*]] = memref.alloc() : memref<1x2xi8>
+  // CHECK: memref.copy %{{.*}}, %[[MATB]] : memref<1x2xi8, strided<[4, 2], offset: 1>> to memref<1x2xi8>
   %m = cim.reduce_max %tapA, %tapB
      : (memref<1x2xi8, strided<[4, 2], offset: 0>>,
         memref<1x2xi8, strided<[4, 2], offset: 1>>) -> memref<1x2xi8>
+  // Each materialized buffer is written into a fresh device buffer, then
+  // freed immediately -- its bytes are already copied out by then, and it
+  // is never the surviving accumulator (that is always a device buffer).
+  // CHECK: call @cimrt_write(%[[ABUF:[0-9]+]],
+  // CHECK: memref.dealloc %[[MATA]] : memref<1x2xi8>
+  // CHECK: call @cimrt_write(%[[BBUF:[0-9]+]],
+  // CHECK: memref.dealloc %[[MATB]] : memref<1x2xi8>
+  // CHECK: call @cimrt_reduce_max(%{{[0-9]+}}, %{{[0-9]+}}, %[[ABUF]], %[[BBUF]],
+  // CHECK-NOT: error
   return %m : memref<1x2xi8>
 }
 

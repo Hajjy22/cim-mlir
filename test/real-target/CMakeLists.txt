@@ -164,6 +164,14 @@ add_real_target_object(reduce-partial-wrong check-reduce-partial.mlir.in 999)
 # unsigned byte compare, or cimrt_reduce_add wired in by mistake).
 add_real_target_object(reduce-max-correct check-reduce-max.mlir.in 5)
 add_real_target_object(reduce-max-wrong check-reduce-max.mlir.in 99)
+# cim.reduce_max over STRIDED (unmaterialized) operands -- the real
+# pooling-tap shape python/cim_frontend/emit.py actually emits, proving
+# lowerReduceMax's own materialization (not just its contiguous-operand
+# path above) end to end. See check-reduce-max-strided.mlir.in's own
+# header for why 40 (channel 0's true signed max over the 2x2 window)
+# cannot be reached by either wrong implementation.
+add_real_target_object(reduce-max-strided-correct check-reduce-max-strided.mlir.in 40)
+add_real_target_object(reduce-max-strided-wrong check-reduce-max-strided.mlir.in 99)
 # A genuine multi-K-tile linalg.matmul_transpose_b through the real
 # cim-detect/cim-partition/cim-lower-to-target chain -- see
 # check-multi-k-tile.mlir.in's own header for why 36 is the value that
@@ -215,6 +223,7 @@ add_real_target_object(digital-cim-volatile-wrong check.mlir.in 999
 foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
                 reduce-max-correct reduce-max-wrong
+                reduce-max-strided-correct reduce-max-strided-wrong
                 multi-k-tile-correct multi-k-tile-wrong
                 loop-correct loop-wrong
                 batch-correct batch-wrong
@@ -243,6 +252,11 @@ add_test(NAME real-target-e2e-reduce-partial-correct-value-passes
 # above), so this needs no WORKING_DIRECTORY either.
 add_test(NAME real-target-e2e-reduce-max-correct-value-passes
          COMMAND real-target-e2e-reduce-max-correct)
+# check-reduce-max-strided.mlir.in also hand-writes cim.device_open with
+# the absolute path substituted in directly, so this needs no
+# WORKING_DIRECTORY either.
+add_test(NAME real-target-e2e-reduce-max-strided-correct-value-passes
+         COMMAND real-target-e2e-reduce-max-strided-correct)
 # Needs WORKING_DIRECTORY, unlike every other variant here: those all
 # hand-write cim.device_open with @CIM_REAL_TARGET_YAML@ (an absolute
 # path) substituted directly into the target string. check-multi-k-tile
@@ -301,6 +315,8 @@ add_test(NAME real-target-e2e-reduce-partial-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-partial-wrong>")
 add_test(NAME real-target-e2e-reduce-max-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-max-wrong>")
+add_test(NAME real-target-e2e-reduce-max-strided-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-max-strided-wrong>")
 add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-multi-k-tile-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)

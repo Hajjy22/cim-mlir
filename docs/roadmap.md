@@ -2440,42 +2440,70 @@ out of scope for v0.1 across the board, not just here.
   confident wrong answer, not a crash, the exact failure class this
   project refuses to ship.
 
-  Rather than materialize (an automatic `memref.alloc` + `memref.copy` per
-  strided operand inside the pass), `lowerReduceMax` REFUSES a
-  non-identity-layout operand outright, with a diagnostic naming exactly
-  why (`hostPointer`'s own unit-stride assumption) and what still works
-  (the `cim-run` interpreter, whose `gather()` walks arbitrary strides
-  natively). This was the conservative branch of the plan written before
-  implementation -- refusing can never produce a wrong answer, only decline
-  to compile a shape that materialization might have handled -- and it
-  means a MaxPool-bearing module still does not compile on this real-target
-  path today; `python/README.md`'s own `MaxPool` section says so.
-
-  Verified against real compiled binaries, both directions, before this
-  was written into the test suite: a hand-built module with the exact
-  `[5, 3]` vs `[-1, -128]` pair `test/Run/reduce-max.mlir` and
-  `test/unit/cimrt_test.cpp` both pin ran through the full
+  The first working revision REFUSED a non-identity-layout operand
+  outright instead of staging it -- the conservative branch, since a
+  refusal can never produce a wrong answer, only decline to compile a
+  shape materialization might have handled. That shipped, was verified
+  (see below), and made a MaxPool-bearing module still not compile on
+  this real-target path at all. It was superseded the same day by actual
+  materialization, once the refuse-first revision had already landed and
+  the remaining risk was scoped down to one question: does staging a
+  FRESH, contiguous copy of a strided tap actually compute the right
+  answer through the real backend? Probed by hand before writing any
+  pass code, the same discipline as everywhere else in this project: a
+  module with the real 4-tap, 2x2-window shape (`[1, 3, 3, 2]` padded
+  buffer, four `[1, 1, 1, 2]` strided taps), with `memref.alloc` +
+  `memref.copy` written BY HAND ahead of each tap, ran through the full
   `cim-opt --cim-lower-to-target` -> `mlir-opt --convert-to-llvm` ->
   `mlir-translate` -> `clang` -> link -> execute chain and produced the
-  correct signed max; a deliberately wrong expected value made the same
-  chain trap (`SIGABRT`), proving the check itself has teeth; and a
-  hand-built module with genuinely strided taps was refused cleanly at
-  `cim-lower-to-target`, not miscompiled.
+  correct per-channel max. Only then was it automated: `lowerReduceMax`
+  now, for each non-identity-layout operand, emits a fresh identity-layout
+  `memref.alloc` (hoisted through `creationBuilder` like every other
+  allocation this pass makes, so a reduce_max inside a hoisted loop nest
+  still allocates once, not per iteration) and a `memref.copy` FROM the
+  strided view INTO it -- the copy itself stays at the op's own position,
+  since its source is genuinely loop-varying -- then stages and frees
+  that copy exactly as it would any other host memref. A MaxPool-bearing
+  module now compiles on this real-target path; `python/README.md`'s own
+  `MaxPool` section says so.
 
-  New `test/real-target/check-reduce-max.mlir.in`, registered as
-  `reduce-max-correct`/`reduce-max-wrong` (ctest: 20 -> 22), using the
-  same three-way-discriminating operand pair (signed max vs. an unsigned
-  byte compare vs. an add) as every other `cim.reduce_max` test in this
-  project. New structural `FileCheck` tests in
-  `test/Transforms/cim-lower-to-target.mlir`: an N=3 case pinning exactly
-  N-1 `cimrt_reduce_max` calls and NO `cimrt_reduce_add`, the missing-
-  device refusal, and the strided-operand refusal. Mutation-tested twice:
-  swapping the emitted callee to `cimrt_reduce_add` made the *correct*
-  real-target binary trap (element 0 computed `5 + (-1) = 4`, not `5`);
-  disabling the strided-layout check made the strided-refusal test fail
+  Verified against real compiled binaries, several directions, before any
+  of it was written into the test suite: the `[5, 3]` vs `[-1, -128]`
+  contiguous pair `test/Run/reduce-max.mlir` and `test/unit/cimrt_test.cpp`
+  both pin, run/trap correctly (see below); the hand-materialized strided
+  probe above, run/correct; and the SAME strided shape with materialization
+  fully automated by the pass (nothing hand-written), also run/correct --
+  proving the automation reproduces the hand-verified design exactly.
+
+  New `test/real-target/check-reduce-max.mlir.in` (contiguous operands,
+  registered `reduce-max-correct`/`reduce-max-wrong`) and
+  `check-reduce-max-strided.mlir.in` (the real, unmaterialized pooling-tap
+  shape, registered `reduce-max-strided-correct`/`-wrong`) -- ctest:
+  20 -> 24 -- using the same three-way-discriminating operand values
+  (signed max vs. an unsigned byte compare vs. an add) as every other
+  `cim.reduce_max` test in this project. New structural `FileCheck` tests
+  in `test/Transforms/cim-lower-to-target.mlir`: an N=3 case pinning
+  exactly N-1 `cimrt_reduce_max` calls and NO `cimrt_reduce_add`, the
+  missing-device refusal, and a materialization case pinning the
+  alloc-then-copy-then-write-then-free sequence for each of two strided
+  taps.
+
+  Mutation-tested three times. Swapping the emitted callee to
+  `cimrt_reduce_add` made the *correct* real-target binary trap (element 0
+  computed `5 + (-1) = 4`, not `5`). The refuse-first revision's own
+  strided-layout check, disabled, made its structural refusal test fail
   for a different, still-controlled reason (the next guard down, "needs a
-  device"), confirming the check is genuinely load-bearing. Both reverted
-  and reconfirmed green.
+  device") -- that revision and its own mutation test were both superseded
+  by materialization, not carried forward, but the finding stood: the
+  check was genuinely load-bearing. Most tellingly, once materialization
+  replaced refusal: commenting out the one line that redirects staging
+  from the original strided operand to its materialized copy (leaving the
+  copy created but unused) turned the *correct* strided real-target binary
+  into an immediate, unambiguous crash -- `free(): double free detected in
+  tcache 2` -- because the pass then tried to `memref.dealloc` a
+  `memref.subview` result (a non-owning view into a larger allocation) as
+  if it were its own fresh buffer, corrupting the allocator. Every
+  mutation reverted and reconfirmed green.
 
   `test/Transforms/cim-lower-to-target-unhandled-cim-op.mlir` -- which
   pinned `cim.reduce_max` as *the* op with no lowering at all -- was

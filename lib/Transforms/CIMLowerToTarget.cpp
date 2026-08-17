@@ -860,10 +860,11 @@ private:
     // without anyone having to remember this file or re-add a test for it
     // -- until that day, reaching this branch means a new op was added to
     // CIMOps.td without a matching case here, not a real user-facing gap.
-    // (lowerReduceMax has its OWN, narrower refusal for a specific operand
-    // SHAPE it cannot yet stage -- a non-contiguous memref.subview -- which
-    // is a different thing from having no lowering at all; see its own
-    // doc comment.)
+    // (lowerReduceMax's own strided-operand handling used to be a
+    // narrower refusal here; it now MATERIALIZES a non-contiguous operand
+    // into a fresh contiguous copy instead of refusing it -- see its own
+    // doc comment for the real-binary verification that motivated the
+    // change.)
     if (op->getDialect() == op->getContext()->getLoadedDialect<CIMDialect>())
       return op->emitError(
                  "cim-lower-to-target has no lowering for this op, so it "
@@ -1448,14 +1449,29 @@ private:
   /// `pool_params` docstring). Staging such an operand as if it were
   /// contiguous would silently copy the wrong bytes: a confident wrong
   /// answer, not a crash -- exactly the failure class this project refuses
-  /// to ship. So a non-identity-layout operand is refused here with a
-  /// located diagnostic instead, on the same "refuse rather than guess"
-  /// discipline as checkAllowedConsumers' own refusal of a non-rank-1 or
-  /// non-unit-stride memref.subview consumer of a device-space value,
-  /// below. This means a MaxPool-bearing module compiles and runs under
-  /// the cim-run interpreter (which gathers via arbitrary strides
-  /// natively) but does not yet compile on this real-target path --
-  /// docs/roadmap.md and python/README.md both say so explicitly.
+  /// to ship.
+  ///
+  /// So a non-identity-layout operand is MATERIALIZED here instead of
+  /// staged directly: a fresh, identity-layout `memref.alloc` (hoisted
+  /// through creationBuilder like every other allocation this pass makes,
+  /// so a reduce_max inside a hoisted loop nest still allocates once, not
+  /// per iteration) plus a `memref.copy` FROM the strided view INTO it --
+  /// left at the op's own position, unlike the allocation, since the
+  /// source is genuinely loop-varying. `stageForRead` then reads from
+  /// that contiguous copy exactly as it would any other host memref, and
+  /// the copy is freed immediately after (see `stageOperand` below) --
+  /// its only reader.
+  ///
+  /// Verified against a real compiled binary before being automated here,
+  /// the same discipline as everywhere else in this project: a hand-built
+  /// module with the exact 4-tap, 2x2-window shape a real MaxPool
+  /// produces (padded `1x3x3x2` buffer, four `1x1x1x2` strided taps),
+  /// with this exact alloc+copy sequence written BY HAND ahead of
+  /// `cim.reduce_max`, ran through the full `cim-opt --cim-lower-to-target`
+  /// -> `mlir-opt --convert-to-llvm` -> `mlir-translate` -> `clang` ->
+  /// link -> execute chain and computed the correct per-channel max. See
+  /// docs/roadmap.md's `lowerReduceMax` entry for the values and the
+  /// earlier, more conservative refuse-outright revision this replaced.
   LogicalResult lowerReduceMax(ReduceMaxOp op) {
     auto resultType = dyn_cast<MemRefType>(op.getResult().getType());
     if (!resultType)
@@ -1470,16 +1486,35 @@ private:
     const int64_t count = resultType.getNumElements();
     const unsigned bits = resultType.getElementTypeBitWidth();
 
+    // cim.reduce_max carries no device operand of its own in the dialect,
+    // same as cim.reduce_partial/cim.copy/cim.requantize -- "any device
+    // opened so far", see lowerCopy's comment. Checked before the operand
+    // loop below (rather than after, as lowerReducePartial's own
+    // identical check is) because materialization itself needs no device,
+    // but the "needs a device" diagnostic should still fire before any IR
+    // is emitted, matching this function's OWN structural tests.
+    if (openDevices.empty())
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_max needs a device to stage "
+          "through, but no cim.device_open has been lowered yet in this "
+          "function");
+    Value dev = openDevices.front();
+
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+
     // Raw operand access, not an ODS accessor -- see lowerReducePartial's
     // own identical comment. Every operand is validated up front, all of
-    // them, before any call is emitted, INCLUDING the contiguity check
-    // this function's own header comment explains: byteSizeOf/hostPointer
-    // both assume an identity (unit-stride, offset-0-relative) layout, so
-    // a genuinely strided operand is refused HERE, not staged and then
-    // silently mis-copied.
+    // them, before any call is emitted; a non-identity-layout one is
+    // materialized in place (see this function's own doc comment above)
+    // rather than refused, and `materialized[i]` records which entries
+    // are this pass' own scratch, for `stageOperand` below to free once
+    // consumed.
     SmallVector<Value> operands(op->getOperands().begin(),
                                 op->getOperands().end());
-    for (Value operand : operands) {
+    SmallVector<bool> materialized(operands.size(), false);
+    for (size_t i = 0; i < operands.size(); ++i) {
+      Value &operand = operands[i];
       if (operand.getType() == ptrTy)
         continue;
       auto type = dyn_cast<MemRefType>(operand.getType());
@@ -1488,30 +1523,15 @@ private:
             "cim-lower-to-target: cim.reduce_max's operands must be "
             "ranked memrefs with a static shape and a whole-byte element "
             "type");
-      if (!type.getLayout().isIdentity())
-        return op.emitError(
-            "cim-lower-to-target: this cim.reduce_max operand is a "
-            "non-contiguous (strided or offset) memref, which this pass "
-            "does not stage -- byteSizeOf/hostPointer both assume an "
-            "identity layout, and copying a strided view as if it were "
-            "contiguous would silently read the wrong bytes rather than "
-            "fail loudly. A pooling window built from strided "
-            "memref.subview taps (python/cim_frontend/emit.py's own "
-            "MaxPool gather) is therefore not yet supported on this "
-            "compiled real-target path -- the cim-run interpreter, whose "
-            "gather() walks arbitrary strides natively, still executes "
-            "it. See docs/roadmap.md's cim.reduce_max entry.");
+      if (!type.getLayout().isIdentity()) {
+        auto contigType = MemRefType::get(type.getShape(), type.getElementType());
+        auto alloc = creationBuilder(b).create<memref::AllocOp>(loc, contigType);
+        noteHoisted(alloc.getResult());
+        b.create<memref::CopyOp>(loc, operand, alloc.getResult());
+        operand = alloc.getResult();
+        materialized[i] = true;
+      }
     }
-
-    // cim.reduce_max carries no device operand of its own in the dialect,
-    // same as cim.reduce_partial/cim.copy/cim.requantize -- "any device
-    // opened so far", see lowerCopy's comment.
-    if (openDevices.empty())
-      return op.emitError(
-          "cim-lower-to-target: cim.reduce_max needs a device to stage "
-          "through, but no cim.device_open has been lowered yet in this "
-          "function");
-    Value dev = openDevices.front();
 
     // Same reasoning as lowerReducePartial's own identical block: the
     // stage space follows the RESULT's declared space, not an operand's.
@@ -1524,9 +1544,20 @@ private:
                                                             : CimrtSpace::kNear)
             : CimrtSpace::kNear;
 
-    OpBuilder b(op);
-    Location loc = op.getLoc();
     Value original = op.getResult();
+
+    // stageForRead, plus: if operand[idx] is this pass' own materialized
+    // contiguous copy, free it right after -- stageForRead's own
+    // writeBuffer has by then already copied every byte out of it
+    // synchronously, so nothing later can read it, and it is never the
+    // survived accumulator (that is always a fresh device buffer, never
+    // a materialized HOST one).
+    auto stageOperand = [&](size_t idx, bool &isScratch) -> Value {
+      Value staged = stageForRead(b, loc, dev, operands[idx], stageSpace, isScratch);
+      if (materialized[idx])
+        b.create<memref::DeallocOp>(loc, operands[idx]);
+      return staged;
+    };
 
     auto finish = [&](Value acc, bool accIsOwnScratch) -> LogicalResult {
       if (resultIsDevice) {
@@ -1553,7 +1584,7 @@ private:
       // but a hand-written module could, and forwarding the sole operand
       // is the only correct lowering.
       bool scratch = false;
-      Value only = stageForRead(b, loc, dev, operands[0], stageSpace, scratch);
+      Value only = stageOperand(0, scratch);
       return finish(only, scratch);
     }
 
@@ -1565,10 +1596,10 @@ private:
         b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
 
     bool accScratch = false;
-    Value acc = stageForRead(b, loc, dev, operands[0], stageSpace, accScratch);
+    Value acc = stageOperand(0, accScratch);
     for (size_t i = 1; i < operands.size(); ++i) {
       bool rhsScratch = false;
-      Value rhs = stageForRead(b, loc, dev, operands[i], stageSpace, rhsScratch);
+      Value rhs = stageOperand(i, rhsScratch);
       OpBuilder maxAllocB = creationBuilder(b);
       Value maxed = allocBuffer(maxAllocB, loc, dev, *bytes, stageSpace);
       noteHoisted(maxed);
