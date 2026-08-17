@@ -327,6 +327,27 @@ chained conv feeding matmul layers has: `y_zero_point == 0`, a scalar
 produced by the previous layer's own zero-point-0 bridge, and the emitted
 IR applies no zero-point shift to an intermediate activation.
 
+## A conv stem feeding matmul layers
+
+A conv chain (two or more `QLinearConv` layers, above) feeding one or more
+`MatMulInteger` layers — a real conv stem into a fully-connected head, the
+realistic full CNN shape — is imported too, built by composing the
+conv-chain machinery above with the conv-to-matmul bridge earlier in this
+document, both reused rather than reimplemented. The bridge sits in one
+place only: `Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout])` after the
+chain's own **last** conv layer, feeding the first matmul — identical to
+the single-conv case, just applied to the last layer of a longer stem
+instead of the only one.
+
+Every conv layer here — **including the last** — keeps the restriction a
+single conv feeding matmul layers has (`y_zero_point == 0`, a scalar
+`w_scale`, no bias; every layer but the first also needs `x_zero_point ==
+0`). That is narrower than a standalone conv chain's own last layer, which
+gets full generality precisely *because* it is the graph's own declared
+output there — here, no conv layer is ever the graph's own output, since
+even the last one feeds the bridge into a matmul, never the graph
+directly.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the
@@ -490,6 +511,18 @@ else.
   non-zero `y_zero_point`/per-channel `w_scale`/bias on a non-last layer,
   a non-zero `x_zero_point` on a non-first layer, a `uint8` output on a
   non-last layer, and a `Cin`/`Cout` mismatch between adjacent layers.
+- `test/python/test_onnx_frontend_conv_chain_matmul_chain.py` — the conv
+  stem-feeding-matmuls counterpart: a two-conv-layer chain feeding one
+  matmul, a combined stride/pad/dilation interior conv layer feeding two
+  matmuls with a real inter-matmul bridge scale, a batched (N > 1)
+  differential, a three-conv-layer chain feeding a matmul, two
+  anti-vacuity checks (a perturbation in an interior conv layer, and
+  separately in the matmul layer), and refusal tests for a missing
+  Transpose/Reshape bridge after the chain, a non-zero `y_zero_point`/
+  per-channel `w_scale`/bias on the LAST conv layer (unlike a standalone
+  conv chain, no conv layer here ever gets that generality), a non-zero
+  `x_zero_point` on a non-first conv layer, and a `uint8` output on the
+  last conv layer.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 - `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid

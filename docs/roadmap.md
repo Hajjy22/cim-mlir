@@ -2186,6 +2186,63 @@ out of scope for v0.1 across the board, not just here.
   layer's tail-logic wiring entirely produces IR referencing an undefined
   SSA value, a hard compile failure, not a silent wrong number.
 
+- **A conv chain feeding matmul layers (PR D, "chain convolution layers"'
+  own realistic full CNN shape).** A conv stem (two or more `QLinearConv`
+  layers, PR C) feeding one or more `MatMulInteger` layers, bridged via
+  `load_conv_matmul_chain`'s own `Transpose(perm=[0, 2, 3, 1]) ->
+  Reshape([M, Cout])` pair after the chain's own LAST conv -- the same
+  bridge PR B already requires between a single conv and its first
+  matmul, generalized here to a multi-layer conv stem rather than
+  reimplemented. Built by COMPOSING PR C's own conv-chain
+  discovery/channel-last gather with PR B's own conv-to-matmul bridge,
+  both reused verbatim.
+
+  `emit.py`'s `emit_conv_chain_module` gains an `n_conv_layers`
+  parameter: layers before it get the full gather (`expand_shape`/padded
+  buffer/`Kh*Kw` tap-subviews, unchanged from PR C); layers at or after
+  it are plain `MatMulInteger` bridges -- no gather at all, since a
+  matmul layer's activation is already the flat `[M, K]` shape a matmul
+  needs, reusing `emit_chain_module`'s own bridge-then-matmul step
+  verbatim. When the chain ends in a matmul layer (not a conv), the
+  `last_bias`/`last_trailing_requantize`/`last_per_channel_requantize`
+  parameters are forbidden (a `ValueError` if any is given) -- a
+  matmul-terminated chain always prints its own last layer's raw int32
+  accumulator directly, exactly `emit_chain_module`'s own convention,
+  since `MatMulInteger`'s own `"Y"` IS the raw accumulator, needing no
+  tail the way a conv-terminated chain's own final `QLinearConv` layer
+  does.
+
+  `onnx_import.py` gains a shared `_discover_conv_chain` helper --
+  extracted from `load_conv_chain`'s own chain-walking logic (producer/
+  consumer edges, not node-list order) so both loaders share ONE
+  implementation of "is this actually one linear chain," rather than two
+  that could silently drift apart -- and a new `load_conv_chain_matmul_
+  chain` loader: EVERY conv layer here, including the chain's own last
+  one, keeps `load_conv_matmul_chain`'s own restriction (`y_zero_point ==
+  0`, a scalar `w_scale`, no bias), because unlike `load_conv_chain`'s
+  own last layer, no conv layer here is ever the graph's own output --
+  even the last one feeds the Transpose/Reshape bridge into a matmul, not
+  the graph directly. `import_model`'s own dispatch is narrowed
+  (`load_conv_matmul_chain`'s own condition tightens from `conv_count >=
+  1` to `conv_count == 1`, now that a more specific loader exists for
+  `conv_count >= 2`) and gains a new `conv_count >= 2 and matmul_count >=
+  1` branch routing to the new loader.
+
+  Verified against the real compiled pipeline: a two-conv-layer chain
+  feeding one matmul, a combined stride/pad/dilation interior conv layer
+  feeding two matmuls with a real (non-1.0) inter-matmul bridge scale, a
+  batched (N > 1) differential, a three-conv-layer chain feeding a
+  matmul, and two anti-vacuity checks (a perturbation in an INTERIOR conv
+  layer, and separately in the matmul layer, each still caught).
+  Mutation-tested: the channel-last flatten in the NEW loader (a
+  SEPARATE code path from PR C's own, reverted to Cin-major) turns every
+  correctness test red; the "every layer restricted, including the last"
+  `x_zero_point`/`y_zero_point == 0` guards (disabled in turn) turn their
+  own dedicated refusal tests red; forcing the gather path to run for a
+  plain matmul layer (whose own `conv_params` entry is `None`, by
+  convention) crashes immediately with a clear `TypeError`, not a silent
+  wrong number.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).

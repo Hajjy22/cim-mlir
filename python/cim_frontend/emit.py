@@ -480,7 +480,7 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
 
 def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                            weight_syms=None, act_sym="a", header="",
-                           scales=None, last_bias=None,
+                           scales=None, n_conv_layers=None, last_bias=None,
                            last_trailing_requantize=None,
                            last_per_channel_requantize=None,
                            effective_bits=8):
@@ -561,21 +561,39 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     is safe, and what a real (non-1.0) one changes about which oracle to
     compare against" as emit_chain_module's own `scales` parameter.
 
+    `n_conv_layers`, if given, is the number of LEADING layers that are
+    real convolutions needing the gather machinery above (default: every
+    layer -- this function's original, PR C scope, unchanged). Layers from
+    `n_conv_layers` onward are plain `MatMulInteger` layers: no
+    expand_shape/pad/tap-gather at all, just `emit_chain_module`'s own
+    bridge-then-matmul step, since a matmul layer's activation is already
+    the flat `[M, K]` shape a matmul needs -- unlike a conv layer, whose
+    activation needs reinterpreting as a 4-D spatial view first. `M`
+    threads through every matmul-only layer unchanged, exactly
+    `emit_chain_module`'s own note. `conv_params[i]` for `i >=
+    n_conv_layers` is unused (the matmul portion needs no geometry), the
+    same "entry present but unused" convention `conv_params[0]` already
+    has. This is the "chain convolution layers" plan's PR D: a real
+    conv-stem-feeding-an-FC-head chain -- the realistic full CNN shape --
+    built by composing PR C's own conv-chain gather with PR B's own
+    conv-to-matmul bridge, both reused verbatim rather than reimplemented.
+
     `last_bias`, `last_trailing_requantize`, and `last_per_channel_
-    requantize` apply ONLY to the chain's own final layer, with exactly
+    requantize` apply ONLY when the chain's own FINAL layer is a
+    convolution (`n_conv_layers == len(weights2d)`), with exactly
     `emit_module`'s own meaning for each (see its docstring) -- via the
     shared `_emit_bias_and_requantize` helper, so the two stay a single
-    implementation. This matters because the final layer's real ONNX
-    identity is a `QLinearConv`, and unlike `MatMulInteger` (whose "Y" IS
-    the raw accumulator, which is what every earlier bridge in THIS chain
-    already prints when nothing more specific is asked for), QLinearConv's
-    own "Y" is DEFINED by the op itself as the fully quantized result --
-    bias added, then a scalar or per-channel requantize applied -- so a
-    chain that truly ends in a conv (rather than being fed on into a
-    MatMulInteger, PR B's own scope) needs this to faithfully reprint what
-    the graph itself declares as its output. Default `None` for all three
-    preserves this function's original raw-int32-final-accumulator
-    behavior exactly.
+    implementation. This matters because a conv-terminated chain's real
+    ONNX identity is a `QLinearConv`, and unlike `MatMulInteger` (whose
+    "Y" IS the raw accumulator, which is what every matmul-terminated
+    chain prints, with these three parameters forbidden -- see the
+    ValueError below), QLinearConv's own "Y" is DEFINED by the op itself
+    as the fully quantized result -- bias added, then a scalar or
+    per-channel requantize applied -- so a chain that truly ends in a conv
+    needs this to faithfully reprint what the graph itself declares as
+    its output. Default `None` for all three preserves this function's
+    original raw-int32-final-accumulator behavior exactly (for either
+    kind of final layer).
 
     Deallocation follows emit_chain_module's own established convention
     (only `%a0` and the final PRINTED buffer get an explicit
@@ -598,6 +616,26 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
         raise ValueError(
             f"conv_params must have one entry per layer (n_layers = "
             f"{n_layers}, entry 0 unused), got {len(conv_params)}")
+    if n_conv_layers is None:
+        n_conv_layers = n_layers
+    if not (1 <= n_conv_layers <= n_layers):
+        raise ValueError(
+            f"n_conv_layers must be between 1 and {n_layers} (the total "
+            f"layer count -- layer 0 is always a convolution, since its "
+            f"activation is the Python-computed patches0, not a bare "
+            f"matmul activation), got {n_conv_layers}")
+    ends_in_conv = n_conv_layers == n_layers
+    if not ends_in_conv and (last_bias is not None
+                            or last_trailing_requantize is not None
+                            or last_per_channel_requantize is not None):
+        raise ValueError(
+            "last_bias/last_trailing_requantize/last_per_channel_requantize "
+            "only apply when the chain's own final layer is a convolution "
+            "(n_conv_layers == len(weights2d)) -- a chain ending in a "
+            "plain MatMulInteger layer prints that layer's own raw int32 "
+            "accumulator directly, exactly like emit_chain_module, since "
+            "MatMulInteger's own \"Y\" IS the raw accumulator by the op's "
+            "own definition, needing no further tail.")
     if weight_syms is None:
         weight_syms = [f"w{i}" for i in range(n_layers)]
     if len(weight_syms) != n_layers:
@@ -627,11 +665,22 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             f"layer 0's weight K ({weights2d[0].shape[1]}) does not match "
             f"patches0's K ({k0})")
     for i in range(1, n_layers):
-        if weights2d[i].shape[1] != weights2d[i - 1].shape[0] * conv_params[i][0] * conv_params[i][1]:
-            raise ValueError(
-                f"layer {i}'s weight K ({weights2d[i].shape[1]}) does not "
-                f"match Kh*Kw*Cin (layer {i - 1}'s Cout={weights2d[i - 1].shape[0]}, "
-                f"layer {i}'s Kh={conv_params[i][0]}, Kw={conv_params[i][1]})")
+        if i < n_conv_layers:
+            if weights2d[i].shape[1] != weights2d[i - 1].shape[0] * conv_params[i][0] * conv_params[i][1]:
+                raise ValueError(
+                    f"layer {i}'s weight K ({weights2d[i].shape[1]}) does "
+                    f"not match Kh*Kw*Cin (layer {i - 1}'s "
+                    f"Cout={weights2d[i - 1].shape[0]}, layer {i}'s "
+                    f"Kh={conv_params[i][0]}, Kw={conv_params[i][1]})")
+        else:
+            # A plain matmul layer: K == the previous layer's own N/Cout
+            # directly, no Kh*Kw spatial expansion -- load_matmul_chain's
+            # own convention.
+            if weights2d[i].shape[1] != weights2d[i - 1].shape[0]:
+                raise ValueError(
+                    f"layer {i}'s weight K ({weights2d[i].shape[1]}) does "
+                    f"not match layer {i - 1}'s own N/Cout "
+                    f"({weights2d[i - 1].shape[0]})")
 
     # Every layer's own (M, OutH, OutW), computed once, purely from static
     # shapes/geometry -- BEFORE any MLIR text is emitted. This is needed
@@ -644,9 +693,14 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     # layer's OutH/OutW to size its subviews) reads from here rather than
     # recomputing the same formula a second time and risking the two
     # silently drifting apart.
+    # Only the CONV portion (indices 1..n_conv_layers-1) has real spatial
+    # geometry to precompute -- a plain matmul layer (index >=
+    # n_conv_layers) keeps M unchanged and has no OutH/OutW at all, so it
+    # needs no entry here (nothing downstream reads past n_conv_layers-1:
+    # see below).
     layer_shapes = [(m0, out_h, out_w)]
     ph, pw = out_h, out_w
-    for i in range(1, n_layers):
+    for i in range(1, n_conv_layers):
         (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
          pad_right, dilation_h, dilation_w) = conv_params[i]
         dilated_kh = (kh - 1) * dilation_h + 1
@@ -666,24 +720,39 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                              next_out_h, next_out_w))
         ph, pw = next_out_h, next_out_w
 
-    last_m = layer_shapes[-1][0]
-    last_cout = weights2d[-1].shape[0]
-    # _tail_allocs (the per-buffer dealloc list _emit_bias_and_requantize
-    # gives emit_module) is deliberately unused here: this function keeps
-    # its OWN leaky-by-convention discipline (see the module docstring
-    # above), not emit_module's stricter one, so only the final PRINTED
-    # buffer (`result_val`, below) gets an explicit dealloc.
-    tail_lines, _tail_allocs, bias_global, result_val, result_elem = (
-        _emit_bias_and_requantize(
-            f"%out{n_layers - 1}", last_m, last_cout, weight_syms[-1],
-            bias=last_bias,
-            per_channel_requantize=last_per_channel_requantize,
-            trailing_requantize=last_trailing_requantize,
-            effective_bits=effective_bits))
-    quantized = (last_trailing_requantize is not None
-                or last_per_channel_requantize is not None)
-    print_call = "cim_print_i8" if quantized else "cim_print_i32"
-    result_type = f"memref<{last_m}x{last_cout}x{result_elem}>"
+    if ends_in_conv:
+        last_m = layer_shapes[-1][0]
+        last_cout = weights2d[-1].shape[0]
+        # _tail_allocs (the per-buffer dealloc list _emit_bias_and_requantize
+        # gives emit_module) is deliberately unused here: this function
+        # keeps its OWN leaky-by-convention discipline (see the module
+        # docstring above), not emit_module's stricter one, so only the
+        # final PRINTED buffer (`result_val`, below) gets an explicit
+        # dealloc.
+        tail_lines, _tail_allocs, bias_global, result_val, result_elem = (
+            _emit_bias_and_requantize(
+                f"%out{n_layers - 1}", last_m, last_cout, weight_syms[-1],
+                bias=last_bias,
+                per_channel_requantize=last_per_channel_requantize,
+                trailing_requantize=last_trailing_requantize,
+                effective_bits=effective_bits))
+        quantized = (last_trailing_requantize is not None
+                    or last_per_channel_requantize is not None)
+        print_call = "cim_print_i8" if quantized else "cim_print_i32"
+        result_type = f"memref<{last_m}x{last_cout}x{result_elem}>"
+    else:
+        # A matmul-terminated chain prints its own last layer's raw int32
+        # accumulator directly -- exactly emit_chain_module's own
+        # convention -- so there is no tail to precompute, and result_val/
+        # result_type are only known once the main loop below has actually
+        # reached the final layer (its own M may have changed during the
+        # conv portion).
+        bias_global = ""
+        print_call = "cim_print_i32"
+        result_elem = "i32"
+        tail_lines = None
+        result_val = None
+        result_type = None
     unranked_type = f"memref<*x{result_elem}>"
 
     lines = [header.rstrip("\n")] if header else []
@@ -730,10 +799,19 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
         lines.append(f"    outs({out_val} : memref<{cur_m}x{cout}xi32>)")
 
         if i == n_layers - 1:
-            # Last layer: apply the same bias/requantize tail emit_module
-            # applies to its own single conv, precomputed above (needed
-            # earlier for the bias global's own module-scope placement).
-            lines += tail_lines
+            if ends_in_conv:
+                # Apply the same bias/requantize tail emit_module applies
+                # to its own single conv, precomputed above (needed
+                # earlier for the bias global's own module-scope
+                # placement).
+                lines += tail_lines
+            else:
+                # A matmul-terminated chain: this layer's own raw
+                # accumulator IS the printed result, exactly
+                # emit_chain_module's own convention -- only known now,
+                # since `cur_m` may have changed during the conv portion.
+                result_val = out_val
+                result_type = f"memref<{cur_m}x{cout}xi32>"
             break
 
         bridged = f"%act{i + 1}"
@@ -742,6 +820,15 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             f"{float(scales[i])!r} : f32, zero_point = 0 : i32, "
             f"effective_bits = 8 : i32}}")
         lines.append(f"    : memref<{cur_m}x{cout}xi32> -> memref<{cur_m}x{cout}xi8>")
+
+        if i + 1 >= n_conv_layers:
+            # A plain MatMulInteger layer: the bridged activation is
+            # already the flat [M, K] shape a matmul needs, no gather at
+            # all -- exactly emit_chain_module's own inter-matmul step.
+            # M threads through unchanged (that function's own note).
+            act_val = bridged
+            cur_k = cout
+            continue
 
         (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
          pad_right, dilation_h, dilation_w) = conv_params[i + 1]

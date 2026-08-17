@@ -1505,6 +1505,74 @@ def load_conv_matmul_chain(model):
 # ---------------------------------------------------------------------------
 
 
+def _discover_conv_chain(graph, convs):
+    """Order two or more QLinearConv nodes into a single linear chain via
+    producer/consumer edges over the WHOLE graph -- NOT node-list order,
+    which ONNX does not guarantee to be topological, let alone a chain
+    order. Shared by `load_conv_chain` (a pure conv chain, ending at the
+    graph's own output) and `load_conv_chain_matmul_chain` (a conv chain
+    feeding further `MatMulInteger` layers): the TOPOLOGY among the convs
+    themselves is identical either way -- what may legally read the
+    chain's own LAST layer is each caller's own decision, made from the
+    `consumers` map this also returns, not this helper's.
+
+    Returns `(chain, consumers)`: `chain` is the ordered list of
+    QLinearConv nodes, with `len(chain) == len(convs)` always -- fewer
+    would mean the given convs do not form one single linear chain
+    (branching, a second chain, or a disconnected node), which is raised
+    HERE as a Refusal rather than returned partially, so both callers
+    share one implementation of "is this actually one chain" instead of
+    two that could silently drift apart (the same "one copy, not two"
+    discipline `_conv_geometry`'s own factoring already follows).
+    `consumers` maps every tensor name in the graph to the list of nodes
+    that read it (built once, over every node, not just the convs) --
+    reused by the caller for its own further lookups past the chain's
+    own last layer.
+    """
+    producer = {n.output[0]: n for n in convs}
+    consumers = {}
+    for n in graph.node:
+        for inp in n.input:
+            if inp:
+                consumers.setdefault(inp, []).append(n)
+
+    starts = [n for n in convs if n.input[0] not in producer]
+    if len(starts) != 1:
+        raise Refusal(
+            f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
+            f"activation is not another {ACCEPTED_CONV_OP}'s output; a "
+            f"single linear chain has exactly one such node (its own "
+            f"first layer) -- {len(starts)} means either a disconnected "
+            f"graph or more than one chain. Nothing emitted.")
+
+    chain = [starts[0]]
+    seen_ids = {id(starts[0])}
+    current = starts[0]
+    while len(chain) < len(convs):
+        out = current.output[0]
+        readers = consumers.get(out, [])
+        conv_readers = [r for r in readers if r.op_type == ACCEPTED_CONV_OP]
+        if (len(readers) != 1 or len(conv_readers) != 1
+                or conv_readers[0].input[0] != out):
+            raise Refusal(
+                f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
+                f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
+                f"own activation ({len(readers)} total reader(s) found). "
+                f"A chain must be linear -- no branching, no extra "
+                f"consumers, no non-conv reader before its own last "
+                f"layer. Nothing emitted.")
+        nxt = conv_readers[0]
+        if id(nxt) in seen_ids:
+            raise Refusal(
+                f"the {ACCEPTED_CONV_OP} chain forms a cycle. Nothing "
+                f"emitted.")
+        chain.append(nxt)
+        seen_ids.add(id(nxt))
+        current = nxt
+
+    return chain, consumers
+
+
 def load_conv_chain(model):
     """Two or more chained QLinearConv nodes, discovered via producer/
     consumer edges (NOT node-list order -- ONNX does not guarantee a
@@ -1578,47 +1646,9 @@ def load_conv_chain(model):
             f"conv_(i+1)'s own \"X\" directly, both natively [N, C, H, W] "
             f"per the ONNX spec. Nothing emitted.")
 
-    # Chain-ordering discovery via producer/consumer edges, not node-list
-    # order.
-    producer = {n.output[0]: n for n in convs}
-    consumers = {}
-    for n in graph.node:
-        for inp in n.input:
-            if inp:
-                consumers.setdefault(inp, []).append(n)
-
-    starts = [n for n in convs if n.input[0] not in producer]
-    if len(starts) != 1:
-        raise Refusal(
-            f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
-            f"activation is not another {ACCEPTED_CONV_OP}'s output; a "
-            f"single linear chain has exactly one such node (its own "
-            f"first layer) -- {len(starts)} means either a disconnected "
-            f"graph or more than one chain. Nothing emitted.")
-
-    chain = [starts[0]]
-    seen_ids = {id(starts[0])}
-    current = starts[0]
-    while len(chain) < len(convs):
-        out = current.output[0]
-        readers = consumers.get(out, [])
-        conv_readers = [r for r in readers if r.op_type == ACCEPTED_CONV_OP]
-        if (len(readers) != 1 or len(conv_readers) != 1
-                or conv_readers[0].input[0] != out):
-            raise Refusal(
-                f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
-                f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
-                f"own activation ({len(readers)} total reader(s) found). "
-                f"A chain must be linear -- no branching, no extra "
-                f"consumers, no non-conv reader. Nothing emitted.")
-        nxt = conv_readers[0]
-        if id(nxt) in seen_ids:
-            raise Refusal(
-                f"the {ACCEPTED_CONV_OP} chain forms a cycle. Nothing "
-                f"emitted.")
-        chain.append(nxt)
-        seen_ids.add(id(nxt))
-        current = nxt
+    # `_unused_consumers`: nothing downstream of a pure conv chain's own
+    # last layer is validated except the graph output check below.
+    chain, _unused_consumers = _discover_conv_chain(graph, convs)
 
     if len(graph.output) != 1:
         raise Refusal(
@@ -1809,6 +1839,396 @@ def load_conv_chain(model):
            uint8_output_shifted, bridge_scales)
 
 
+# ---------------------------------------------------------------------------
+# A chain of two or more QLinearConv nodes feeding one or more MatMulInteger
+# layers -- PR D of the "chain convolution layers" plan: a real
+# conv-stem-feeding-an-FC-head chain, the realistic full CNN shape. Built by
+# COMPOSING load_conv_chain's own conv-chain discovery/channel-last gather
+# (PR C) with load_conv_matmul_chain's own conv-to-matmul Transpose/Reshape
+# bridge (PR B), both reused rather than reimplemented -- this function's own
+# body is a straight generalization of load_conv_matmul_chain's single-conv
+# validation loop to N >= 2 conv layers via _discover_conv_chain, plus that
+# same function's own matmul-portion loop, verbatim.
+#
+# WHY EVERY CONV LAYER HERE -- INCLUDING THE LAST -- STAYS RESTRICTED
+# =======================================================================
+# load_conv_chain's own last layer gets full generality (asymmetric output,
+# per-channel w_scale, a bias) because it IS the graph's own declared
+# output there. Here, NO conv layer is ever the graph's own output -- even
+# the chain's last conv feeds the Transpose/Reshape bridge into a matmul,
+# never the graph directly -- so every layer keeps
+# load_conv_matmul_chain's own restriction on its single conv, generalized
+# uniformly: y_zero_point == 0, a scalar w_scale, no bias. Every layer but
+# the first also needs x_zero_point == 0 (load_conv_chain's own
+# restriction, for the same reason: an intermediate activation arrives
+# already zero-centered, and the emitted IR applies no shift to it).
+# ---------------------------------------------------------------------------
+
+
+def load_conv_chain_matmul_chain(model):
+    """Two or more chained QLinearConv nodes feeding one or more
+    MatMulInteger layers via the Transpose(perm=[0, 2, 3, 1]) ->
+    Reshape([M, Cout]) bridge load_conv_matmul_chain already requires
+    between a SINGLE conv and its first matmul -- generalized here to the
+    chain's own LAST conv layer (see this section's own module header).
+
+    Returns (conv_nodes, matmul_nodes, weights2d, x_name, x_shape,
+    conv_params, x_zero_point, matmul_weights, bridge_scales) where:
+
+    - `conv_nodes`/`weights2d`/`conv_params`/`x_name`/`x_shape`/
+      `x_zero_point` are exactly load_conv_chain's own shapes (see its
+      docstring): `weights2d[0]` is Cin-major, `weights2d[i]` for i >= 1
+      is CHANNEL-LAST -- the same dangerous line, the same named/mutation
+      test precedent.
+    - `matmul_weights`/the matmul-portion of `bridge_scales` are exactly
+      load_conv_matmul_chain's own returns for its matmul portion.
+    - `bridge_scales` has `len(conv_nodes) - 1 + len(matmul_weights)`
+      entries: one per conv-to-conv bridge (PR C's own derivation, `len(
+      conv_nodes) - 1` of them), then the chain's own LAST conv layer's
+      derived scale (the conv -> first-matmul bridge, exactly
+      load_conv_matmul_chain's own `conv_scale`), then the real
+      QuantizeLinear scales between matmul layers.
+
+    Pass `weights2d`, `conv_params`, the im2col'd `patches0`/`out_shape0`
+    for layer 0, `bridge_scales`, and `n_conv_layers=len(conv_nodes)`
+    straight through to emit.emit_conv_chain_module, with `weights2d`
+    extended by `matmul_weights` (`weights2d + matmul_weights`).
+
+    Raises Refusal for anything outside this function's own scope: fewer
+    than two QLinearConv nodes (use load_conv_matmul_chain for exactly
+    one), no MatMulInteger node (use load_conv_chain instead), or
+    anything load_conv_chain/load_conv_matmul_chain would themselves
+    refuse on their own respective layers.
+    """
+    from onnx import numpy_helper
+
+    _check_opset(model)
+    graph = model.graph
+    initializers = _tensor_names(model)
+
+    convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
+    matmul_nodes = [n for n in graph.node if n.op_type == ACCEPTED_OP]
+    if len(convs) < 2:
+        raise Refusal(
+            f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); "
+            f"load_conv_chain_matmul_chain handles a chain of two or "
+            f"more feeding {ACCEPTED_OP} layers. Use "
+            f"load_conv_matmul_chain for exactly one convolution "
+            f"feeding {ACCEPTED_OP} layers instead. Nothing emitted.")
+    if not matmul_nodes:
+        raise Refusal(
+            f"no {ACCEPTED_OP} node in the graph; "
+            f"load_conv_chain_matmul_chain needs at least one, to chain "
+            f"the convolutions into. Use load_conv_chain for a "
+            f"standalone convolution chain instead. Nothing emitted.")
+
+    allowed = {ACCEPTED_CONV_OP, ACCEPTED_OP, "Cast", "QuantizeLinear",
+              "Transpose", "Reshape"}
+    others = [n for n in graph.node if n.op_type not in allowed]
+    if others:
+        kinds = sorted({n.op_type for n in others})
+        raise Refusal(
+            f"graph also contains {', '.join(kinds)}. A "
+            f"{ACCEPTED_CONV_OP} chain feeding {ACCEPTED_OP} layers may "
+            f"only be bridged, between conv layers, by nothing at all "
+            f"(conv_i's own \"Y\" feeds conv_(i+1)'s own \"X\" directly), "
+            f"between the chain's own last conv and the first matmul by "
+            f"Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]), and "
+            f"between matmul layers by Cast(to=float32) -> "
+            f"QuantizeLinear. Nothing emitted.")
+
+    chain, consumers = _discover_conv_chain(graph, convs)
+    producer = {out: n for n in graph.node for out in n.output}
+
+    x_name = None
+    x_shape = None
+    x_zero_point = 0
+    weights2d = []
+    conv_params = []
+    bridge_scales = []
+    prev_cout = None
+
+    for i, node in enumerate(chain):
+        is_first = i == 0
+        where = f"node '{node.name or ACCEPTED_CONV_OP}' (layer {i})"
+
+        if len(node.input) < 8:
+            raise Refusal(
+                f"{ACCEPTED_CONV_OP} has {len(node.input)} inputs; x, "
+                f"x_scale, x_zero_point, w, w_scale, w_zero_point, "
+                f"y_scale and y_zero_point are all mandatory per the "
+                f"ONNX spec. Nothing emitted.", where=where)
+        (x_i, x_scale_name, x_zp_name, w_name, w_scale_name, w_zp_name,
+         y_scale_name, y_zp_name) = node.input[:8]
+        bias_name = node.input[8] if len(node.input) > 8 else ""
+
+        if bias_name:
+            raise Refusal(
+                f"this node has a bias operand '{bias_name}', but no "
+                f"layer of a {ACCEPTED_CONV_OP} chain feeding "
+                f"{ACCEPTED_OP} layers may have one -- every layer's own "
+                f"bridge is emit_conv_chain_module's unconditional "
+                f"scalar cim.requantize, with no cim.reduce_partial "
+                f"step. Nothing emitted.", where=where)
+        if w_name not in initializers:
+            raise Refusal(
+                f"the weight operand '{w_name}' is not a constant "
+                f"initializer. Nothing emitted.", where=where)
+        if x_i in initializers:
+            raise Refusal(
+                f"both operands are constant initializers. Nothing "
+                f"emitted.", where=where)
+
+        w_init = next(t for t in graph.initializer if t.name == w_name)
+        weight = numpy_helper.to_array(w_init)
+        if weight.dtype != np.int8:
+            raise Refusal(
+                f"the weight operand '{w_name}' has dtype {weight.dtype}. "
+                f"Nothing emitted.", where=where)
+        if weight.ndim != 4:
+            raise Refusal(
+                f"the weight operand '{w_name}' has rank {weight.ndim}; a "
+                f"2-D convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. "
+                f"Nothing emitted.", where=where)
+        cout, cin, kh, kw = weight.shape
+
+        if not is_first and cin != prev_cout:
+            raise Refusal(
+                f"layer {i}'s weight has Cin={cin}, but layer {i - 1}'s "
+                f"weight has Cout={prev_cout} -- one conv's own output "
+                f"channel count must match the next conv's own input "
+                f"channel count. Nothing emitted.", where=where)
+
+        x_scale = _positive_scalar_scale(graph, x_scale_name, node.name,
+                                         "x_scale")
+        w_scale = _positive_weight_scale(graph, w_scale_name, node.name,
+                                         "w_scale", cout)
+        if isinstance(w_scale, np.ndarray):
+            raise Refusal(
+                f"w_scale has {w_scale.size} elements; every layer of a "
+                f"{ACCEPTED_CONV_OP} chain feeding {ACCEPTED_OP} layers "
+                f"requires a single scalar w_scale, not a per-channel "
+                f"one -- every bridge here is one unconditional "
+                f"cim.requantize, not the N-way per-channel split a "
+                f"standalone conv's own per_channel_requantize uses. "
+                f"Nothing emitted.", where=where)
+        y_scale = _positive_scalar_scale(graph, y_scale_name, node.name,
+                                         "y_scale")
+        layer_x_zp, _x_zp_dtype = _scalar_zero_point(
+            graph, x_zp_name, node.name, "x_zero_point",
+            allow_nonzero=is_first)
+        _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
+        layer_y_zp, y_zp_dtype = _scalar_zero_point(
+            graph, y_zp_name, node.name, "y_zero_point",
+            allow_nonzero=False)
+        if y_zp_dtype != np.int8:
+            raise Refusal(
+                f"y_zero_point is {y_zp_dtype}; every layer of a "
+                f"{ACCEPTED_CONV_OP} chain feeding {ACCEPTED_OP} layers "
+                f"must declare an int8 output. The standalone conv path "
+                f"can accept uint8 (load_qlinear_conv's own "
+                f"uint8_output_shifted note) because it documents a "
+                f"caller-side +128 shift on the FINAL printed result -- "
+                f"but there is no caller here to apply that shift before "
+                f"the next layer reads this value. Nothing emitted.",
+                where=where)
+
+        (dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right,
+         stride_h, stride_w) = _conv_geometry(node, weight, where)
+        conv_params.append((kh, kw, stride_h, stride_w, pad_top, pad_bottom,
+                           pad_left, pad_right, dilation_h, dilation_w))
+
+        if is_first:
+            x_info = next((v for v in graph.input if v.name == x_i), None)
+            if x_info is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' is neither a graph "
+                    f"input nor a constant. Nothing emitted.", where=where)
+            if x_info.type.tensor_type.elem_type not in (_INT8, _UINT8):
+                raise Refusal(
+                    f"the activation operand '{x_i}' is not int8 or "
+                    f"uint8. Nothing emitted.", where=where)
+            shp = _shape_of(x_info)
+            if shp is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has a symbolic or "
+                    f"unknown shape. Nothing emitted.", where=where)
+            if len(shp) != 4:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has rank {len(shp)}; "
+                    f"a 2-D convolution's input is rank 4 [N, Cin, H, W]. "
+                    f"Nothing emitted.", where=where)
+            if shp[1] != cin:
+                raise Refusal(
+                    f"activation has Cin={shp[1]} but the weight is "
+                    f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+                    where=where)
+            x_name = x_i
+            x_shape = tuple(shp)
+            x_zero_point = layer_x_zp
+            weights2d.append(
+                np.ascontiguousarray(weight.reshape(cout, cin * kh * kw)))
+        else:
+            # Channel-last: see load_conv_chain's own docstring, and
+            # emit_conv_chain_module's own -- the same dangerous line.
+            weights2d.append(np.ascontiguousarray(
+                weight.transpose(0, 2, 3, 1).reshape(cout, kh * kw * cin)))
+
+        bridge_scales.append(y_scale / (x_scale * w_scale))
+        prev_cout = cout
+
+    # Propagate N/OutH/OutW through every conv layer's own geometry --
+    # same formula as im2col_nchw's own -- needed only to validate the
+    # Reshape bridge's target shape below, not to gather any patches
+    # (layer 0's own im2col runs once the caller has a real activation
+    # array; every later layer's own gather happens in the emitted IR).
+    n_batch = x_shape[0]
+    cur_h, cur_w = x_shape[2], x_shape[3]
+    for i, params in enumerate(conv_params):
+        (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+         pad_right, dilation_h, dilation_w) = params
+        dilated_kh = (kh - 1) * dilation_h + 1
+        dilated_kw = (kw - 1) * dilation_w + 1
+        hp = cur_h + pad_top + pad_bottom
+        wp = cur_w + pad_left + pad_right
+        cur_h = (hp - dilated_kh) // stride_h + 1
+        cur_w = (wp - dilated_kw) // stride_w + 1
+        if cur_h <= 0 or cur_w <= 0:
+            raise Refusal(
+                f"layer {i}: non-positive output size ({cur_h}, {cur_w}). "
+                f"Nothing emitted.")
+    m = n_batch * cur_h * cur_w
+
+    # The chain's own last conv -> first-matmul bridge: Transpose(perm=
+    # [0, 2, 3, 1]) -> Reshape([M, Cout]) -- see load_conv_matmul_chain's
+    # own module header for why this exact pattern is required, not
+    # merely tolerated.
+    last_where = (f"node '{chain[-1].name or ACCEPTED_CONV_OP}' "
+                 f"(layer {len(chain) - 1})")
+    conv_out = chain[-1].output[0]
+    conv_readers = consumers.get(conv_out, [])
+    if len(conv_readers) != 1 or conv_readers[0].op_type != "Transpose":
+        raise Refusal(
+            f"the chain's own last layer's output is not read by exactly "
+            f"one Transpose node ({len(conv_readers)} reader(s) found). "
+            f"Nothing emitted.", where=last_where)
+    transpose_node = conv_readers[0]
+    perm_attr = next((a for a in transpose_node.attribute
+                      if a.name == "perm"), None)
+    perm = list(perm_attr.ints) if perm_attr is not None else None
+    if perm != [0, 2, 3, 1]:
+        raise Refusal(
+            f"Transpose '{transpose_node.name}' has perm={perm}; the "
+            f"conv->matmul bridge requires perm=[0, 2, 3, 1] (NCHW -> "
+            f"NHWC), matching im2col.py's own (n, oh, ow)-row-major x "
+            f"Cout flatten order. Nothing emitted.", where=last_where)
+
+    transpose_out = transpose_node.output[0]
+    transpose_readers = consumers.get(transpose_out, [])
+    if len(transpose_readers) != 1 or transpose_readers[0].op_type != "Reshape":
+        raise Refusal(
+            f"Transpose '{transpose_node.name}''s output is not read by "
+            f"exactly one Reshape node ({len(transpose_readers)} "
+            f"reader(s) found). Nothing emitted.", where=last_where)
+    reshape_node = transpose_readers[0]
+    if len(reshape_node.input) < 2:
+        raise Refusal(
+            f"Reshape '{reshape_node.name}' has no shape operand. "
+            f"Nothing emitted.", where=last_where)
+    shape_arr = _initializer_array(graph, reshape_node.input[1])
+    if shape_arr is None:
+        raise Refusal(
+            f"Reshape '{reshape_node.name}''s shape operand "
+            f"'{reshape_node.input[1]}' is not a constant initializer. "
+            f"Nothing emitted.", where=last_where)
+    target_shape = [int(v) for v in np.asarray(shape_arr).reshape(-1)]
+    if target_shape != [m, prev_cout]:
+        raise Refusal(
+            f"Reshape '{reshape_node.name}' targets {target_shape}; the "
+            f"conv->matmul bridge requires exactly [{m}, {prev_cout}] "
+            f"(M = N*OutH*OutW = {m}, Cout = {prev_cout}). A wildcard "
+            f"(-1 or 0) is not accepted -- this bridge must be an "
+            f"explicit, checkable statement of the same shape "
+            f"im2col_nchw derives, not something this loader has to "
+            f"infer. Nothing emitted.", where=last_where)
+
+    reshape_out = reshape_node.output[0]
+    reshape_readers = consumers.get(reshape_out, [])
+    if len(reshape_readers) != 1 or reshape_readers[0] is not matmul_nodes[0]:
+        raise Refusal(
+            f"Reshape '{reshape_node.name}''s output is not read by "
+            f"exactly the first {ACCEPTED_OP} layer "
+            f"({len(reshape_readers)} reader(s) found). Nothing "
+            f"emitted.", where=last_where)
+    if matmul_nodes[0].input[0] != reshape_out:
+        raise Refusal(
+            f"the first {ACCEPTED_OP} layer's activation operand is not "
+            f"Reshape '{reshape_node.name}''s own output. Nothing "
+            f"emitted.", where=last_where)
+
+    if len(graph.output) != 1:
+        raise Refusal(
+            f"graph has {len(graph.output)} outputs; a chain must end in "
+            f"exactly one. Nothing emitted.")
+    if graph.output[0].name != matmul_nodes[-1].output[0]:
+        raise Refusal(
+            f"the graph's output is not the last {ACCEPTED_OP}'s own "
+            f"output -- only a chain that ends directly at the last "
+            f"layer's int32 accumulator, with no trailing op, is "
+            f"supported. Nothing emitted.")
+
+    matmul_weights = []
+    prev_n = prev_cout
+    for i, node in enumerate(matmul_nodes):
+        where_i = f"node '{node.name or ACCEPTED_OP}' (matmul layer {i})"
+        a_name, b_name = node.input[0], node.input[1]
+
+        if b_name not in initializers:
+            raise Refusal(
+                f"the weight operand '{b_name}' is not a constant "
+                f"initializer. Nothing emitted.", where=where_i)
+        if a_name in initializers:
+            raise Refusal(
+                f"both operands are constant initializers. Nothing "
+                f"emitted.", where=where_i)
+
+        a_zp = node.input[2] if len(node.input) > 2 else ""
+        b_zp = node.input[3] if len(node.input) > 3 else ""
+        _zero_point_is_zero(model, a_zp, node.name or ACCEPTED_OP,
+                            "a_zero_point")
+        _zero_point_is_zero(model, b_zp, node.name or ACCEPTED_OP,
+                            "b_zero_point")
+
+        mm_weight = numpy_helper.to_array(
+            next(t for t in graph.initializer if t.name == b_name))
+        if mm_weight.dtype != np.int8:
+            raise Refusal(
+                f"the weight operand '{b_name}' has dtype {mm_weight.dtype}; "
+                f"cim.mvm and the simulator are signed throughout. Nothing "
+                f"emitted.", where=where_i)
+        if mm_weight.ndim != 2:
+            raise Refusal(
+                f"the weight operand '{b_name}' has rank {mm_weight.ndim}; "
+                f"cim-partition requires rank-2 operands. Nothing "
+                f"emitted.", where=where_i)
+        if mm_weight.shape[0] != prev_n:
+            raise Refusal(
+                f"layer {i}'s K ({mm_weight.shape[0]}) does not match the "
+                f"previous layer's N ({prev_n}). Nothing emitted.",
+                where=where_i)
+
+        if i > 0:
+            bridge_scales.append(_validate_bridge(
+                graph, producer, consumers, matmul_nodes[i - 1].output[0],
+                a_name, where_i))
+
+        matmul_weights.append(np.ascontiguousarray(mm_weight.T))
+        prev_n = mm_weight.shape[1]
+
+    return (chain, matmul_nodes, weights2d, x_name, x_shape, conv_params,
+           x_zero_point, matmul_weights, bridge_scales)
+
+
 def _validate_conv_activation(activation, x_shape, x_zero_point=0):
     """The supplied activation must be exactly `x_shape` ([N, Cin, H, W]).
 
@@ -1890,11 +2310,13 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     """An ONNX model plus an activation vector -> MLIR text.
 
     Dispatches on how many MatMulInteger and QLinearConv nodes the graph
-    has. One or more QLinearConv AND one or more MatMulInteger nodes goes
-    through load_conv_matmul_chain, which itself refuses anything but
-    exactly one QLinearConv (the conv is always layer 0 -- a SECOND
-    convolution feeding further MatMulInteger layers is out of scope for
-    both loaders; see load_conv_matmul_chain's own module section header).
+    has. Exactly one QLinearConv AND one or more MatMulInteger nodes goes
+    through load_conv_matmul_chain (the conv is layer 0). Two or more
+    QLinearConv AND one or more MatMulInteger nodes goes through
+    load_conv_chain_matmul_chain -- a real conv-stem-feeding-an-FC-head
+    chain, PR D of the "chain convolution layers" plan, built by composing
+    load_conv_chain's own conv-chain machinery with load_conv_matmul_
+    chain's own conv-to-matmul bridge (see its own module section header).
     Zero MatMulInteger nodes and two or more QLinearConv nodes goes
     through load_conv_chain (a real, direct conv-to-conv chain -- see its
     own module section header for why it needs no bridge node the way
@@ -1903,10 +2325,10 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     (standalone). Two or more MatMulInteger nodes and no QLinearConv go
     through load_matmul_chain; exactly one of either goes through the
     single-layer paths (load_matmul_integer, load_qlinear_conv). Anything
-    else -- more than one QLinearConv, or stray Cast/QuantizeLinear nodes
-    around a single MatMulInteger -- is refused by the relevant loader's
-    own "graph also contains ..." check, which already says the right
-    thing for that case.
+    else -- stray Cast/QuantizeLinear nodes around a single MatMulInteger,
+    for instance -- is refused by the relevant loader's own "graph also
+    contains ..." check, which already says the right thing for that
+    case.
     """
     from onnx import TensorProto  # noqa: F401 (documents op_type below)
 
@@ -1915,7 +2337,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     conv_count = sum(1 for n in model.graph.node
                      if n.op_type == ACCEPTED_CONV_OP)
 
-    if conv_count >= 1 and matmul_count >= 1:
+    if conv_count == 1 and matmul_count >= 1:
         (conv_node, matmul_nodes, weight2d, x_name, x_shape, conv_params,
          x_zero_point, matmul_weights, bridge_scales) = (
             load_conv_matmul_chain(model))
@@ -1942,6 +2364,43 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
         return emit_chain_module(
             [weight2d] + matmul_weights, patches, weight_syms=weight_syms,
             act_sym=act_sym, header=header, scales=bridge_scales)
+
+    if conv_count >= 2 and matmul_count >= 1:
+        (conv_nodes, matmul_nodes, weights2d, x_name, x_shape, conv_params,
+         x_zero_point, matmul_weights, bridge_scales) = (
+            load_conv_chain_matmul_chain(model))
+        activation = _validate_conv_activation(activation, x_shape,
+                                               x_zero_point)
+
+        patches0, out_shape0 = im2col_nchw(activation, *conv_params[0])
+        n_batch, out_h, out_w = out_shape0
+
+        taken = set()
+        weight_syms = [sanitize_symbol(n.input[3], taken) for n in conv_nodes]
+        weight_syms += [sanitize_symbol(n.input[1], taken)
+                        for n in matmul_nodes]
+        act_sym = sanitize_symbol(x_name, taken)
+
+        header = provenance(model_path, model_bytes, activation_source)
+        header += (
+            f"//   conv im2col (layer 0): N={n_batch} OutH={out_h} "
+            f"OutW={out_w} -- the whole chain's printed output rows stay "
+            f"in (n, oh, ow) row-major order (emit_conv_chain_module "
+            f"threads M through every layer, exactly like "
+            f"emit_chain_module), reshape to [N, OutH, OutW, Cout] then "
+            f"transpose(0, 3, 1, 2) for ONNX's own [N, Cout, OutH, OutW] "
+            f"layout.\n")
+        # emit_conv_chain_module expects one conv_params entry per TOTAL
+        # layer (conv and matmul alike -- see its own n_conv_layers
+        # docstring); the matmul layers' own entries are unused, so
+        # padded with None rather than load_conv_chain_matmul_chain
+        # inventing placeholder geometry that means nothing.
+        conv_params_padded = list(conv_params) + [None] * len(matmul_weights)
+        return emit_conv_chain_module(
+            weights2d + matmul_weights, conv_params_padded, patches0,
+            out_shape0, weight_syms=weight_syms, act_sym=act_sym,
+            header=header, scales=bridge_scales,
+            n_conv_layers=len(conv_nodes))
 
     if matmul_count == 0 and conv_count >= 2:
         (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
