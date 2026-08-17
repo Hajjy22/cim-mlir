@@ -779,7 +779,7 @@ private:
   LogicalResult checkAllowedConsumers(Value deviceValue) {
     for (Operation *user : deviceValue.getUsers()) {
       if (isa<ProgramOp, MvmOp, CopyOp, RequantizeOp, ReducePartialOp,
-              memref::DeallocOp>(user))
+              ReduceMaxOp, memref::DeallocOp>(user))
         continue;
       if (auto view = dyn_cast<memref::SubViewOp>(user)) {
         if (isIdentitySubview(view))
@@ -832,6 +832,8 @@ private:
       return lowerBarrier(o);
     if (auto o = dyn_cast<ReducePartialOp>(op))
       return lowerReducePartial(o);
+    if (auto o = dyn_cast<ReduceMaxOp>(op))
+      return lowerReduceMax(o);
     if (auto o = dyn_cast<RequantizeOp>(op))
       return lowerRequantize(o);
     if (auto o = dyn_cast<memref::DeallocOp>(op))
@@ -845,13 +847,23 @@ private:
     // mlir-translate as an unknown dialect op -- failing far from its
     // cause, or worse, being silently dropped by a later pass.
     //
-    // Reached today by cim.reduce_max, which the interpreter executes but
-    // this compiled path has no lowering for yet: PR A deliberately scoped
-    // that op to cim-run. Saying so here is what keeps "the real-target
-    // path does not support this yet" a loud, located error rather than a
-    // mystery downstream. Written as a dialect check rather than a
-    // per-op list so the NEXT op added to the dialect inherits the same
-    // protection without anyone having to remember this file.
+    // Every op in the dialect has a dispatch case above as of
+    // cim.reduce_max's own lowerReduceMax (this file), which was the last
+    // one missing (PR A had deliberately scoped it to cim-run only; see
+    // that op's own doc comment in CIMOps.td). This fallthrough is
+    // therefore UNEXERCISED BY CONSTRUCTION today -- test/Transforms/
+    // cim-lower-to-target-unhandled-cim-op.mlir, which used to pin exactly
+    // this path via cim.reduce_max, was deleted for that reason (see
+    // docs/roadmap.md's cim.reduce_max compiled-lowering entry). It stays
+    // written as a dialect check rather than a per-op list precisely so
+    // the NEXT op added to the dialect inherits the same protection
+    // without anyone having to remember this file or re-add a test for it
+    // -- until that day, reaching this branch means a new op was added to
+    // CIMOps.td without a matching case here, not a real user-facing gap.
+    // (lowerReduceMax has its OWN, narrower refusal for a specific operand
+    // SHAPE it cannot yet stage -- a non-contiguous memref.subview -- which
+    // is a different thing from having no lowering at all; see its own
+    // doc comment.)
     if (op->getDialect() == op->getContext()->getLoadedDialect<CIMDialect>())
       return op->emitError(
                  "cim-lower-to-target has no lowering for this op, so it "
@@ -1402,6 +1414,174 @@ private:
       if (rhsScratch)
         freeBuffer(b, loc, rhs);
       acc = sum;
+      accScratch = true; // every accumulator from here on is our own scratch
+    }
+    return finish(acc, /*accIsOwnScratch=*/true);
+  }
+
+  /// cim.reduce_max's compiled lowering: cimrt_reduce_max (spec-adjacent to
+  /// cim.reduce_partial above -- see this file's header point 2 and
+  /// runtime/include/cimrt.h's own cimrt_reduce_max doc comment) -- an
+  /// N-operand reduce becomes N-1 chained pairwise SIGNED maxes, matching
+  /// Interpreter.cpp's runReduceMax's own left-to-right fold.
+  ///
+  /// Deliberately just lowerReducePartial's out-of-place branch with
+  /// cimrt_reduce_max substituted for cimrt_reduce_add -- there is no
+  /// in-place counterpart here (no cimrt_reduce_max_inplace exists): PR A's
+  /// own runtime/include/cimrt.h doc comment records that reduce_partial
+  /// shipped out-of-place first too, with in-place landing later as
+  /// separate, motivated work. Not duplicated by copy-paste of a helper --
+  /// this function inlines the same shape directly, the same way
+  /// lowerReducePartial's own two branches are each written out rather than
+  /// factored, since the accumulator-threading logic is only a few lines
+  /// once the shared byteSizeOf/stageForRead/allocBuffer/freeBuffer/
+  /// checkOk/getOrInsertFunc/finish machinery is reused.
+  ///
+  /// NON-CONTIGUOUS OPERANDS ARE REFUSED, NOT MATERIALIZED -- see this
+  /// function's own diagnostic below for why: byteSizeOf and hostPointer
+  /// both assume a contiguous (identity-layout) memref, an invariant that
+  /// holds for every operand cim-partition itself ever builds but NOT for
+  /// a hand-emitted, non-unit-stride memref.subview -- exactly the shape
+  /// python/cim_frontend/emit.py's own MaxPool pooling-window gather
+  /// produces (Kh*Kw strided taps fed directly into cim.reduce_max, no
+  /// per-tap contiguous copy -- see emit_conv_chain_module's own
+  /// `pool_params` docstring). Staging such an operand as if it were
+  /// contiguous would silently copy the wrong bytes: a confident wrong
+  /// answer, not a crash -- exactly the failure class this project refuses
+  /// to ship. So a non-identity-layout operand is refused here with a
+  /// located diagnostic instead, on the same "refuse rather than guess"
+  /// discipline as checkAllowedConsumers' own refusal of a non-rank-1 or
+  /// non-unit-stride memref.subview consumer of a device-space value,
+  /// below. This means a MaxPool-bearing module compiles and runs under
+  /// the cim-run interpreter (which gathers via arbitrary strides
+  /// natively) but does not yet compile on this real-target path --
+  /// docs/roadmap.md and python/README.md both say so explicitly.
+  LogicalResult lowerReduceMax(ReduceMaxOp op) {
+    auto resultType = dyn_cast<MemRefType>(op.getResult().getType());
+    if (!resultType)
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_max's result must be a ranked "
+          "memref");
+    FailureOr<int64_t> bytes = byteSizeOf(resultType);
+    if (failed(bytes))
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_max's result must have a "
+          "static shape and a whole-byte element type");
+    const int64_t count = resultType.getNumElements();
+    const unsigned bits = resultType.getElementTypeBitWidth();
+
+    // Raw operand access, not an ODS accessor -- see lowerReducePartial's
+    // own identical comment. Every operand is validated up front, all of
+    // them, before any call is emitted, INCLUDING the contiguity check
+    // this function's own header comment explains: byteSizeOf/hostPointer
+    // both assume an identity (unit-stride, offset-0-relative) layout, so
+    // a genuinely strided operand is refused HERE, not staged and then
+    // silently mis-copied.
+    SmallVector<Value> operands(op->getOperands().begin(),
+                                op->getOperands().end());
+    for (Value operand : operands) {
+      if (operand.getType() == ptrTy)
+        continue;
+      auto type = dyn_cast<MemRefType>(operand.getType());
+      if (!type || failed(byteSizeOf(type)))
+        return op.emitError(
+            "cim-lower-to-target: cim.reduce_max's operands must be "
+            "ranked memrefs with a static shape and a whole-byte element "
+            "type");
+      if (!type.getLayout().isIdentity())
+        return op.emitError(
+            "cim-lower-to-target: this cim.reduce_max operand is a "
+            "non-contiguous (strided or offset) memref, which this pass "
+            "does not stage -- byteSizeOf/hostPointer both assume an "
+            "identity layout, and copying a strided view as if it were "
+            "contiguous would silently read the wrong bytes rather than "
+            "fail loudly. A pooling window built from strided "
+            "memref.subview taps (python/cim_frontend/emit.py's own "
+            "MaxPool gather) is therefore not yet supported on this "
+            "compiled real-target path -- the cim-run interpreter, whose "
+            "gather() walks arbitrary strides natively, still executes "
+            "it. See docs/roadmap.md's cim.reduce_max entry.");
+    }
+
+    // cim.reduce_max carries no device operand of its own in the dialect,
+    // same as cim.reduce_partial/cim.copy/cim.requantize -- "any device
+    // opened so far", see lowerCopy's comment.
+    if (openDevices.empty())
+      return op.emitError(
+          "cim-lower-to-target: cim.reduce_max needs a device to stage "
+          "through, but no cim.device_open has been lowered yet in this "
+          "function");
+    Value dev = openDevices.front();
+
+    // Same reasoning as lowerReducePartial's own identical block: the
+    // stage space follows the RESULT's declared space, not an operand's.
+    auto resultSpace = dyn_cast_or_null<SpaceAttr>(resultType.getMemorySpace());
+    const bool resultIsDevice =
+        resultSpace && resultSpace.getKind() != SpaceKind::host;
+    const CimrtSpace stageSpace =
+        resultIsDevice
+            ? (resultSpace.getKind() == SpaceKind::insitu ? CimrtSpace::kInsitu
+                                                            : CimrtSpace::kNear)
+            : CimrtSpace::kNear;
+
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    Value original = op.getResult();
+
+    auto finish = [&](Value acc, bool accIsOwnScratch) -> LogicalResult {
+      if (resultIsDevice) {
+        if (failed(checkAllowedConsumers(original)))
+          return failure();
+        original.replaceAllUsesWith(acc);
+        deviceValueElemBits[acc] = bits;
+      } else {
+        auto realAlloc = creationBuilder(b).create<memref::AllocOp>(loc, resultType);
+        noteHoisted(realAlloc.getResult());
+        Value realPtr = hostPointer(b, loc, realAlloc.getResult());
+        readBuffer(b, loc, acc, realPtr, *bytes);
+        if (accIsOwnScratch)
+          freeBuffer(b, loc, acc);
+        original.replaceAllUsesWith(realAlloc.getResult());
+      }
+      op.erase();
+      return success();
+    };
+
+    if (operands.size() == 1) {
+      // Mirrors lowerReducePartial's own single-operand fallback: never
+      // emitted by cim-partition (a single tap has "nothing to reduce"),
+      // but a hand-written module could, and forwarding the sole operand
+      // is the only correct lowering.
+      bool scratch = false;
+      Value only = stageForRead(b, loc, dev, operands[0], stageSpace, scratch);
+      return finish(only, scratch);
+    }
+
+    Value countVal = constI64(b, loc, count);
+    Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
+
+    auto fn = getOrInsertFunc(
+        "cimrt_reduce_max",
+        b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
+
+    bool accScratch = false;
+    Value acc = stageForRead(b, loc, dev, operands[0], stageSpace, accScratch);
+    for (size_t i = 1; i < operands.size(); ++i) {
+      bool rhsScratch = false;
+      Value rhs = stageForRead(b, loc, dev, operands[i], stageSpace, rhsScratch);
+      OpBuilder maxAllocB = creationBuilder(b);
+      Value maxed = allocBuffer(maxAllocB, loc, dev, *bytes, stageSpace);
+      noteHoisted(maxed);
+      Value status =
+          b.create<func::CallOp>(
+               loc, fn, ValueRange{dev, maxed, acc, rhs, countVal, bitsVal})
+              .getResult(0);
+      checkOk(b, loc, status, "cimrt_reduce_max failed");
+      if (accScratch)
+        freeBuffer(b, loc, acc);
+      if (rhsScratch)
+        freeBuffer(b, loc, rhs);
+      acc = maxed;
       accScratch = true; // every accumulator from here on is our own scratch
     }
     return finish(acc, /*accIsOwnScratch=*/true);

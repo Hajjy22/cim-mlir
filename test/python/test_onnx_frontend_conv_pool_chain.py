@@ -43,7 +43,6 @@ pytest.importorskip("onnx", reason="the ONNX front end's oracle")
 
 from onnx import TensorProto  # noqa: E402
 from onnx import helper as onnx_helper  # noqa: E402
-from onnx import numpy_helper  # noqa: E402
 
 from cim_frontend.onnx_import import import_model  # noqa: E402
 from cim_frontend.refusal import Refusal  # noqa: E402

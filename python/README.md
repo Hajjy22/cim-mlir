@@ -402,6 +402,18 @@ pool needs a real conv on both sides, to gather from and be gathered
 into). Composing pooling with the conv-to-matmul bridge is real,
 plausible follow-on work, not attempted here.
 
+**A module with pooling in it runs under `cim-run` today, but does not
+yet compile into a real-target binary.** `cim.reduce_max` has a compiled
+`cim-lower-to-target` lowering (`lowerReduceMax`), but that lowering
+refuses a non-contiguous operand outright rather than silently mis-staging
+it — and this front end's own pooling-window gather feeds `cim.reduce_max`
+exactly that shape (non-unit-stride `memref.subview` taps, no per-tap
+contiguous copy; see `emit_conv_chain_module`'s own `pool_params`
+docstring). Staging a strided tap as if it were contiguous would copy the
+wrong bytes rather than fail loudly — the class of bug this project
+refuses to ship — so the compiled path declines instead, with a diagnostic
+naming exactly why. See `docs/roadmap.md`'s `lowerReduceMax` entry.
+
 ## What it refuses, and why refusing is the point
 
 It refuses rather than guesses, and the reason is sharper than usual: the

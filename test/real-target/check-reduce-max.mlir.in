@@ -1,0 +1,39 @@
+// Sibling of check.mlir.in and check-reduce-partial.mlir.in, configured the
+// same way (see check.mlir.in's own header and
+// test/real-target/CMakeLists.txt) into reduce-max-correct.mlir
+// (EXPECTED_VALUE=5) and reduce-max-wrong.mlir (EXPECTED_VALUE=99).
+//
+// Proves cim.reduce_max's compiled lowering (lowerReduceMax,
+// lib/Transforms/CIMLowerToTarget.cpp) for real, through a genuinely
+// compiled binary -- the same job check-reduce-partial.mlir.in does for
+// cim.reduce_partial/cimrt_reduce_add.
+//
+// THE OPERANDS ARE THE SAME DISCRIMINATING PAIR test/Run/reduce-max.mlir
+// AND test/unit/cimrt_test.cpp BOTH PIN, ON PURPOSE: [5, 3] vs [-1, -128].
+//
+//   signed max (correct, and what ONNX MaxPool on int8 computes) -> 5
+//   unsigned byte compare (the copy-paste bug)                   -> -1
+//   an ADD, i.e. cimrt_reduce_add wired in by mistake             -> 4
+//
+// All three answers differ, so EXPECTED_VALUE=5 cannot pass by luck under
+// either wrong implementation -- this is what the mutation test in
+// docs/roadmap.md's cim.reduce_max compiled-lowering entry actually
+// flips (the callee name lowerReduceMax passes to getOrInsertFunc) to
+// confirm this file has teeth. EXPECTED_VALUE=99 (the "wrong" variant)
+// is not achievable by ANY of the three answers above, so it is
+// unambiguously false rather than merely different from the true one.
+func.func @run_check() {
+  %dev = cim.device_open {target = "@CIM_REAL_TARGET_YAML@"} : !cim.device<"@CIM_REAL_TARGET_YAML@">
+  %a = memref.get_global @a : memref<2xi8>
+  %b = memref.get_global @b : memref<2xi8>
+  %m = cim.reduce_max %a, %b : (memref<2xi8>, memref<2xi8>) -> memref<2xi8>
+  %c0 = arith.constant 0 : index
+  %got = memref.load %m[%c0] : memref<2xi8>
+  %expected = arith.constant @EXPECTED_VALUE@ : i8
+  %ok = arith.cmpi eq, %got, %expected : i8
+  cf.assert %ok, "real-target e2e: cimrt_reduce_max result did not match the expected value"
+  memref.dealloc %m : memref<2xi8>
+  return
+}
+memref.global "private" constant @a : memref<2xi8> = dense<[5, 3]>
+memref.global "private" constant @b : memref<2xi8> = dense<[-1, -128]>

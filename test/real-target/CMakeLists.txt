@@ -157,6 +157,13 @@ add_real_target_object(requantize-wrong check-requantize.mlir.in 999)
 # header for why neither partial alone can pass this check.
 add_real_target_object(reduce-partial-correct check-reduce-partial.mlir.in 25)
 add_real_target_object(reduce-partial-wrong check-reduce-partial.mlir.in 999)
+# cim.reduce_max: [5, 3] vs [-1, -128], the same discriminating pair
+# test/Run/reduce-max.mlir and test/unit/cimrt_test.cpp both pin -- see
+# check-reduce-max.mlir.in's own header for why 5 (element 0's true
+# signed max) cannot be reached by either wrong implementation (an
+# unsigned byte compare, or cimrt_reduce_add wired in by mistake).
+add_real_target_object(reduce-max-correct check-reduce-max.mlir.in 5)
+add_real_target_object(reduce-max-wrong check-reduce-max.mlir.in 99)
 # A genuine multi-K-tile linalg.matmul_transpose_b through the real
 # cim-detect/cim-partition/cim-lower-to-target chain -- see
 # check-multi-k-tile.mlir.in's own header for why 36 is the value that
@@ -207,6 +214,7 @@ add_real_target_object(digital-cim-volatile-wrong check.mlir.in 999
 
 foreach(variant correct wrong requantize-correct requantize-wrong
                 reduce-partial-correct reduce-partial-wrong
+                reduce-max-correct reduce-max-wrong
                 multi-k-tile-correct multi-k-tile-wrong
                 loop-correct loop-wrong
                 batch-correct batch-wrong
@@ -230,6 +238,11 @@ add_test(NAME real-target-e2e-requantize-correct-value-passes
          COMMAND real-target-e2e-requantize-correct)
 add_test(NAME real-target-e2e-reduce-partial-correct-value-passes
          COMMAND real-target-e2e-reduce-partial-correct)
+# check-reduce-max.mlir.in hand-writes cim.device_open with the absolute
+# path substituted in directly (same as check-reduce-partial.mlir.in
+# above), so this needs no WORKING_DIRECTORY either.
+add_test(NAME real-target-e2e-reduce-max-correct-value-passes
+         COMMAND real-target-e2e-reduce-max-correct)
 # Needs WORKING_DIRECTORY, unlike every other variant here: those all
 # hand-write cim.device_open with @CIM_REAL_TARGET_YAML@ (an absolute
 # path) substituted directly into the target string. check-multi-k-tile
@@ -286,6 +299,8 @@ add_test(NAME real-target-e2e-requantize-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-requantize-wrong>")
 add_test(NAME real-target-e2e-reduce-partial-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-partial-wrong>")
+add_test(NAME real-target-e2e-reduce-max-wrong-value-traps
+         COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-reduce-max-wrong>")
 add_test(NAME real-target-e2e-multi-k-tile-wrong-value-traps
          COMMAND sh -c "! $<TARGET_FILE:real-target-e2e-multi-k-tile-wrong>"
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/test)

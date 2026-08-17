@@ -383,6 +383,77 @@ func.func @reduce_partial_needs_a_device(%p0: memref<4xi32>, %p1: memref<4xi32>)
 
 // -----
 
+// cim.reduce_max lowers against cimrt_reduce_max, NOT cimrt_reduce_add --
+// lowerReduceMax is lowerReducePartial's own out-of-place branch with the
+// callee substituted (see its own doc comment for why there is no
+// in-place counterpart). Three operands chain exactly two calls (N-1),
+// matching reduce_three_partials_chains_two_calls above; the CHECK-NOT
+// pins that no cimrt_reduce_add call ever appears for this op, the
+// structural half of the signed-vs-unsigned/add-vs-max discrimination
+// test/Run/reduce-max.mlir and test/unit/cimrt_test.cpp both pin at the
+// ABI level.
+// CHECK-LABEL: func.func @reduce_three_taps_chains_two_max_calls
+func.func @reduce_three_taps_chains_two_max_calls(
+    %h0: memref<4xi8>, %h1: memref<4xi8>, %h2: memref<4xi8>) -> memref<4xi8> {
+  %dev = cim.device_open {target = "t"} : !cim.device<"t">
+  %p0 = cim.copy %h0 : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  %p1 = cim.copy %h1 : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  %p2 = cim.copy %h2 : memref<4xi8> to memref<4xi8, #cim.space<near>>
+  // CHECK: call @cimrt_write(%[[P0BUF:[0-9]+]],
+  // CHECK: call @cimrt_write(%[[P1BUF:[0-9]+]],
+  // CHECK: call @cimrt_write(%[[P2BUF:[0-9]+]],
+  %m = cim.reduce_max %p0, %p1, %p2
+       : (memref<4xi8, #cim.space<near>>, memref<4xi8, #cim.space<near>>,
+          memref<4xi8, #cim.space<near>>) -> memref<4xi8>
+  // CHECK: call @cimrt_reduce_max(%{{[0-9]+}}, %[[ACC1:[0-9]+]], %[[P0BUF]], %[[P1BUF]],
+  // CHECK: call @cimrt_reduce_max(%{{[0-9]+}}, %[[ACC2:[0-9]+]], %[[ACC1]], %[[P2BUF]],
+  // CHECK-NOT: call @cimrt_reduce_add
+  // CHECK: call @cimrt_free(%[[ACC1]])
+  // CHECK: call @cimrt_read(%[[ACC2]],
+  // CHECK: call @cimrt_free(%[[ACC2]])
+  // CHECK-NOT: error
+  return %m : memref<4xi8>
+}
+
+// -----
+
+// Same missing-device refusal cim.reduce_partial's own has -- cim.reduce_max
+// carries no device operand of its own in the dialect either.
+func.func @reduce_max_needs_a_device(%p0: memref<4xi8>, %p1: memref<4xi8>) -> memref<4xi8> {
+  // expected-error @+1 {{cim.reduce_max needs a device to stage through}}
+  %m = cim.reduce_max %p0, %p1 : (memref<4xi8>, memref<4xi8>) -> memref<4xi8>
+  return %m : memref<4xi8>
+}
+
+// -----
+
+// THE hazard this op's own lowering exists to refuse rather than silently
+// mis-stage: a non-contiguous (non-unit-stride) memref.subview operand --
+// exactly the shape a MaxPool's own pooling-window gather produces
+// (python/cim_frontend/emit.py's own pool_params emission feeds Kh*Kw
+// strided taps directly into cim.reduce_max, no per-tap contiguous copy).
+// byteSizeOf/hostPointer both assume an identity layout; staging this
+// operand as though it were contiguous would silently copy the wrong
+// bytes, so it is refused instead, with a diagnostic naming exactly why.
+// Verified against a real compiled binary before this test was written
+// (see docs/roadmap.md's cim.reduce_max compiled-lowering entry): a
+// contiguous pair of the SAME [5, 3] vs [-1, -128] operands
+// test/Run/reduce-max.mlir pins lowers and runs correctly end to end;
+// only the strided shape is refused.
+func.func @reduce_max_refuses_a_strided_operand(%src: memref<1x4xi8>) -> memref<1x2xi8> {
+  %tapA = memref.subview %src[0, 0] [1, 2] [1, 2]
+     : memref<1x4xi8> to memref<1x2xi8, strided<[4, 2], offset: 0>>
+  %tapB = memref.subview %src[0, 1] [1, 2] [1, 2]
+     : memref<1x4xi8> to memref<1x2xi8, strided<[4, 2], offset: 1>>
+  // expected-error @+1 {{this cim.reduce_max operand is a non-contiguous}}
+  %m = cim.reduce_max %tapA, %tapB
+     : (memref<1x2xi8, strided<[4, 2], offset: 0>>,
+        memref<1x2xi8, strided<[4, 2], offset: 1>>) -> memref<1x2xi8>
+  return %m : memref<1x2xi8>
+}
+
+// -----
+
 // cim.requantize, host in and out: staged into a scratch near-space buffer
 // (freed once its one use is done, same as cim.mvm's activation staging),
 // requantized via cimrt_requantize, then read back into a real host

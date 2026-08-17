@@ -1000,8 +1000,12 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
          pad_right, dilation_h, dilation_w) = conv_params[i + 1]
         cin = cout  # layer i+1's Cin is layer i's own Cout.
         h, w_ = cur_h, cur_w
-        dilated_kh = (kh - 1) * dilation_h + 1
-        dilated_kw = (kw - 1) * dilation_w + 1
+        # dilated_kh/dilated_kw's own output-size arithmetic now lives in
+        # im2col.py's shared output_size(), already folded into
+        # layer_shapes[i + 1] (next_out_h/next_out_w below) by this
+        # function's own precompute pass -- so unlike hp/wp (still needed
+        # here, for the padded buffer's own shape), dilation itself has
+        # nothing left to compute at this point in the loop.
         hp = h + pad_top + pad_bottom
         wp = w_ + pad_left + pad_right
         next_m, next_out_h, next_out_w = layer_shapes[i + 1]

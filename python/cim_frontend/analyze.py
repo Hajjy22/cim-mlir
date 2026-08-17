@@ -18,7 +18,12 @@ count -- never its values, and never an activation. A `MaxPool` or
 `Softmax` node has no resident weights and so cannot change that count no
 matter what it computes; a grouped `QLinearConv` this project's compiler
 cannot yet EMIT still has a real, known weight tensor whose shape this
-module can still report. So this walker never refuses the graph:
+module can still report. (`MaxPool` is skipped here for exactly that
+"no resident weights" reason, not because it cannot be compiled --
+`onnx_import.py`'s own `load_conv_pool_chain` DOES emit and execute it,
+inside a `QLinearConv` chain; this stays true even now, so a later reader
+should not "fix" this sentence into inconsistency by removing it.) So
+this walker never refuses the graph:
 every node is either an offloadable layer (its shape goes in `layers`) or
 a skip (its op type and the reason go in `skipped`), and the walk always
 completes.

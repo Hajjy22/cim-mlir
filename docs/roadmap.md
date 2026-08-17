@@ -2316,10 +2316,9 @@ out of scope for v0.1 across the board, not just here.
   `CIMLowerToTarget.cpp`'s `lowerOp` silently passed ANY unrecognized op
   through, so a `cim.*` op with no lowering would have survived among
   fully-lowered code and failed far from its cause. It now errors,
-  written as a dialect check so every future op inherits the protection
-  (`test/Transforms/cim-lower-to-target-unhandled-cim-op.mlir`).
-  `cim.reduce_max` is interpreter-only for now; the compiled real-target
-  path says so out loud rather than mystifying downstream.
+  written as a dialect check so every future op inherits the protection.
+  `cim.reduce_max` was interpreter-only at the time this entry first
+  landed; the next entry below closes that.
 
   **A real bug found in this project's own primary oracle, recorded so it
   is not rediscovered.** `onnx.reference` cannot evaluate integer
@@ -2406,6 +2405,86 @@ out of scope for v0.1 across the board, not just here.
   other than `(1, 1)`, and `Relu`/`GlobalAveragePool`/`Concat` (still
   genuinely blocked on missing dialect-level primitives -- see the
   previous entry's own "Explicitly out of scope" list).
+
+- **`lowerReduceMax`: a compiled real-target lowering for `cim.reduce_max`,
+  closing the last dialect asymmetry.** Every other `cim` op had both an
+  interpreter path and a compiled `cim-lower-to-target` lowering, each
+  proven by a `real-target-e2e` binary pair -- `cim.reduce_max` was the
+  only one that did not, and PR B made that user-visible: a real MaxPool
+  chain now compiles through `cim-detect`/`cim-partition` and runs under
+  `cim-run`, but could not be built into a real-target binary. Verified
+  concretely before writing any code: running the front end's own pooling
+  output through `--cim-lower-to-target` produced exactly `cim-lower-to-
+  target has no lowering for this op: cim.reduce_max`.
+
+  `lowerReduceMax` is `lowerReducePartial`'s own out-of-place branch
+  (`lib/Transforms/CIMLowerToTarget.cpp`) with `cimrt_reduce_add`
+  substituted for `cimrt_reduce_max` -- stage operand 0, then for each
+  remaining operand stage it, allocate a fresh device accumulator, emit
+  one `cimrt_reduce_max` call, free whichever inputs were scratch, chain
+  the accumulator forward. No in-place counterpart exists (no
+  `cimrt_reduce_max_inplace`), matching `reduce_partial`'s own staged
+  history -- in-place landed later there, as separate, motivated work.
+
+  **The real risk was staging a strided operand, not writing the core
+  loop.** The front end's own pooling taps are non-unit-stride, rank-4
+  `memref.subview`s (`emit.py`'s `pool_params` gather feeds them straight
+  into `cim.reduce_max`, no per-tap contiguous copy). Two pieces of the
+  existing staging path assume contiguity: `byteSizeOf` computes a
+  buffer's size as `getNumElements() * elemBytes`, ignoring layout
+  entirely, and `hostPointer`'s own doc comment states the invariant it
+  relies on -- *"every subview this pass or cim-partition ever builds is
+  unit-stride"* -- an invariant that holds for every subview the compiler
+  itself builds but not for one `emit.py` hand-emits. Staging a strided
+  tap as if it were contiguous would copy the wrong bytes silently: a
+  confident wrong answer, not a crash, the exact failure class this
+  project refuses to ship.
+
+  Rather than materialize (an automatic `memref.alloc` + `memref.copy` per
+  strided operand inside the pass), `lowerReduceMax` REFUSES a
+  non-identity-layout operand outright, with a diagnostic naming exactly
+  why (`hostPointer`'s own unit-stride assumption) and what still works
+  (the `cim-run` interpreter, whose `gather()` walks arbitrary strides
+  natively). This was the conservative branch of the plan written before
+  implementation -- refusing can never produce a wrong answer, only decline
+  to compile a shape that materialization might have handled -- and it
+  means a MaxPool-bearing module still does not compile on this real-target
+  path today; `python/README.md`'s own `MaxPool` section says so.
+
+  Verified against real compiled binaries, both directions, before this
+  was written into the test suite: a hand-built module with the exact
+  `[5, 3]` vs `[-1, -128]` pair `test/Run/reduce-max.mlir` and
+  `test/unit/cimrt_test.cpp` both pin ran through the full
+  `cim-opt --cim-lower-to-target` -> `mlir-opt --convert-to-llvm` ->
+  `mlir-translate` -> `clang` -> link -> execute chain and produced the
+  correct signed max; a deliberately wrong expected value made the same
+  chain trap (`SIGABRT`), proving the check itself has teeth; and a
+  hand-built module with genuinely strided taps was refused cleanly at
+  `cim-lower-to-target`, not miscompiled.
+
+  New `test/real-target/check-reduce-max.mlir.in`, registered as
+  `reduce-max-correct`/`reduce-max-wrong` (ctest: 20 -> 22), using the
+  same three-way-discriminating operand pair (signed max vs. an unsigned
+  byte compare vs. an add) as every other `cim.reduce_max` test in this
+  project. New structural `FileCheck` tests in
+  `test/Transforms/cim-lower-to-target.mlir`: an N=3 case pinning exactly
+  N-1 `cimrt_reduce_max` calls and NO `cimrt_reduce_add`, the missing-
+  device refusal, and the strided-operand refusal. Mutation-tested twice:
+  swapping the emitted callee to `cimrt_reduce_add` made the *correct*
+  real-target binary trap (element 0 computed `5 + (-1) = 4`, not `5`);
+  disabling the strided-layout check made the strided-refusal test fail
+  for a different, still-controlled reason (the next guard down, "needs a
+  device"), confirming the check is genuinely load-bearing. Both reverted
+  and reconfirmed green.
+
+  `test/Transforms/cim-lower-to-target-unhandled-cim-op.mlir` -- which
+  pinned `cim.reduce_max` as *the* op with no lowering at all -- was
+  deleted rather than rewritten: every op in the dialect now has a
+  dispatch case, so that generic fallthrough guard is unexercised by
+  construction until the next op is added without one. The guard itself
+  stays, written against the dialect rather than a per-op list, for
+  exactly that next op's sake; its own comment in `CIMLowerToTarget.cpp`
+  now carries the explanation this deleted test used to.
 
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
