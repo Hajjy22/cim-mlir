@@ -1,19 +1,14 @@
 # The ONNX front end
 
-Reads an ONNX model and emits the MLIR the `cim` pipeline consumes. This
-is the front door the rest of the project was written behind: everything
-else here starts from MLIR that this repository wrote, either by hand in
-the FileCheck tests or from a string builder in the differential tests.
+Reads an ONNX model and emits the MLIR the `cim` pipeline consumes. This is the front door
+the rest of the project was written behind.
 
 ## Install
 
 ```sh
 pip install ./python           # cim-import-onnx CLI only
-pip install './python[onnx]'   # + the onnx package the CLI actually needs at runtime
+pip install './python[onnx]'   # + the onnx package it needs at runtime
 ```
-
-This installs a `cim-import-onnx` console script, so the pipe below no
-longer needs `PYTHONPATH`:
 
 ```sh
 cim-import-onnx model.onnx --input act.npy \
@@ -23,617 +18,180 @@ cim-import-onnx model.onnx --input act.npy \
   | cim-run --target-yaml=targets/erbium-8t.yaml --profile -
 ```
 
-Without installing, the equivalent is:
+Without installing, replace the first line with
+`PYTHONPATH=python python3 -m cim_frontend model.onnx --input act.npy`.
 
-```sh
-PYTHONPATH=python python3 -m cim_frontend model.onnx --input act.npy \
-  | cim-opt - --cim-detect \
-      --cim-partition=target-yaml=targets/erbium-8t.yaml \
-      --cim-placement=target-yaml=targets/erbium-8t.yaml \
-  | cim-run --target-yaml=targets/erbium-8t.yaml --profile -
-```
+The package covers `cim_frontend` only — it deliberately depends on nothing under `lib/`,
+`runtime/`, or `tools/`, which would drag in an LLVM/MLIR toolchain. CI installs it fresh
+with `pip` and runs the console script for real, so this stays true rather than merely
+documented.
 
-`python/pyproject.toml` packages only this directory (`cim_frontend`);
-it deliberately does not depend on anything under `lib/`, `runtime/`, or
-`tools/`, since those need an LLVM/MLIR toolchain this package has no
-reason to require. The `.github/workflows/ci.yml` `packaging` job installs
-it fresh with `pip` and runs the console script for real (not
-`python3 -m`, and not through the `test/python` suites' `sys.path` hack)
-so this stays true rather than merely documented.
-
-## Why Python, and why not in `tools/`
-
-The output is *text*, consumed by the `cim-opt` binary over a pipe, so
-there is no in-memory MLIR handoff a C++ importer would preserve. Against
-that, a C++ importer costs real things:
-
-- `libonnx` + protobuf become a hard dependency of the **build**, not of
-  an optional test. The `core`, `core-asan` and `core-valgrind` CI jobs
-  configure with `-DCIM_ENABLE_MLIR=OFF` and build in seconds; the
-  README's claim that the core has no heavy dependencies would need an
-  asterisk.
-- `.github/workflows/ci.yml`'s `static-analysis` job runs
-  `run-clang-tidy-18 -warnings-as-errors='*'` over all of
-  `lib|runtime|tools/**/*.cpp`. Protobuf-generated sources under that flag
-  means either suppressions or narrowing the glob, and narrowing the glob
-  weakens a gate that currently covers everything.
-
-`onnx`'s canonical API is Python, and torch-mlir's own ONNX importer is
-Python for these same reasons.
-
-It lives in `python/` rather than `tools/` because every subdirectory of
-`tools/` is a CMake target producing a binary in `<build>/bin`, which is
-also how `test/python/conftest.py`'s `find_tool()` locates tools. A script
-that is not built, needs no MLIR, and cannot be found that way does not
-belong there.
+**Why Python:** the output is *text*, piped into `cim-opt`, so a C++ importer would
+preserve no in-memory handoff — but it would make `libonnx` + protobuf a hard dependency of
+the build and put protobuf-generated sources under a `-warnings-as-errors` clang-tidy gate.
+`onnx`'s canonical API is Python, and torch-mlir's own ONNX importer is Python for the same
+reasons.
 
 ## What it accepts
 
-A graph consisting of one or more `MatMulInteger` nodes and nothing else
-(chains are bridged as described below), where each layer's operands
-satisfy:
+| Graph shape | Notes |
+|---|---|
+| One `MatMulInteger` | The v0.1 contract in one node: int8 A, int8 B, int32 Y |
+| A chain of `MatMulInteger` | Bridged by `Cast(float32) -> QuantizeLinear(scale, zero_point=0)` |
+| One `QLinearConv` | Via im2col, entirely in Python — no new MLIR op |
+| `QLinearConv` -> `MatMulInteger` chain | Bridged by `Transpose(perm=[0,2,3,1]) -> Reshape([M, Cout])` |
+| A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]` |
+| A conv chain -> matmul chain | The realistic full-CNN shape |
+| `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
 
-- the weight operand (B) is a constant initializer,
-- both operands are `int8` (not `uint8`),
-- zero points are absent or zero,
-- operands are rank 2 (the activation may have one row or many — see
-  "Batching" below),
-- every dimension is a known constant,
-- the model targets opset 10 or later.
+Per layer, operands must be: constant int8 weights, rank 2 (or 4 for conv), all dimensions
+statically known, opset 10 or later.
 
-`MatMulInteger` is the accepted op because it *is* the v0.1 contract in
-one node: int8 A, int8 B, int32 Y — "INT8 in, wider integer accumulator
-out". A single, standalone `QLinearConv` node is also accepted, as a
-second entry point — see "A single 2-D convolution" below.
+The activation may have any number of rows (M > 1). `cim-partition` tiles a multi-row
+matmul the same way it tiles one row, wrapping the work in an `scf.for` it builds itself.
 
-## Chained layers
+### Convolution details
 
-A single `MatMulInteger` is the whole v0.1 contract, but it is also the
-one shape where `cim-placement` has nothing to reuse *across* — real
-cross-layer eviction, the `mlp-3layer` benchmark shape, needs more than
-one weight matrix competing for the tile budget. A graph of two or more
-`MatMulInteger` nodes is imported as a chain, provided consecutive layers
-are bridged by exactly one pattern: `Cast(to=float32) ->
-QuantizeLinear(scale, zero_point=0, int8 output)`. Anything else between
-layers — a non-positive scale, a missing zero point, any other op — is
-refused.
+A 2-D convolution over a *constant* activation is a matmul in disguise: the kernel
+reshapes to `[Cout, Cin*Kh*Kw]`, the activation im2cols into `[N*OutH*OutW, Cin*Kh*Kw]`,
+and the existing matmul emitter takes it from there. im2col is normally expensive because
+it materializes overlapping windows at every inference — that cost does not apply here,
+since every emitted module bakes exactly one inference.
 
-That specific bridge, and no other, is what keeps the numerical claim
-checkable. Each bridge's scale becomes the `scale` operand of a real
-`cim.requantize(scale=<scale>, zero_point=0, effective_bits=8)` between the
-two compiled matmuls — `cim.requantize` and its runtime implementation are
-fully scale-generic, so any positive scale is accepted, not just `1.0`.
+Accepted: dilation, per-channel `w_scale`, a real int32 bias, asymmetric zero points, and
+a `uint8` output. All four were found necessary by importing a real model
+(`squeezenet1.0-12-int8`), and all four turned out to be expressible with existing
+machinery — per-channel scale as N `cim.requantize` calls over subviews, the bias as a
+`cim.reduce_partial`, `x_zero_point` folded into the constant activation in Python, and
+uint8 output via the exact identity `clamp(-128,127, t-128) == clamp(0,255,t) - 128`.
 
-What differs is which oracle a real scale can be checked against.
-`cim.requantize` rounds half-away-from-zero; ONNX's `QuantizeLinear` rounds
-half-to-even — two modes that diverge only at a tie, a value ending in
-exactly `.5`. At `scale=1.0`, both sides compute `round(v / 1.0)` on a `v`
-that is already an integer (an accumulator), so there is never a
-fractional part and therefore never a tie either side could round
-differently — the compiled chain matches an *unquantized* ONNX oracle
-exactly. At a real (non-1.0) scale, ties are possible in general, but an
-**odd integer scale makes one mathematically impossible**: `v / s` lands on
-a half-integer only if `s / 2` is itself an integer, which an odd `s`
-never is. So an odd-scale chain still matches exactly, checked against
-`onnx.reference`'s own *quantized* evaluation instead of an unquantized
-one (see `test_a_real_calibrated_scale_matches_the_quantized_reference`).
-An even scale can hit a genuine tie, where the two rounding modes really do
-disagree by construction, not by bug — `test_a_real_scale_at_an_exact_
-rounding_tie_documents_the_known_divergence` pins that divergence
-explicitly rather than hiding it. This was checked against a real
-`cim-opt`/`cim-run` round trip by hand before the graph-walking code that
-finds this pattern was written — see `onnx_import.py`'s own module
-docstring for the exact numbers.
+That uint8 shift is **disclosed in the emitted module's provenance header**: the printed
+result is `(true value - 128)` and the caller must add 128 back.
 
-## Batching (M > 1)
+For a conv layer that is not the graph's own output, the bridge is one scalar
+`cim.requantize` with `zero_point = 0`, so interior layers require `y_zero_point == 0`, a
+scalar `w_scale`, and no bias.
 
-The activation may have more than one row. `cim-partition` tiles a real
-M-row matmul the same way it tiles a single row: the same weight
-programming, activation staging, `cim.mvm`, and write-back, generated
-once and wrapped in a real `scf.for` it builds itself over the rows,
-rather than refused (`docs/roadmap.md`'s M4 entry). This threads through a
-chain unchanged too — `cim.requantize` never changes shape, so a batched
-layer 0 makes every later layer genuinely `[M, ...]` as well, with no
-per-layer bookkeeping in this front end.
+### `MaxPool` details
 
-Pass a real `[M, K]` array via `--input` (a `.npy` or `.json` file) to use
-it; `--input-random` still synthesizes a single row only, since it exists
-for quick smoke-testing rather than as the batching entry point.
+Plain ONNX `MaxPool` carries no scale or zero point, because max is scale-invariant. So a
+pooling layer needs no requantize: the previous conv's bridge already produced int8,
+`MaxPool` folds int8 to int8, and the next conv reads it directly.
 
-## A single 2-D convolution (`QLinearConv`)
+Emitted as `Kh * Kw` static strided `memref.subview` taps folded by one `cim.reduce_max`.
+That op compares **signed**, matching what ONNX `MaxPool` on int8 actually computes
+(`max(5, -1) == 5`, not `-1`'s raw byte).
 
-A graph consisting of exactly one `QLinearConv` node (and no
-`MatMulInteger`) is imported too — via im2col, entirely in Python, with no
-new MLIR op and no `cim-detect`/`cim-partition`/interpreter change. This
-works because of the same fact "The activation is required" (below)
-already establishes: every emitted module bakes ONE inference, so the
-activation is always a compile-time constant. im2col is normally
-considered expensive because it materializes every overlapping window
-redundantly, at every inference — that cost does not apply here, since
-there is no per-inference cost in this project's execution model at all.
-A 2-D convolution over a constant activation and a constant kernel is
-exactly a matmul in disguise: the kernel reshapes `[Cout, Cin, Kh, Kw] ->
-[Cout, Cin*Kh*Kw]` (no transpose needed — see `im2col.py`'s own module
-docstring for why this is different from `MatMulInteger`'s weight), the
-activation im2cols into `[N*OutH*OutW, Cin*Kh*Kw]`, and the result is
-handed to the exact same emitter this front end already runs a full
-verification gate against for a plain matmul. `N*OutH*OutW` flattens
-straight into the M > 1 batching machinery above, so a batched convolution
-needs no separate support either.
+The pad value is **`-128`**, not `0` — a convolution's correct pad value is wrong here,
+since `0` can beat a real negative activation it should lose to. Confirmed against three
+independent implementations.
 
-Unlike `MatMulInteger`, `QLinearConv` always quantizes its own output in
-one node, so the emitted module ends in a `cim.requantize` even for this
-single "layer" — the scale it needs is derived as
-`y_scale / (x_scale * w_scale)`, matching `QLinearConv`'s own reference
-semantics for an integer accumulator.
-
-Only a plain (non-grouped), explicit-padding convolution is accepted — see
-`onnx_import.py`'s `load_qlinear_conv` module section header for the full
-list of what is refused and why (each is a real scope boundary, not an
-oversight; the refusal table below has an entry for the exact-padding
-requirement, which is the one surprise: `auto_pad=VALID` is refused too,
-despite being definitionally just zero padding, because `onnx.reference`'s
-own `Conv` implementation computes it with a padding formula that is wrong
-for any model with more than one image or input channel — an oracle bug
-this front end sidesteps by refusing it, rather than a limitation of its
-own). A chain of convolutions, or a convolution feeding a matmul, is not
-supported — only a single, standalone `QLinearConv`, matching how
-single-layer `MatMulInteger` import preceded chained import.
-
-**Dilation (`dilations != (1, 1)`) is accepted** — unlike group, it changes
-only which source pixels a kernel tap reads, not the shape of anything:
-the destination patch `im2col_nchw` builds per output position is the same
-dense block either way, so numpy's own strided slicing (step = the
-dilation factor) reads the pattern directly with no new data structure or
-second pass. See `im2col.py`'s own "DILATION IS A SAMPLING PATTERN" note.
-Grouped convolution remains refused: each group is really an independent
-matmul over a slice of channels, which genuinely cannot be expressed as a
-single reshape the way dilation can.
-
-**Per-channel scale, a real bias, and asymmetric zero points are also
-accepted** — found necessary, not merely nice-to-have, by importing a real
-model (`squeezenet1.0-12-int8` from the ONNX model zoo): every layer of a
-real, ONNX-Runtime-quantized model uses a per-output-channel `w_scale`, a
-real int32 bias, and an asymmetric `x_zero_point`, none of which the first
-version of this front end accepted. All three (plus a real
-`y_zero_point`) turned out to be expressible with existing,
-already-verified machinery rather than a dialect change:
-
-- **Per-channel `w_scale`**: N `cim.requantize` calls, one per output
-  channel, each against a `memref.subview` of that column.
-- **A bias operand**: one `cim.reduce_partial(matmul_output,
-  bias_broadcast)` between the matmul and the eventual requantize —
-  composes cleanly with `cim-partition`'s own rewrite because that pass
-  treats a matmul's output buffer as an opaque destination it fills in
-  place, regardless of what reads it afterward.
-- **A non-zero `x_zero_point`**: subtracted from the constant activation
-  in Python before im2col ever runs — exact whenever `w_zero_point == 0`
-  (still required), refused if the shifted result does not fit signed
-  int8.
-- **A non-zero `y_zero_point`**: `cim.requantize` already had a real
-  `zero_point` parameter; this front end just stopped hard-coding it to
-  0.
-
-`squeezenet1.0-12-int8`'s own first layer was extracted standalone and run
-through the real compiled pipeline as a capstone check: all 14,400 output
-elements matched `onnx.reference` exactly, using its actual per-channel
-scales, actual bias, and actual asymmetric input. The one thing that layer
-could not be imported with unmodified at the time — its declared `uint8`
-output (`y_zero_point` dtype) — is also now accepted: `cim.requantize`'s
-clamp is a signed range and cannot represent uint8's full `[0, 255]` span
-directly, but `clamp(-128, 127, t - 128) == clamp(0, 255, t) - 128` for
-every real `t`, so requantizing with `y_zero_point - 128` instead of the
-declared value produces exactly `(true_uint8_output - 128)` in every
-element — algebraically exact, not approximate. **The emitted module's
-provenance header discloses this shift explicitly**: a uint8-output
-`QLinearConv`'s printed result is `(true value - 128)`, and the caller
-must add 128 back, the same "the front end's job ends at 'produce the
-right numbers'; a documented caller-side transform is not a silent one"
-discipline as the NHWC reshape a conv's own caller already has to apply.
-
-Still refused: a non-zero `w_zero_point` (the correction term it would
-need is per-row, activation-dependent — not a fixed per-channel bias, so
-it is not a reshape of anything above), and a non-scalar `x_zero_point`/
-`y_zero_point` (per-tensor activation/output quantization is the
-near-universal convention, unlike per-channel weight scale).
-
-## A convolution feeding matmul layers
-
-A `QLinearConv` immediately followed by one or more `MatMulInteger` layers
-— a convolution stem feeding a fully-connected head, a real CNN shape —
-is imported as a chain, the first real step toward compiling a whole
-network rather than one isolated layer. This is tractable without any new
-MLIR emission: the convolution is always layer 0, so its activation is
-still the literal graph input and `im2col` still runs once in Python
-exactly as it does standalone; everything after that reuses the
-already-proven `MatMulInteger` chain bridge unchanged. Chaining a
-*second* convolution needs a real MLIR-level `im2col` instead — the next
-layer's activation only exists as an MLIR value once the first layer's
-compiled code actually runs, so its patches have to be gathered *in the
-emitted IR* — and that harder capability is a separate feature, described
-in its own section below.
-
-The bridge between the conv and the first matmul is `Transpose(perm=[0,
-2, 3, 1]) -> Reshape([M, Cout])`, **required in the graph, not merely
-tolerated**. This was not a design choice made for its own sake: ONNX's
-own `MatMulInteger` reference kernel does N-D numpy-broadcast matmul
-rather than requiring 2-D operands, so a graph that wires a
-`QLinearConv`'s raw `[N, Cout, OutH, OutW]` output directly into a
-`MatMulInteger` node does not error — it silently contracts whatever axes
-happen to line up (e.g. `OutW` against `Cout`, if they happen to be
-equal), a genuinely different, wrong function, confirmed by hand before
-this loader was written. The explicit `Transpose`/`Reshape` pair makes
-the `.onnx` file itself a faithful, standards-compliant statement of the
-same function this compiler emits — the `(n, oh, ow)`-row-major × `Cout`
-flatten `im2col.py`'s own patches layout already commits to.
-
-A chained convolution is narrower than a standalone one: `emit_chain_
-module`'s bridge is one unconditional scalar `cim.requantize` with
-`zero_point` hardcoded at 0, so a chained conv requires `y_zero_point ==
-0` (declared `int8`, not `uint8` — there is no caller downstream to apply
-the standalone path's documented `+128` shift before the next matmul
-reads the value), a single scalar `w_scale` (no per-channel), and no
-bias. Lifting any of these needs `emit_chain_module` itself to grow a
-per-channel/bias-aware bridge, not just the loader — not attempted here,
-on the same "don't invent capability a real model hasn't forced" basis
-the rest of this section follows.
-
-## Chained convolutions
-
-Two or more `QLinearConv` nodes, connected *directly* — `conv_i`'s own
-`"Y"` feeding `conv_(i+1)`'s own `"X"` — import as a real convolution
-chain, with no bridge node between layers at all. That is unlike every
-other chain this front end accepts: a matmul-to-matmul bridge is an
-explicit `Cast`/`QuantizeLinear` pair, and a conv-to-matmul bridge is an
-explicit `Transpose`/`Reshape` pair (see above). A conv-to-conv edge needs
-neither, because both `QLinearConv`'s own `"X"` input and `"Y"` output are
-already declared `[N, C, H, W]` per the ONNX spec — wiring one conv's `"Y"`
-straight into the next conv's own `"X"` is already a faithful,
-standards-compliant statement of the same function this compiler emits.
-
-Layer 0's activation is still the literal graph input, so its own `im2col`
-still runs once in Python exactly as it does standalone. Every layer after
-that is different: its own activation is the *previous* layer's bridged
-output, an MLIR value this front end has never seen as a concrete array,
-so its patches are gathered **in the emitted IR** — a real MLIR-level
-`im2col`. The interpreter cannot execute `arith.addi`/`arith.muli` or
-`scf.if` at all, which rules out the two obvious designs (an `scf.for`
-computing tap indices via arithmetic, or a fully-unrolled emission over
-every output position — IR size would scale with `OutH * OutW`, easily
-thousands). Instead, the gather unrolls over `Kh * Kw` kernel taps
-(small — 9 to 49 for a realistic kernel), each one a single, fully static,
-non-unit-stride `memref.subview` + `memref.copy` covering every output
-position for that tap in one shot — `memref.subview` already supports a
-static stride generically, so no loop and no arithmetic are needed.
-
-Layer `i >= 1`'s weight is flattened **channel-last** (`[Cout, Kh, Kw,
-Cin]`), the *opposite* order from layer 0's NCHW-sourced, Cin-major
-flatten — because layer `i`'s own activation is NHWC by construction of
-how the gather lays out patches columns (tap-major, channel-minor within
-each tap). Getting this backwards produces IR that verifies, compiles,
-and runs, and computes the wrong answer — the same shape of danger as
-"the transpose" below, and mutation-tested the same way.
-
-Unlike a chain ending in `MatMulInteger` (whose own `"Y"` *is* the raw
-accumulator), a chain ending in `QLinearConv` must apply that layer's own
-bias and requantize: `QLinearConv`'s `"Y"` is *defined* by the ONNX spec
-as the fully quantized result, not a raw accumulator. So only the
-**last** layer of a conv chain keeps `load_qlinear_conv`'s own full
-generality — an asymmetric (including `uint8`) output, a per-channel
-`w_scale`, and a bias. Every earlier layer keeps the same restriction a
-chained conv feeding matmul layers has: `y_zero_point == 0`, a scalar
-`w_scale`, no bias. Every layer but the *first* additionally needs
-`x_zero_point == 0` — its activation arrives already zero-centered,
-produced by the previous layer's own zero-point-0 bridge, and the emitted
-IR applies no zero-point shift to an intermediate activation.
-
-## A conv stem feeding matmul layers
-
-A conv chain (two or more `QLinearConv` layers, above) feeding one or more
-`MatMulInteger` layers — a real conv stem into a fully-connected head, the
-realistic full CNN shape — is imported too, built by composing the
-conv-chain machinery above with the conv-to-matmul bridge earlier in this
-document, both reused rather than reimplemented. The bridge sits in one
-place only: `Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout])` after the
-chain's own **last** conv layer, feeding the first matmul — identical to
-the single-conv case, just applied to the last layer of a longer stem
-instead of the only one.
-
-Every conv layer here — **including the last** — keeps the restriction a
-single conv feeding matmul layers has (`y_zero_point == 0`, a scalar
-`w_scale`, no bias; every layer but the first also needs `x_zero_point ==
-0`). That is narrower than a standalone conv chain's own last layer, which
-gets full generality precisely *because* it is the graph's own declared
-output there — here, no conv layer is ever the graph's own output, since
-even the last one feeds the bridge into a matmul, never the graph
-directly.
-
-## `MaxPool` between convolutions
-
-A `MaxPool` node may sit directly between any two consecutive layers of a
-`QLinearConv` chain (two or more, above) — the first *non-matmul host op*
-this front end executes at all, rather than merely analyzes (see
-`analyze.py`, below). Unlike every quantized op documented so far, plain
-ONNX `MaxPool` carries no scale or zero point of its own: max is
-scale-invariant (`max(a·s, b·s) == max(a, b)·s` for any positive `s`), so
-a pooling layer needs no `cim.requantize` of its own — the *previous*
-conv layer's existing bridge already produced a real `int8` value,
-`MaxPool` folds `int8` to `int8` unchanged, and the *next* conv reads it
-directly.
-
-Emitted the same way a conv-to-conv gather is: `memref.expand_shape` the
-bridged activation into a 4-D `[N, H, W, C]` view, a padded buffer, and
-`Kh * Kw` fully static, non-unit-stride `memref.subview` taps — except the
-taps are folded by **one `cim.reduce_max`** call instead of being copied
-into columns of a matmul's patches buffer, since there is no matmul here
-at all. `cim.reduce_max` is the compiler's own first executable
-non-matmul primitive (docs/roadmap.md); it compares **signed**, matching
-what ONNX `MaxPool` on `int8` actually computes (`max(5, -1) == 5`, not
-`-1`'s raw byte pattern) — the sibling `cim.reduce_partial` is
-deliberately sign-agnostic (a wrapping add is bit-identical either way),
-so this is not a free choice.
-
-The pad value is **`-128`** (`INT8_MIN`), not `0` — a convolution's own
-correct pad value is wrong here, since `0` can beat a real negative
-activation value it should lose to. Confirmed by three independent
-implementations (`onnx.reference`, `onnxruntime`, and a hand-written
-NumPy max-pool) agreeing exactly on an all-negative `int8` input with real
-padding.
-
-**Scope is narrower than a convolution's own padding/stride support:**
-only `strides >= 2` on both axes, `ceil_mode` absent or `0`, and
-`auto_pad == "NOTSET"` are imported. The stride restriction exists because
-`onnx.reference` — the primary oracle every test in this front end is
-checked against — cannot evaluate an *integer* `MaxPool` at `strides == 1`
-at all: it pads with `np.nan` as its own "never wins the max" sentinel,
-which `np.pad` refuses to place into an integer array, and raises
-`ValueError: cannot convert float NaN to integer` for every kernel/shape/
-pads combination tried at stride 1. That is a gap in what can be
-*verified*, not a limitation of what this front end can *compile* — the
-same class of oracle bug already documented for `auto_pad=VALID` on a
-convolution, above. Padding itself stays fully in scope even though the
-stride restriction exists: `-128` is confirmed correct at `strides >= 2`,
-including with real padding.
-
-A pool must sit strictly between two real convolution layers — not
-before the first, not after the last, and not adjacent to a matmul layer
-— matching `emit_conv_chain_module`'s own `pool_params` restriction (a
-pool needs a real conv on both sides, to gather from and be gathered
-into). Composing pooling with the conv-to-matmul bridge is real,
-plausible follow-on work, not attempted here.
-
-**A module with pooling in it now compiles into a real-target binary, not
-just `cim-run`.** `cim.reduce_max` has a compiled `cim-lower-to-target`
-lowering (`lowerReduceMax`) that MATERIALIZES a non-contiguous operand —
-a fresh `memref.alloc` + `memref.copy` from the strided view — rather than
-staging it directly, since `byteSizeOf`/`hostPointer` both assume a
-contiguous memref and this front end's own pooling-window gather feeds
-`cim.reduce_max` exactly the opposite (non-unit-stride `memref.subview`
-taps, no per-tap contiguous copy of its own; see
-`emit_conv_chain_module`'s own `pool_params` docstring). Verified against
-a real compiled binary, over the real 4-tap 2x2-window shape, before this
-was automated. See `docs/roadmap.md`'s `lowerReduceMax` entry.
+Pooling compiles all the way to a real-target binary, not just `cim-run`:
+`cim-lower-to-target` materializes each non-contiguous pooling tap into a fresh contiguous
+buffer before staging it.
 
 ## What it refuses, and why refusing is the point
 
-It refuses rather than guesses, and the reason is sharper than usual: the
-failure mode of guessing here is not a crash. Dropping an op the importer
-does not recognise emits a module that compiles cleanly, runs, and
-computes a *different function than the model*. A confident wrong number
-is worse than a refusal.
+The failure mode of guessing here is not a crash. Dropping an unrecognized op emits a
+module that compiles cleanly, runs, and computes a *different function than the model*. A
+confident wrong number is worse than a refusal.
 
 | Refused | Because |
 |---|---|
-| `Gemm` | carries a bias operand `C`; the dialect has no bias op, so supporting it means dropping or fusing `C` — both silently change the arithmetic |
-| `MatMul` + `QuantizeLinear`/`DequantizeLinear` | float arithmetic; offloading it means choosing scales, i.e. calibration, which `cim-legalize-precision` also refuses to invent |
+| `Gemm` | its bias operand `C` has no dialect op; dropping or fusing it changes the arithmetic |
+| `MatMul` + `Quantize/DequantizeLinear` | float arithmetic; offloading it means inventing calibration scales |
 | `QLinearMatMul` | quantized int8 output reintroduces rounding-mode divergence |
-| any other op in the graph | see above — silently dropping it changes the computed function |
-| non-constant weight | weight-stationary hardware has nothing to make resident |
-| two constant operands | `cim-detect` needs exactly one, and silently declines otherwise |
-| `uint8` operands | `cim.mvm` and the simulator are signed; reading a `uint8` 200 as `int8` computes with −56 |
-| non-zero zero points | needs a per-output bias term the dialect cannot express |
+| any other op in the graph | silently dropping it changes the computed function |
+| a non-constant weight | weight-stationary hardware has nothing to make resident |
+| `uint8` operands | `cim.mvm` is signed; a `uint8` 200 read as int8 computes with −56 |
+| non-zero matmul zero points | needs a per-output bias term the dialect cannot express |
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
-| a chain bridge with a non-positive scale | `cim.requantize` requires a positive scale; a real positive scale is accepted (see above) |
-| a chain bridge with no or non-zero zero point | needs an explicit int8 zero point of 0, both to fix the output dtype at int8 and to stay symmetric |
-| a value read by more than one node along a chain bridge | a DAG needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
-| a grouped/depthwise `QLinearConv` (`group != 1`) | each group is really an independent matmul over a slice of channels, not one reshape |
-| a `QLinearConv` with a non-positive `dilations` entry | not a sampling pattern any real accelerator (or numpy's own strided slicing) can express; a positive dilation is accepted (see above) |
-| a `QLinearConv` with a non-zero `w_zero_point` | its correction term is per-row (activation-dependent), not a fixed per-channel bias, so it is not one of the reshapes above |
-| a `QLinearConv` with a non-scalar `x_zero_point` or `y_zero_point` | per-tensor activation/output quantization is the near-universal convention, unlike per-channel weight scale |
-| a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
-| two or more `QLinearConv` nodes that do not form a single linear chain | branching, disconnected, or cyclic — `load_conv_chain` needs a strict producer/consumer line, not a DAG |
-| a non-`QLinearConv` node inside a `QLinearConv` chain | a conv-to-conv edge needs no bridge node at all (see above); anything else in that position is unsupported |
-| a `MaxPool` with `strides == 1` on either axis | `onnx.reference` cannot evaluate an integer `MaxPool` at stride 1 at all — a gap in what can be verified, not what can be compiled (see above) |
-| a `MaxPool` with `ceil_mode == 1` | this front end's output-size formula (shared with every convolution) is floor-based |
-| a `MaxPool` with `auto_pad` other than `NOTSET` | same `onnx.reference` shape-dependent-padding bug as `QLinearConv`'s own `auto_pad` refusal, above |
-| a `MaxPool` outside a `QLinearConv` chain, or at its own edges | pooling needs a real convolution on both sides, to gather from and be gathered into |
+| a bridge with a non-positive scale, or a missing/non-zero zero point | `cim.requantize` needs a positive scale and an explicit int8 zero point of 0 |
+| a value read by more than one node along a chain | needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
+| a grouped/depthwise conv (`group != 1`) | each group is an independent matmul over a channel slice, not one reshape |
+| a conv with non-zero `w_zero_point` | its correction term is per-row and activation-dependent, not a fixed per-channel bias |
+| a conv with a non-scalar `x_zero_point`/`y_zero_point` | per-tensor activation quantization is the near-universal convention |
+| `auto_pad` other than `NOTSET`, on conv or pool | needs shape-dependent padding math this front end does not replicate. `VALID` is refused too, because `onnx.reference`'s own formula for it is wrong for `N != 1` or `Cin != 1` — an oracle bug, sidestepped rather than reproduced |
+| a chain of convs that is not strictly linear | branching, disconnected, or cyclic |
+| a `MaxPool` with `strides == 1` | `onnx.reference` cannot evaluate an integer `MaxPool` at stride 1 at all — a gap in what can be *verified*, not what can be compiled |
+| a `MaxPool` with `ceil_mode == 1` | this front end's output-size formula is floor-based |
+| a `MaxPool` outside a conv chain, or at its edges | pooling needs a real conv on both sides, to gather from and be gathered into |
 
-## The activation is required
+## Two things worth knowing
 
-The emitted module is `func.func @main()` with no arguments — `cim-run`
-takes no runtime inputs — so the module is **one baked inference** and the
-activation is a constant.
+**The activation is required.** The emitted module is `func.func @main()` with no
+arguments, so it is one baked inference and the activation is a constant. There is
+deliberately no default: `0 @ W == 0` for every `W`, so a zero default would make every
+downstream numerical check pass against any weight matrix at all — including one that was
+never transposed. Pass `--input` (`.npy` or `.json`), or `--input-random <seed>`, which is
+recorded in the module's provenance header.
 
-There is deliberately no default. A zero activation would not merely be
-arbitrary, it would be *actively harmful*: `0 @ W == 0` for every `W`, so
-every downstream numerical check would pass against any weight matrix at
-all, including one that was never transposed. Pass `--input` (a `.npy` or
-`.json`), or `--input-random <seed>` to synthesize one explicitly — which
-is recorded in the emitted module's provenance header.
+**The transpose.** ONNX stores the weight as `[K, N]`; `cim.mvm` indexes `W[n][k]`, so the
+importer emits `Bᵀ`. This is the single most dangerous thing here: getting it backwards
+produces structurally perfect IR and wrong numbers, and on a square weight it is completely
+silent. Guarded three ways — rectangular shapes throughout, a direct assertion on the
+emitted literal, and a mutation check proving that assertion has teeth.
 
-## The transpose
+## Rounding
 
-ONNX stores the weight as `[K, N]`. `cim.mvm` indexes `W[n][k]`, so the
-importer emits `Bᵀ`. This is the one genuinely dangerous thing in the
-front end: getting it backwards produces structurally perfect IR and
-wrong numbers, and on a square weight it is completely silent.
-`test/python/test_onnx_frontend.py` guards it three ways — rectangular
-shapes throughout so a missing transpose is a loud shape error, a direct
-assertion on the emitted literal, and a mutation check proving that
-assertion has teeth.
+`cim.requantize` rounds half-away-from-zero; ONNX's `QuantizeLinear` rounds half-to-even.
+They differ only at an exact tie. At `scale=1.0` there is never a fractional part, so no
+tie exists. At an **odd** integer scale a tie is mathematically impossible, so those chains
+also match exactly. At an even scale a genuine tie can occur, and a test pins that
+divergence explicitly rather than hiding it.
 
 ## Which passes to run downstream
 
-`cim-detect`, `cim-partition` and `cim-placement` reproduce the model's
-arithmetic exactly. The full eight-pass chain additionally runs
-`cim-legalize-precision`, which inserts a `cim.requantize` clamping every
-accumulator to the target's `precision.output_effective_bits` (8 in every
-shipped target). That is a real modeled hardware effect, not a bug — but
-it means the result stops matching an *unquantized* ONNX oracle as soon as
-any accumulator leaves `[-128, 127]`.
+`cim-detect`, `cim-partition` and `cim-placement` reproduce the model's arithmetic exactly.
+The full eight-pass chain also runs `cim-legalize-precision`, which clamps every
+accumulator to the target's `output_effective_bits`. That is a real modeled hardware
+effect, not a bug — but it means the result stops matching an *unquantized* ONNX oracle as
+soon as an accumulator leaves `[-128, 127]`.
 
 ## Analyzing a real model, without compiling it
 
-Everything above answers "does this model compile and run correctly".
-`--emit-workload` answers a different, narrower question: "how much
-weight-residency pressure does this real network put on a given chip" —
-without needing the whole graph to be offloadable, and without needing an
-activation at all.
+`--emit-workload` answers a narrower question: how much weight-residency pressure does this
+network put on a given chip? No activation needed, and the whole graph need not be
+offloadable.
 
 ```sh
 cim-import-onnx real_model.onnx --emit-workload -o workload.json
 cim-bench analyze --target erbium-8t --workload-file workload.json --out results.json
 ```
 
-The insight this rests on: **weight-residency cost is a function of
-shape, not execution.** `cim-bench`'s placement engine only ever needs a
-layer's `[K, N]` — never its values, and never an activation — so a real
-network's `MaxPool`, `Concat`, `Softmax`, or even a grouped convolution
-this front end cannot yet *compile* does not block *analysis* of the
-layers around it.
+This works because **weight-residency cost is a function of shape, not execution** — the
+placement engine only ever needs each layer's `[K, N]`. So a `MaxPool`, `Concat`,
+`Softmax`, or grouped convolution this front end cannot *compile* does not block *analysis*
+of the layers around it.
 
-`--emit-workload` (`cim_frontend.analyze`) walks the graph permissively —
-unlike every path above, it never refuses the whole model. Every node
-becomes either an offloadable layer (its `[k, n]` goes in the output's
-`layers`) or a skip (its op type and a stated reason go in `skipped`), and
-the walk always completes. `cim-bench analyze` reads that JSON with a
-small, dependency-free reader (`lib/Placement/WorkloadJSON.cpp`, same
-LLVM-free rationale as the target-YAML reader), maps each layer's `[k, n]`
-through the existing `partitionBlockCount` into a real placement problem,
-and runs the same Belady/LRU/FIFO comparison and cost report `cim-bench
-run`'s built-in workloads use.
+Unlike every path above, this walk never refuses the whole model: each node becomes either
+an offloadable layer or a skip with a stated reason, and the walk always completes.
 
-**This is not end-to-end inference cost, and every output says so.** Both
-the JSON `--emit-workload` produces and `cim-bench analyze`'s own output
-(stdout and JSON) state in words how many layers were analyzed and how
-many other ops were skipped, and name the reason for each skip — a number
-that silently represented only part of a network is exactly the kind of
-confident-but-partial result this project refuses to publish anywhere
-else.
+**This is not end-to-end inference cost, and every output says so** — both the JSON and
+`cim-bench analyze`'s own output state how many layers were analyzed, how many ops were
+skipped, and why.
 
 ## Tests
-
-- `test/python/test_onnx_emitter.py` — needs no ONNX and no build; pins
-  the emitted IR shape against the pipeline's own module builder.
-- `test/python/test_onnx_frontend.py` — the end-to-end differential
-  against `onnx.reference` (the spec's own implementation) and
-  `onnxruntime`, including a batched (M > 1) case with independently
-  sampled per-row values.
-- `test/python/test_onnx_frontend_refusals.py` — one test per refusal
-  above, plus a case proving it does not refuse everything.
-- `test/python/test_onnx_frontend_chain.py` — the multi-layer counterpart:
-  a 3-layer differential (the `mlp-3layer` shape), a batched 3-layer
-  differential, a case that actually saturates the bridge's clamp,
-  placement invariance across layers, the chain-specific refusals (bad
-  scale, bad zero point, fan-out), a real (odd, non-1.0) calibrated scale
-  matched against `onnx.reference`'s quantized evaluation, and a hand-built
-  exact-tie case documenting the known rounding-mode divergence at an even
-  scale.
-- `test/python/test_onnx_frontend_conv.py` — the convolution counterpart:
-  a strided/padded differential against `onnx.reference`'s own quantized
-  `QLinearConv` evaluation, a batched (N > 1) case proving im2col's batch
-  flattening composes with M > 1, a full-int8-range 1x1-kernel case at an
-  odd derived scale (guaranteed no rounding tie), a hand-built exact-tie
-  case documenting the known rounding-mode divergence, a per-channel-scale
-  differential, a bias differential, asymmetric `x_zero_point` and
-  `y_zero_point` differentials, a dilated-convolution differential with
-  deliberately asymmetric dilation/stride, a uint8-output differential
-  proving the `-128`/`+128` shift is exact at a non-edge `y_zero_point`,
-  one refusal test per convolution-specific row above (including the
-  all-zero-but-per-channel-shaped `w_zero_point` a real model ships), and
-  direct, `onnx`-free unit tests of `im2col_nchw` (including its dilation
-  path) against an independent hand-written convolution loop. Also
-  validated, outside CI, against `squeezenet1.0-12-int8` (ONNX model zoo)
-  itself — see `docs/roadmap.md`'s M4 entry for the exact result.
-- `test/python/test_onnx_frontend_conv_matmul_chain.py` — the
-  conv-feeding-matmuls counterpart: a single-matmul differential, a
-  two-matmul differential with a strided/padded conv and a real bridge
-  scale, a batched (N > 1) differential, an anti-vacuity check that a
-  perturbation in the matmul layer (not the conv) is actually caught, and
-  refusal tests for a missing/wrong Transpose-Reshape bridge, more than
-  one convolution, a non-zero or `uint8` conv output, a per-channel
-  `w_scale`, and a conv bias — including one case, found by mutation-
-  testing the missing-bridge refusal, where a substring match on the
-  literal word "Transpose" would have passed for the wrong reason (a
-  *different*, later check also happens to print that word while
-  describing a mislabeled node), fixed by matching the specific guard's
-  own wording instead.
-- `test/python/test_onnx_frontend_conv_chain.py` — the conv-to-conv
-  counterpart: a two-layer differential, a combined stride/pad/dilation
-  differential on an interior layer, a batched (N > 1) differential, a
-  three-layer differential (exercising the channel-last weight flatten on
-  two different layers with distinct Cin/Cout, so a wrong flatten order
-  could not accidentally line up), a differential exercising the last
-  layer's own bias and an asymmetric (`uint8`) output together, an
-  anti-vacuity check that a perturbation in an *interior* layer (neither
-  first nor last) of a 3-layer chain is actually caught, and refusal tests
-  for a stray non-conv node, a branching or disconnected chain, a
-  non-zero `y_zero_point`/per-channel `w_scale`/bias on a non-last layer,
-  a non-zero `x_zero_point` on a non-first layer, a `uint8` output on a
-  non-last layer, and a `Cin`/`Cout` mismatch between adjacent layers.
-- `test/python/test_onnx_frontend_conv_chain_matmul_chain.py` — the conv
-  stem-feeding-matmuls counterpart: a two-conv-layer chain feeding one
-  matmul, a combined stride/pad/dilation interior conv layer feeding two
-  matmuls with a real inter-matmul bridge scale, a batched (N > 1)
-  differential, a three-conv-layer chain feeding a matmul, two
-  anti-vacuity checks (a perturbation in an interior conv layer, and
-  separately in the matmul layer), and refusal tests for a missing
-  Transpose/Reshape bridge after the chain, a non-zero `y_zero_point`/
-  per-channel `w_scale`/bias on the LAST conv layer (unlike a standalone
-  conv chain, no conv layer here ever gets that generality), a non-zero
-  `x_zero_point` on a non-first conv layer, and a `uint8` output on the
-  last conv layer.
-- `test/python/test_onnx_frontend_conv_pool_chain.py` — the `MaxPool`
-  counterpart: an independent, hand-written NumPy `MaxPool` oracle
-  (checked against `onnx.reference` itself first, at the only strides the
-  primary oracle can evaluate at all), a two-conv-one-pool differential, a
-  padded-pool differential (against a negative-heavy activation, so an
-  incorrect pad value would win a max it should lose), an overlapping-
-  window (`kernel > stride`) differential, the full conv-pool-conv-pool-
-  conv shape, a batched (N > 1) differential, an anti-vacuity check that a
-  perturbation in the conv layer *after* the pool is actually caught, and
-  refusal tests for `strides == 1`, `ceil_mode == 1`, a non-`NOTSET`
-  `auto_pad`, a pool at the chain's own edge, a stray non-conv/non-pool
-  node, and (a dispatch regression guard) a pure pool-free conv chain
-  still routing to `load_conv_chain`.
-- `test/Run/reduce-max.mlir` — `cim.reduce_max` end to end through the
-  shipped binaries, in the exact shape a `MaxPool` kernel window uses
-  (several strided `memref.subview` taps of one padded buffer, folded by a
-  single variadic op), with operands chosen so a signed compare, an
-  unsigned byte compare, and an add (`cim.reduce_partial` by mistake) all
-  disagree in both elements — this test cannot pass by luck under any of
-  those three wrong implementations.
-- `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
-  in, so the `mlir` CI job guards the shape without the ONNX packages.
-- `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid
-  matmul/conv is offloaded not skipped, an unrecognized op is skipped with
-  a named reason rather than crashing the walk, a grouped convolution is
-  still offloaded (shape-only analysis, unlike compilation), the honesty
-  `note` field, and a regenerate-and-diff check on the checked-in
-  `test/workloads/small-cnn-workload.json` fixture.
-- `test/python/test_workload_json_differential.py` — the C++
-  `WorkloadJSON` reader vs Python's own `json` module on the same file,
-  including `\u` escapes and quote-bearing names.
-- `test/python/test_cim_bench_analyze.py` — `cim-bench analyze` end to
-  end against the checked-in fixture, including a mutation check that
-  enlarging one real layer's `K` moves the placed program count.
-- `test/unit/workload_json_test.cpp` — the JSON reader's own rejection
-  table, same convention as `parser_error_test.cpp`'s for the YAML reader.
-
-Install the optional dependencies with:
 
 ```sh
 pip install -r test/python/requirements-onnx.txt
 ```
 
-Without them these tests skip; they never fail.
+Without the optional dependencies these skip; they never fail.
+
+| Test | Covers |
+|---|---|
+| `test_onnx_emitter.py` | Emitted IR shape. Needs no ONNX and no build. |
+| `test_onnx_frontend.py` | The end-to-end differential against `onnx.reference` and `onnxruntime`, including a batched case |
+| `test_onnx_frontend_refusals.py` | One test per refusal above, plus a case proving it does not refuse everything |
+| `test_onnx_frontend_chain.py` | Multi-layer matmul chains, the clamp, placement invariance, real calibrated scales, the known tie divergence |
+| `test_onnx_frontend_conv.py` | Convolution: strided/padded, batched, per-channel scale, bias, asymmetric zero points, dilation, uint8 output, plus `onnx`-free unit tests of `im2col_nchw` |
+| `test_onnx_frontend_conv_matmul_chain.py` | Conv feeding matmuls, and the bridge refusals |
+| `test_onnx_frontend_conv_chain.py` | Conv-to-conv chains, including the channel-last weight flatten |
+| `test_onnx_frontend_conv_chain_matmul_chain.py` | A conv stem feeding a fully-connected head |
+| `test_onnx_frontend_conv_pool_chain.py` | `MaxPool`, against an independent hand-written NumPy oracle |
+| `test_analyze.py`, `test_workload_json_differential.py`, `test_cim_bench_analyze.py` | `--emit-workload` and the C++ JSON reader that consumes it |
+
+Each differential also carries an **anti-vacuity check**: a deliberate perturbation in an
+interior layer must actually be caught, so a test that passes for the wrong reason gets
+found.

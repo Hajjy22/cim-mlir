@@ -418,7 +418,7 @@ ops = [
     ("cim.reduce_partial", "Elementwise integer sum of N buffers "
                            "(partial sums, and bias add)", "both"),
     ("cim.reduce_max", "Elementwise SIGNED integer maximum of N buffers "
-                       "(a pooling window)", "interp"),
+                       "(a pooling window)", "both"),
     ("cim.requantize", "Round, offset and clamp an accumulator", "both"),
     ("cim.copy", "Explicit memory-space transfer", "both"),
     ("cim.barrier", "Ordering", "both"),
@@ -435,8 +435,9 @@ for name, desc, where in ops:
 S.append(table(rows, [38 * mm, CONTENT_W - 38 * mm - 44 * mm,
                       22 * mm, 22 * mm]))
 S.append(Paragraph(
-    "The single red cell is the most concrete open gap in the compiler "
-    "and is addressed in section 5.", Small))
+    "Every operation in the dialect now has both an interpreter path and "
+    "a compiled path. The last asymmetry &mdash; pooling &mdash; closed "
+    "this cycle.", Small))
 
 S.append(Paragraph("2.4&nbsp;&nbsp;Runtime ABI and target description", H2))
 S.append(Paragraph(
@@ -523,6 +524,12 @@ work = [
      "bytes, compile, run, and quietly return the wrong answer. Landed "
      "with full cost accounting, which a first draft of the plan missed "
      "entirely."),
+    ("Compiled pooling", "The last dialect asymmetry, closed.",
+     "The compiled path assumes contiguous buffers, but a pooling window "
+     "is a set of strided views. Rather than refuse it, the lowering now "
+     "materialises each non-contiguous operand into a fresh contiguous "
+     "copy before staging &mdash; hand-verified against a real linked "
+     "binary on the real window shape before it was automated."),
     ("MaxPool chaining", "Pooling interleaved into a convolution chain.",
      "The reference oracle cannot evaluate integer pooling at unit "
      "stride at all, so that case is refused on verifiability grounds "
@@ -634,11 +641,6 @@ S.append(Paragraph("5.2&nbsp;&nbsp;Capability gaps", H2))
 rows = [[Paragraph(h, THead) for h in
          ("Gap", "Why it matters", "Size")]]
 gaps = [
-    ("No compiled lowering for the pooling primitive",
-     "Every other dialect operation works on both the interpreter and the "
-     "compiled path. A pooling network therefore runs under the "
-     "interpreter but cannot be built into a real-target binary. A plan "
-     "is written and ready to execute.", "Small"),
     ("No calibration",
      "Requantization scales are fixed rather than derived per layer. The "
      "arithmetic is already general; what is missing is a calibration "

@@ -631,7 +631,7 @@
 
     <section id="dialect">
       <h2>Dialect reference</h2>
-      <p>Nine ops, three types (<code>!cim.device</code>, <code>!cim.tile</code>, <code>!cim.resident</code>) and one memory-space attribute. Grouped by what they are for.</p>
+      <p>Ten ops, three types (<code>!cim.device</code>, <code>!cim.tile</code>, <code>!cim.resident</code>) and one memory-space attribute. Grouped by what they are for.</p>
 
       <h3>Device and tiles</h3>
       <div class="op">
@@ -728,7 +728,7 @@
             <tr>
               <td>The dialect</td>
               <td><span class="pill works">working</span></td>
-              <td>Nine ops on MLIR 18, with verifiers and round-trip tests</td>
+              <td>Ten ops on MLIR 18, with verifiers and round-trip tests</td>
             </tr>
             <tr>
               <td>Functional simulator</td>
@@ -768,7 +768,7 @@
             <tr>
               <td>ONNX front end</td>
               <td><span class="pill works">layers and chains</span></td>
-              <td>Reads a real .onnx MatMulInteger model or chain of them, checked against ONNX's own reference implementation</td>
+              <td>Reads real .onnx matmul chains, convolutions, conv chains and MaxPool, each checked against ONNX's own reference implementation</td>
             </tr>
             <tr>
               <td>Real hardware backend</td>
@@ -780,32 +780,22 @@
       </div>
 
       <div class="limit">
-        <span class="tag">Placement across iterations — the number, and why it stops there</span>
-        <p>The benchmark table quotes the <strong>standalone simulator</strong>: 8538 weight-programming ops against 16000 for LRU and FIFO under 2× spill pressure. The compiler does not emit exactly that, and the distance is now measured rather than described.</p>
-        <p>On the same shape — 16 weight blocks over 8 tiles — the compiler emits <strong>7 + 9×T</strong> programs, so 9007 at 1000 inferences against the optimum's 8538. That is a <strong>5.5%</strong> gap, and against LRU's 16000 it is a 43.7% reduction where the table claims 47%. Both numbers and the gap between them are now fields in the compiler's own cost report, so this stays checked rather than asserted.</p>
-        <p>The residual is not a missing optimization. <code>7 + 9×T</code> is <code>tiles−1</code> weights held permanently plus <code>blocks−(tiles−1)</code> reprogrammed each iteration, which is the best <em>any</em> single loop body can do: a weight that nothing in the body programs is never written and so holds a tile forever, and at most <code>tiles−1</code> weights can do that. The unrestricted schedule wins the remaining 5.5% only by <strong>varying how many weights it programs from one iteration to the next</strong> — 8 on some, 9 on others. A loop body executes a fixed set of ops every time round, so it cannot emit a varying number of them.</p>
-        <p>That last point is worth stating because the obvious fix does not work. It looks like the optimal schedule merely rotates which tile holds which weight, which a tile index computed from the loop counter could express. It does not: the count varies, not just the assignment, and no choice of indices changes a fixed body's op count. There is a test pinning that, specifically so the next person does not spend the dialect change to buy nothing.</p>
+        <span class="tag">Placement under spill — the number, and why it stops there</span>
+        <p>The benchmark table quotes the <strong>standalone simulator</strong>: 8538 weight-programming ops against 16000 for LRU and FIFO under 2&times; spill pressure. The compiler emits <strong>7 + 9&times;T</strong> instead &mdash; 9007 at 1000 inferences, a <strong>5.5%</strong> gap. Both numbers and the gap are fields in the compiler's own cost report, so this stays checked rather than asserted.</p>
+        <p>The residual is not a missing optimization. <code>tiles&minus;1</code> weights held permanently plus <code>blocks&minus;(tiles&minus;1)</code> reprogrammed each iteration is the best <em>any</em> single loop body can do. The unrestricted schedule wins the remaining 5.5% only by varying how many weights it programs from one iteration to the next, and a loop body executes a fixed set of ops every time round. A test pins that, so the next person does not spend a dialect change to buy nothing.</p>
+        <p>The bound is aimed at directly, not stumbled into: a <strong>pin-and-stream</strong> schedule pins the <code>tiles&minus;1</code> most-used weights and streams the rest through the one remaining tile. Provably optimal by exhaustive search when every weight in a body is used once; a heuristic proven never worse than pinning nothing when a weight repeats.</p>
       </div>
 
       <div class="limit">
-        <span class="tag">Now reached deliberately, not by accident</span>
-        <p>Until recently the compiler reached that per-iteration bound <strong>by accident rather than by aiming at it</strong>: an eviction scan that starts at tile 0 and stops at the first weight with no future use happens to leave tile 0 absorbing the whole spill and every other tile written exactly once — precisely the condition that marks a weight as permanently resident. A reasonable-looking cleanup of that scan would have spread evictions instead, silently degrading the workload to what a plain LRU cache does. A structural test guards exactly that regression, because the numerical suites cannot see it — a compiler that holds nothing permanently still computes identical values, just more of them per iteration.</p>
-        <p>The bound is now aimed at directly. A <strong>pin-and-stream</strong> schedule pins the <code>tiles−1</code> most-used weights to permanent tiles by occurrence count (ties broken by first-use order) and streams everything else through the one remaining tile via a single-tile Belady sub-solve — single-tile solves are trivial and deterministic, since there is never a victim to choose between. The compiler computes both this schedule and the ordinary per-block solve for every constant-trip loop and takes whichever is strictly cheaper, so every case where the two already agreed is rewritten byte-for-byte unchanged.</p>
-        <p>When every weight in a loop body is used exactly once — <code>cim-partition</code>'s own shape, and every workload in the benchmark table above — pin-and-stream is <strong>provably optimal</strong>, checked by exhaustive search over every permutation up to 7 distinct weights against every tile count. When a weight repeats within one body the pin choice becomes a heuristic (the true optimum there is a residency fixed-point problem this project does not solve exactly), but it is proven never worse than pinning nothing at all, and its own output always replays as a genuine fixed point — checked exhaustively on small alphabets and on 500 random instances. That repeated-weight case is exactly the one the old accidental mechanism could fail on; there is now a test built specifically to hit it, on both the structural IR shape and the computed numbers.</p>
-      </div>
-
-      <div class="limit">
-        <span class="tag">A real model file now compiles</span>
-        <p>Until recently, nothing in this project read a model file. Every claim about correct arithmetic started from MLIR the project itself had written — hand-written in the structural tests, generated by a string builder in the differential tests. A front end in <code>python/</code> now reads a real <code>.onnx</code> file and emits the same MLIR the pipeline was already proven on: one <code>MatMulInteger</code> node — int8 in, int32 accumulator out, exactly the v0.1 contract in a single ONNX op — with a constant weight.</p>
-        <p>It is checked against ONNX's own reference implementation, not against this project's idea of what the model means: <code>onnx.reference.ReferenceEvaluator</code> ships inside the <code>onnx</code> package and is written by the people who write the specification, plus <code>onnxruntime</code> as a second, independent oracle where it is installed. Not PyTorch — heavier, and a producer of ONNX rather than the format's reference implementation.</p>
-        <p>Everything the front end does not recognize is <strong>refused, never silently dropped</strong> — an unrecognized op, a non-constant weight, a <code>uint8</code> operand, a non-zero zero point, more than one output row. Skipping an op it does not understand would emit a module that compiles, runs, and computes a different function than the model; that is a worse failure than declining to compile at all, and it is the same discipline <code>cim-partition</code> already applies when it refuses a plain <code>linalg.matmul</code> rather than guessing a transpose.</p>
-        <p>The one place a wrong answer could hide silently: ONNX stores its weight matrix <code>[K, N]</code>, and <code>cim.mvm</code> needs it output-major, <code>[N, K]</code>. Getting that transpose backwards produces structurally perfect IR and wrong numbers — invisible on a square matrix. It is checked three ways: every test shape is rectangular so a missing transpose is a loud shape error rather than a quiet wrong one, the emitted weight literal is asserted equal to the transpose directly, and a mutation test proves that assertion would actually fail without the transpose.</p>
-        <p>A chain of layers is imported too, now — one <code>MatMulInteger</code> is the whole v0.1 contract, but it is also the one shape where placement has nothing to reuse across. Real cross-layer eviction, the <code>mlp-3layer</code> row in the benchmark table above, needs more than one weight matrix competing for the tile budget. Consecutive layers are bridged by exactly one accepted pattern — <code>Cast(to=float32) → QuantizeLinear(scale=1.0, zero_point=0)</code> — lowered to a real <code>cim.requantize</code> between the compiled matmuls. Scale 1.0 is not a simplification, it is what keeps the chain matching an <em>unquantized</em> oracle exactly: <code>cim.requantize</code> rounds half-away-from-zero and ONNX's <code>QuantizeLinear</code> rounds half-to-even, two modes that diverge only at a tie, and rounding an already-integer accumulator by 1.0 never has a fractional part to tie on. Checked against a real <code>cim-opt</code>/<code>cim-run</code> round trip by hand before any of the graph-walking code that finds this pattern was written.</p>
+        <span class="tag">A real model file compiles</span>
+        <p>A front end in <code>python/</code> reads a real <code>.onnx</code> file and emits the same MLIR the pipeline was already proven on &mdash; matmul chains, convolutions, conv chains, and MaxPool between convolutions. Results are checked against <code>onnx.reference</code>, written by the people who write the specification, plus <code>onnxruntime</code> as a second oracle where installed.</p>
+        <p>Anything it does not recognize is <strong>refused, never silently dropped</strong>. Skipping an unknown op would emit a module that compiles, runs, and computes a different function than the model &mdash; a worse failure than declining to compile.</p>
+        <p>The one place a wrong answer could hide silently: ONNX stores its weight <code>[K, N]</code> and <code>cim.mvm</code> needs <code>[N, K]</code>. Getting that transpose backwards gives structurally perfect IR and wrong numbers, invisible on a square matrix. Checked three ways &mdash; rectangular test shapes so a missing transpose is a loud shape error, a direct assertion on the emitted literal, and a mutation test proving that assertion has teeth.</p>
       </div>
 
       <div class="limit">
         <span class="tag">On the cost numbers</span>
-        <p>The target file's cost figures are <strong>estimates, not measurements</strong>, and the file says so in a provenance field the tools read and print a warning about on every run. Energy figures derived from them inherit that uncertainty. The counts are of weight programming, not end-to-end wall clock.</p>
+        <p>The target file's cost figures are <strong>estimates, not measurements</strong>, and the file says so in a provenance field the tools warn about on every run. Energy figures inherit that uncertainty. The counts are of weight programming, not end-to-end wall clock.</p>
       </div>
     </section>
 

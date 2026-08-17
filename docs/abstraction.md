@@ -1,149 +1,102 @@
-# The cim-mlir hardware abstraction model
+# The hardware abstraction model
 
-This is the most valuable file in this repository — more valuable than the
-code, because it is the part that is hard to reproduce. Everything else in
-this project follows from the model described here. Get this right and the
-project has value even if the code around it is mediocre.
+This is the most valuable file in the repository. Everything else follows from it.
 
-## The problem in one paragraph
+## The problem
 
-CIM/PIM hardware exists and some of it ships. What does not exist is a way
-to take a normal neural network — a PyTorch model, an ONNX file — and run
-it on that hardware without hand-writing assembly or using a vendor's
-closed, single-chip compiler. Every vendor rebuilds this layer privately and
-badly. Academic work (PrIM, SimplePIM, DaPPA) solved it for exactly one chip
-(UPMEM). The result is that CIM/PIM hardware has no software gravity, and
+CIM/PIM hardware exists and some of it ships. What does not exist is a way to run a normal
+neural network on it without hand-written assembly or a vendor's closed, single-chip
+compiler. Every vendor rebuilds this layer privately. Academic work (PrIM, SimplePIM,
+DaPPA) solved it for exactly one chip. So CIM hardware has no software gravity — and
 hardware without software gravity does not get adopted.
 
 ## Five axes of variation
 
-Real CIM/PIM hardware varies along five axes. A useful abstraction must
-parameterize all five and assume none.
+Real hardware varies along five axes. A useful abstraction parameterizes all five and
+assumes none.
 
-| Axis | Range in real hardware | Why the compiler must care |
+| Axis | Range in real hardware | Why the compiler cares |
 |---|---|---|
-| **Compute locality** | In the bitcell array (analog crossbar) → at the sense amps / bitline (digital in-memory) → beside the bank (near-memory logic) → on the DIMM (UPMEM DPU) | Determines what a single "operation" costs and what data must move |
-| **Weight residency** | Weight-stationary and persistent → reloaded per layer | The dominant scheduling constraint. Reprogramming cost varies by ~1000× |
-| **Persistence** | Volatile SRAM → non-volatile MRAM/RRAM/flash | Non-volatility means weights survive power-off: enables intermittent/always-on execution models that have no equivalent in a normal compiler |
-| **Precision** | Analog 3–8 bit effective → digital INT8 / FP8 / BF16 | Determines whether quantization/legalization passes are needed and whether accuracy must be modeled |
-| **Control model** | Host-driven offload → autonomous in-memory cores (host-less) | Determines whether the compiler emits a kernel or a whole program |
+| **Compute locality** | In the bitcell array → at the sense amps → beside the bank → on the DIMM | Sets what one operation costs and what data must move |
+| **Weight residency** | Persistent and weight-stationary → reloaded per layer | The dominant constraint. Reprogramming cost varies by ~1000× |
+| **Persistence** | Volatile SRAM → non-volatile MRAM/RRAM/flash | Non-volatile weights survive power-off, enabling execution models a normal compiler has no equivalent for |
+| **Precision** | Analog 3–8 effective bits → digital INT8/FP8/BF16 | Decides whether quantization passes are needed at all |
+| **Control model** | Host-driven offload → autonomous in-memory cores | Decides whether the compiler emits a kernel or a whole program |
 
-## The unifying abstraction: the Tile
+## The unifying abstraction: the tile
 
 All CIM/PIM hardware is modeled as an array of **tiles**. A tile is:
 
-> A fixed-capacity 2D compute-and-storage unit that can hold a weight
-> sub-matrix and perform a matrix-vector multiply (MVM) against it.
+> A fixed-capacity 2D compute-and-storage unit that can hold a weight sub-matrix and
+> perform a matrix-vector multiply against it.
 
-This is deliberately the *lowest common denominator*. A UPMEM DPU is a tile
-(with an unusual, wide, programmable MVM). A 256×256 digital SRAM CIM macro
-is a tile. An analog crossbar is a tile. A near-memory RISC-V + iRAM cluster
-is a tile. See `!cim.tile` in `include/cim/Dialect/CIMTypes.td` and the
-`tiles:` block in `targets/*.yaml` for how this shows up in the dialect and
-target schema respectively.
+This is deliberately the lowest common denominator. A UPMEM DPU is a tile. A 256×256
+digital SRAM macro is a tile. An analog crossbar is a tile. A near-memory RISC-V cluster
+is a tile.
 
-A tile carries: `rows`/`cols` (weight sub-matrix capacity), `weight_dtype`/
-`activation_dtype` (precision), `persistent`/`persistence` (does it survive
-power-off?), and cost fields for programming vs. computing (see below).
+A tile carries `rows`/`cols`, its weight and activation dtypes, whether it is persistent,
+and its programming and compute costs. See `!cim.tile` in
+`include/cim/Dialect/CIMTypes.td` and the `tiles:` block in
+[`target-format.md`](target-format.md).
 
-## The critical asymmetry the compiler exists to exploit
+## The asymmetry the compiler exists to exploit
 
-On a GPU, loading weights and computing cost roughly comparable amounts.
-**On CIM hardware they differ by orders of magnitude**, and on non-volatile
-CIM the asymmetry is extreme: writes to MRAM/RRAM are slow and
-energy-hungry, but once written the weights sit there at zero standby
-leakage indefinitely.
+On a GPU, loading weights and computing cost roughly the same. **On CIM hardware they
+differ by orders of magnitude.** On non-volatile CIM the gap is extreme: writes are slow
+and energy-hungry, but once written the weights sit there at zero standby leakage.
 
-This means the central optimization problem is not "schedule the math." It is:
+So the central optimization problem is not "schedule the math". It is:
 
-> **Given N physical tiles and a model with M weight matrices where M > N,
-> decide which weights live where and when, to minimize total reprogramming
-> cost.**
+> **Given N physical tiles and a model with M > N weight matrices, decide which weights
+> live where and when, to minimize total reprogramming cost.**
 
-This is a scheduling + placement problem that no mainstream ML compiler
-solves, because no mainstream hardware has this cost structure. **This is
-the thesis of the entire project.** The `cim-placement` pass
-(`lib/Transforms/CIMPlacement.cpp`) is the pass that implements it, and if
-this project builds nothing else of value, it builds that pass.
+No mainstream ML compiler solves this, because no mainstream hardware has this cost
+structure. **This is the thesis of the project**, and `cim-placement`
+(`lib/Transforms/CIMPlacement.cpp`) is the pass that implements it.
 
-Because the model graph is static, the whole use sequence is known at compile
-time — so the theoretically optimal replacement policy (Belady/furthest-in-future,
-which a runtime cache can never implement) is available here. The pass recovers
-that sequence from the emitted `cim.program` ops, solves it, and rewrites the IR:
-weights already resident in a tile are reused rather than reprogrammed.
+Because the model graph is static, the whole use sequence is known at compile time — so
+Belady's optimal replacement policy, which a runtime cache can never implement, is
+available here.
 
-How far that currently reaches: reuse is found **within a block**, across
-matmuls that share weights. Two matmuls against one weight global on a device
-whose tiles fit them emit two `cim.program` ops instead of four, and under spill
-pressure Belady still beats what an LRU cache would do.
+### How far it currently reaches
 
-Loops are handled too, but conservatively rather than by solving the same
-problem again at a larger scale. A `cim.program` is hoisted out of an
-`scf.for` when its tile is written by nothing else within one loop iteration
-and the loop's trip count is a compile-time constant proven positive — never
-out of a loop that might run zero times, never out of one nested inside
-another. This reproduces the project's headline claim on real IR for the
-first time: a model that fits entirely in tiles reprograms once, no matter
-how many inferences the loop runs.
-
-Under spill it comes close to, but does not exactly match, a full
-N-inference Belady solve — and the interesting part is *why*, which is now
-measured rather than assumed. The pass emits the proven optimum for any
-single loop body: `tiles-1` weights hoisted to permanent residency plus
-`blocks-(tiles-1)` reprogrammed per iteration. The unrestricted solve does
-better only by varying how many weights it programs from one iteration to
-the next, and a fixed loop body executes a fixed set of ops every
-iteration, so it cannot express that. On the standard spill shape the
-difference is 5.5%. The compiler now computes both numbers on the real IR
-and reports the gap, so this is a measurement in the artifact rather than
-a caveat in prose. See `docs/roadmap.md`'s M3 section.
-
-Reaching that `tiles-1`/`blocks-(tiles-1)` bound is deliberate, not
-incidental: `cim::computeSteadyStatePlacement` pins the `tiles-1`
-most-used weights and streams the rest through the one remaining tile —
-provably exact when every weight in a body is used once (`cim-partition`'s
-own shape), a validated heuristic otherwise — and `cim-placement` uses it
-whenever it beats the ordinary per-block solve. This also closes the one
-case the ordinary solve's own eviction tie-break could miss: a weight used
-more than once within a single loop body.
+- **Within a block.** Two matmuls sharing a weight emit two `cim.program` ops instead of
+  four. Under spill, Belady still beats LRU.
+- **Across loop iterations.** A `cim.program` is hoisted out of an `scf.for` when its tile
+  is written by nothing else in one iteration and the trip count is a compile-time
+  constant proven positive. This reproduces the headline claim on real IR: a model that
+  fits reprograms *once*, however many inferences run.
+- **Under spill**, it emits `tiles-1` weights pinned plus `blocks-(tiles-1)` reprogrammed
+  per iteration — the proven optimum for any *single loop body*. An unrestricted solve
+  beats that only by varying its per-iteration program count, which a fixed loop body
+  cannot express. On the standard spill shape the gap is 5.5%, and the compiler computes
+  and reports both numbers rather than leaving it as a caveat.
 
 ## Reaching this model from a real file
 
-Everything above is checked against MLIR this project wrote itself — hand-
-written in the FileCheck tests, generated by a string builder in the
-differential tests. `python/cim_frontend` closes the other end: it reads a
-real `.onnx` file (one `MatMulInteger` node, INT8 in, int32 accumulator
-out — the v0.1 contract in a single op) and emits the same MLIR shape, and
-`test/python/test_onnx_frontend.py` checks the compiled result against
-`onnx`'s own reference implementation, not against this project's idea of
-what the model means. Everything the front end does not recognize is
-refused rather than silently dropped, for the same reason `cim-partition`
-refuses a plain `linalg.matmul` rather than guessing a transpose: a module
-that compiles and computes a different function than the model is worse
-than one that does not compile at all.
+`python/cim_frontend` reads a real `.onnx` file and emits this same MLIR, and its results
+are checked against ONNX's own reference implementation rather than against this
+project's idea of what a model means. Anything it does not recognize is refused, not
+silently dropped — a module that compiles and computes a different function than the
+model is worse than one that does not compile.
 
 ## Memory spaces
 
-Three address spaces are modeled as MLIR memory-space attributes on
-`memref` (`#cim.space<host|near|insitu>` in `include/cim/Dialect/CIMAttrs.td`):
+Three address spaces, modeled as memory-space attributes on `memref`
+(`#cim.space<host|near|insitu>`):
 
-- `#cim.space<host>` — normal host DRAM
-- `#cim.space<near>` — memory local to the compute-in-memory unit (DPU
-  scratchpad, tile buffer)
-- `#cim.space<insitu>` — the weight array itself, where compute happens
+- `host` — normal host DRAM
+- `near` — memory local to the compute unit (DPU scratchpad, tile buffer)
+- `insitu` — the weight array itself, where compute happens
 
-Transfers between spaces are explicit ops (`cim.copy`). Nothing implicit.
-This is the single design decision that makes cost modeling honest: every
-byte that moves between spaces is visible in the IR, and therefore every
-byte that moves is accounted for in the cost report (`cim-cost-report`).
+Transfers between spaces are explicit `cim.copy` ops. Nothing is implicit. That single
+decision is what makes cost modeling honest: every byte that moves is visible in the IR,
+so every byte that moves is accounted for.
 
-## What this project deliberately does not model (v0.1)
+## Not modeled in v0.1
 
-Out of scope for the v0.1 contract (see `docs/roadmap.md`): training,
-floating point, convolutions, attention/softmax, multi-chip execution,
-dynamic shapes, analog noise modeling, and autotuning. Analog CIM is
-modeled as a target *class* (`class: analog_cim` in the target schema) but
-the first working targets are digital/near-memory, because that is what
-ships. Cycle-accurate hardware timing is explicitly out of scope in favor
-of an analytical cost model (spec Sec. 9.2) — if real timing is later
-needed, integrate Ramulator2 rather than rebuilding a simulator.
+Training, floating point, attention/softmax, multi-chip execution, dynamic shapes, analog
+noise, and autotuning. Analog CIM is modeled as a target *class* but the first working
+targets are digital. Cycle-accurate timing is deliberately out of scope in favor of an
+analytical cost model; if real timing is later needed, integrate Ramulator2 rather than
+rebuilding a simulator.
