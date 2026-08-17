@@ -50,7 +50,8 @@ import hashlib
 
 import numpy as np
 
-from .emit import emit_chain_module, emit_module, sanitize_symbol
+from .emit import (emit_chain_module, emit_conv_chain_module, emit_module,
+                   sanitize_symbol)
 from .im2col import im2col_nchw
 from .refusal import Refusal
 
@@ -1446,6 +1447,368 @@ def load_conv_matmul_chain(model):
            conv_params, x_zero_point, matmul_weights, bridge_scales)
 
 
+# ---------------------------------------------------------------------------
+# A chain of two or more QLinearConv nodes, connected DIRECTLY -- the real,
+# hard capability docs/roadmap.md's "chain convolution layers" plan set out
+# to reach (PR C). Depends on emit.emit_conv_chain_module (a real MLIR-level
+# im2col for layer 1 onward, via expand_shape/collapse_shape and
+# Kh*Kw-unrolled static-stride subview taps -- see that function's own
+# docstring for the full design and why it looks the way it does).
+#
+# WHY THIS NEEDS NO BRIDGE NODE, UNLIKE EVERY OTHER CHAIN THIS FRONT END
+# ACCEPTS
+# ============================================================================
+# load_matmul_chain's bridge is an explicit Cast(to=float32) ->
+# QuantizeLinear pair (MatMulInteger's "Y" has no native quantization of its
+# own). load_conv_matmul_chain's bridge is an explicit
+# Transpose(perm=[0,2,3,1]) -> Reshape([M,Cout]) pair (MatMulInteger has no
+# native NCHW/NHWC convention at all, so the conv's own [N,Cout,H,W] output
+# needs an explicit statement of how it becomes a 2-D matmul operand).
+# QLinearConv needs neither: both its own "X" input and "Y" output are
+# ALREADY declared [N,C,H,W] per the ONNX spec, so wiring one conv's "Y"
+# straight into the next conv's own "X" is already a faithful,
+# standards-compliant statement of the same function this compiler emits --
+# there is nothing to bridge.
+#
+# WHY THIS IS NARROWER THAN A STANDALONE CONV, FOR EVERY LAYER BUT THE LAST
+# =============================================================================
+# Exactly load_conv_matmul_chain's own restriction, and for the same
+# reason: emit_conv_chain_module's own per-bridge cim.requantize is ONE
+# unconditional scalar call at zero_point 0 (reused, unchanged, from
+# emit_chain_module) -- there is no MLIR-level per-channel-requantize or
+# bias-add op available for an intermediate bridge. So every layer except
+# the LAST must have y_zero_point == 0, a scalar (non-per-channel) w_scale,
+# and no bias. Every layer except the FIRST must ALSO have x_zero_point ==
+# 0: its activation arrives already zero-centered, produced by the
+# previous layer's own zero_point-0 bridge, and the emitted IR applies no
+# zero-point shift to an intermediate activation the way load_qlinear_conv
+# applies one to layer 0's (in Python, via _validate_conv_activation,
+# before im2col even runs) -- a nonzero x_zero_point here would silently
+# diverge from what onnx.reference actually computes for this graph. Only
+# the LAST layer keeps load_qlinear_conv's own full generality: asymmetric
+# zero point (including uint8, with the exact same -128 shift and
+# `uint8_output_shifted` disclosure load_qlinear_conv's own docstring
+# describes), a per-channel w_scale, and a bias.
+#
+# BRIDGE SCALE INDEPENDENCE
+# ==========================
+# bridge_scales[i] is layer i's OWN y_scale / (x_scale * w_scale) --
+# QLinearConv's own reference formula for layer i's raw accumulator,
+# exactly load_conv_matmul_chain's own conv_scale. There is no need to
+# cross-validate layer i's y_scale against layer i+1's x_scale: QLinearConv's
+# reference formula computes a scale-independent RAW integer accumulator
+# and only applies scale in each conv's own final step, so each layer is
+# self-contained -- layer i+1's own x_scale is used only for layer i+1's
+# OWN eventual bridge/output scale, never to reinterpret the already-bridged
+# integer values themselves (whose correctness depends only on
+# x_zero_point == 0, already required above).
+# ---------------------------------------------------------------------------
+
+
+def load_conv_chain(model):
+    """Two or more chained QLinearConv nodes, discovered via producer/
+    consumer edges (NOT node-list order -- ONNX does not guarantee a
+    topological, let alone chain, node ordering) and connected directly,
+    conv_i's own "Y" feeding conv_(i+1)'s own "X" with no bridge node
+    between them (see this section's own module header for why).
+
+    Returns (conv_nodes, weights2d, x_name, x_shape, conv_params,
+    x_zero_point, trailing_requantize, per_channel_requantize, bias,
+    uint8_output_shifted, bridge_scales) where:
+
+    - `conv_nodes` is the chain's own QLinearConv nodes, in execution
+      order.
+    - `weights2d[0]` is layer 0's weight, Cin-major [Cout, Cin*Kh*Kw] --
+      load_qlinear_conv's own convention, no transpose, since layer 0's
+      activation is still the literal NCHW graph input. `weights2d[i]`
+      for i >= 1 is CHANNEL-LAST [Cout, Kh*Kw*Cin] -- THE dangerous line
+      in this feature (see emit.emit_conv_chain_module's own docstring
+      for why, and its own named/mutation test for the consequence of
+      getting it backwards).
+    - `x_name`/`x_shape`/`x_zero_point` are exactly load_qlinear_conv's
+      own returns, for layer 0's activation.
+    - `conv_params[i]` is layer i's own (kh, kw, stride_h, stride_w,
+      pad_top, pad_bottom, pad_left, pad_right, dilation_h, dilation_w),
+      for every i from 0 to len(conv_nodes) - 1 -- `conv_params[0]` is
+      passed to `im2col_nchw` for layer 0's own Python-side patches
+      exactly as load_qlinear_conv's own return is, and the WHOLE list is
+      passed straight through to emit.emit_conv_chain_module (whose own
+      `conv_params[0]` entry it does not read, by that function's own
+      documented convention).
+    - `trailing_requantize`/`per_channel_requantize`/`bias`/
+      `uint8_output_shifted` are exactly load_qlinear_conv's own returns,
+      for the LAST layer only -- pass them straight through to
+      emit.emit_conv_chain_module's own `last_trailing_requantize`/
+      `last_per_channel_requantize`/`last_bias` parameters.
+    - `bridge_scales` has `len(conv_nodes) - 1` entries, bridge i's real
+      positive cim.requantize scale -- see this section's own module
+      header for the derivation and why no cross-layer validation is
+      needed.
+
+    Raises Refusal for anything outside this function's own scope (see
+    this section's own module header): fewer than two QLinearConv nodes,
+    any non-conv node in the graph, a branching/cyclic/disconnected
+    "chain", a non-zero y_zero_point/per-channel w_scale/bias on any
+    layer but the last, or a non-zero x_zero_point on any layer but the
+    first.
+    """
+    from onnx import numpy_helper
+
+    _check_opset(model)
+    graph = model.graph
+    initializers = _tensor_names(model)
+
+    convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
+    if len(convs) < 2:
+        raise Refusal(
+            f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); load_conv_chain "
+            f"handles a chain of two or more. Use load_qlinear_conv for a "
+            f"standalone convolution, or load_conv_matmul_chain for a "
+            f"convolution feeding MatMulInteger layers, instead. Nothing "
+            f"emitted.")
+
+    others = [n for n in graph.node if n.op_type != ACCEPTED_CONV_OP]
+    if others:
+        kinds = sorted({n.op_type for n in others})
+        raise Refusal(
+            f"graph also contains {', '.join(kinds)}. A chain of "
+            f"{ACCEPTED_CONV_OP} nodes needs no bridge node between layers "
+            f"(unlike a {ACCEPTED_CONV_OP} chained into {ACCEPTED_OP}, or a "
+            f"chain of {ACCEPTED_OP} layers) -- conv_i's own \"Y\" feeds "
+            f"conv_(i+1)'s own \"X\" directly, both natively [N, C, H, W] "
+            f"per the ONNX spec. Nothing emitted.")
+
+    # Chain-ordering discovery via producer/consumer edges, not node-list
+    # order.
+    producer = {n.output[0]: n for n in convs}
+    consumers = {}
+    for n in graph.node:
+        for inp in n.input:
+            if inp:
+                consumers.setdefault(inp, []).append(n)
+
+    starts = [n for n in convs if n.input[0] not in producer]
+    if len(starts) != 1:
+        raise Refusal(
+            f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
+            f"activation is not another {ACCEPTED_CONV_OP}'s output; a "
+            f"single linear chain has exactly one such node (its own "
+            f"first layer) -- {len(starts)} means either a disconnected "
+            f"graph or more than one chain. Nothing emitted.")
+
+    chain = [starts[0]]
+    seen_ids = {id(starts[0])}
+    current = starts[0]
+    while len(chain) < len(convs):
+        out = current.output[0]
+        readers = consumers.get(out, [])
+        conv_readers = [r for r in readers if r.op_type == ACCEPTED_CONV_OP]
+        if (len(readers) != 1 or len(conv_readers) != 1
+                or conv_readers[0].input[0] != out):
+            raise Refusal(
+                f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
+                f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
+                f"own activation ({len(readers)} total reader(s) found). "
+                f"A chain must be linear -- no branching, no extra "
+                f"consumers, no non-conv reader. Nothing emitted.")
+        nxt = conv_readers[0]
+        if id(nxt) in seen_ids:
+            raise Refusal(
+                f"the {ACCEPTED_CONV_OP} chain forms a cycle. Nothing "
+                f"emitted.")
+        chain.append(nxt)
+        seen_ids.add(id(nxt))
+        current = nxt
+
+    if len(graph.output) != 1:
+        raise Refusal(
+            f"graph has {len(graph.output)} outputs; a chain must end in "
+            f"exactly one. Nothing emitted.")
+    if graph.output[0].name != chain[-1].output[0]:
+        raise Refusal(
+            f"the graph's output is not the chain's own last "
+            f"{ACCEPTED_CONV_OP}'s own output. Nothing emitted.")
+
+    n_layers = len(chain)
+    weights2d = []
+    conv_params = []
+    bridge_scales = []
+    x_name = None
+    x_shape = None
+    x_zero_point = 0
+    trailing_requantize = None
+    per_channel_requantize = None
+    bias = None
+    uint8_output_shifted = False
+    prev_cout = None
+
+    for i, node in enumerate(chain):
+        is_first = i == 0
+        is_last = i == n_layers - 1
+        where = f"node '{node.name or ACCEPTED_CONV_OP}' (layer {i})"
+
+        if len(node.input) < 8:
+            raise Refusal(
+                f"{ACCEPTED_CONV_OP} has {len(node.input)} inputs; x, "
+                f"x_scale, x_zero_point, w, w_scale, w_zero_point, y_scale "
+                f"and y_zero_point are all mandatory per the ONNX spec. "
+                f"Nothing emitted.", where=where)
+        (x_i, x_scale_name, x_zp_name, w_name, w_scale_name, w_zp_name,
+         y_scale_name, y_zp_name) = node.input[:8]
+        bias_name = node.input[8] if len(node.input) > 8 else ""
+
+        if not is_last and bias_name:
+            raise Refusal(
+                f"this node has a bias operand '{bias_name}', but only "
+                f"the LAST layer of a {ACCEPTED_CONV_OP} chain may have "
+                f"one -- an intermediate layer's own bridge is "
+                f"emit_conv_chain_module's unconditional scalar "
+                f"cim.requantize, with no cim.reduce_partial step. "
+                f"Compile this chain up to (and not including) this "
+                f"layer instead, or drop the bias. Nothing emitted.",
+                where=where)
+        if w_name not in initializers:
+            raise Refusal(
+                f"the weight operand '{w_name}' is not a constant "
+                f"initializer. Nothing emitted.", where=where)
+        if x_i in initializers:
+            raise Refusal(
+                f"both operands are constant initializers. Nothing "
+                f"emitted.", where=where)
+
+        w_init = next(t for t in graph.initializer if t.name == w_name)
+        weight = numpy_helper.to_array(w_init)
+        if weight.dtype != np.int8:
+            raise Refusal(
+                f"the weight operand '{w_name}' has dtype {weight.dtype}. "
+                f"Nothing emitted.", where=where)
+        if weight.ndim != 4:
+            raise Refusal(
+                f"the weight operand '{w_name}' has rank {weight.ndim}; a "
+                f"2-D convolution's kernel is rank 4 [Cout, Cin, Kh, Kw]. "
+                f"Nothing emitted.", where=where)
+        cout, cin, kh, kw = weight.shape
+
+        if not is_first and cin != prev_cout:
+            raise Refusal(
+                f"layer {i}'s weight has Cin={cin}, but layer {i - 1}'s "
+                f"weight has Cout={prev_cout} -- one conv's own output "
+                f"channel count must match the next conv's own input "
+                f"channel count. Nothing emitted.", where=where)
+
+        x_scale = _positive_scalar_scale(graph, x_scale_name, node.name,
+                                         "x_scale")
+        w_scale = _positive_weight_scale(graph, w_scale_name, node.name,
+                                         "w_scale", cout)
+        y_scale = _positive_scalar_scale(graph, y_scale_name, node.name,
+                                         "y_scale")
+        layer_x_zp, _x_zp_dtype = _scalar_zero_point(
+            graph, x_zp_name, node.name, "x_zero_point",
+            allow_nonzero=is_first)
+        _weight_zero_point_must_be_zero(graph, w_zp_name, node.name, cout)
+        layer_y_zp, y_zp_dtype = _scalar_zero_point(
+            graph, y_zp_name, node.name, "y_zero_point",
+            allow_nonzero=is_last)
+
+        if not is_last and isinstance(w_scale, np.ndarray):
+            raise Refusal(
+                f"w_scale has {w_scale.size} elements; only the LAST "
+                f"layer of a {ACCEPTED_CONV_OP} chain may have a "
+                f"per-channel w_scale -- an intermediate layer's own "
+                f"bridge is one unconditional scalar cim.requantize, not "
+                f"the N-way per-channel split a standalone conv's own "
+                f"per_channel_requantize uses. Nothing emitted.",
+                where=where)
+        if not is_last and y_zp_dtype != np.int8:
+            raise Refusal(
+                f"y_zero_point is {y_zp_dtype}; an intermediate layer of a "
+                f"{ACCEPTED_CONV_OP} chain must declare an int8 output. "
+                f"The LAST layer can accept uint8 (load_qlinear_conv's own "
+                f"uint8_output_shifted note) because it documents a "
+                f"caller-side +128 shift on the FINAL printed result -- "
+                f"but there is no caller here to apply that shift before "
+                f"the next layer reads this value. Nothing emitted.",
+                where=where)
+
+        (dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right,
+         stride_h, stride_w) = _conv_geometry(node, weight, where)
+        conv_params.append((kh, kw, stride_h, stride_w, pad_top, pad_bottom,
+                           pad_left, pad_right, dilation_h, dilation_w))
+
+        if is_first:
+            x_info = next((v for v in graph.input if v.name == x_i), None)
+            if x_info is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' is neither a graph "
+                    f"input nor a constant. Nothing emitted.", where=where)
+            if x_info.type.tensor_type.elem_type not in (_INT8, _UINT8):
+                raise Refusal(
+                    f"the activation operand '{x_i}' is not int8 or "
+                    f"uint8. Nothing emitted.", where=where)
+            shp = _shape_of(x_info)
+            if shp is None:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has a symbolic or "
+                    f"unknown shape. Nothing emitted.", where=where)
+            if len(shp) != 4:
+                raise Refusal(
+                    f"the activation operand '{x_i}' has rank {len(shp)}; "
+                    f"a 2-D convolution's input is rank 4 [N, Cin, H, W]. "
+                    f"Nothing emitted.", where=where)
+            if shp[1] != cin:
+                raise Refusal(
+                    f"activation has Cin={shp[1]} but the weight is "
+                    f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+                    where=where)
+            x_name = x_i
+            x_shape = tuple(shp)
+            x_zero_point = layer_x_zp
+            weights2d.append(
+                np.ascontiguousarray(weight.reshape(cout, cin * kh * kw)))
+        else:
+            # Channel-last: layer i's own activation is layer i-1's own
+            # bridged [M, Cout] output, NHWC by construction of how
+            # emit_conv_chain_module's own gather lays out patches columns
+            # (tap-major, channel-minor within each tap) -- see this
+            # section's own module header, and emit_conv_chain_module's
+            # own docstring, for why getting this backwards is silently
+            # wrong rather than a shape error.
+            weights2d.append(np.ascontiguousarray(
+                weight.transpose(0, 2, 3, 1).reshape(cout, kh * kw * cin)))
+
+        if is_last:
+            uint8_output_shifted = y_zp_dtype == np.uint8
+            zp_for_module = (layer_y_zp - 128 if uint8_output_shifted
+                            else layer_y_zp)
+            if isinstance(w_scale, np.ndarray):
+                derived_scales = y_scale / (x_scale * w_scale)
+                trailing_requantize = None
+                per_channel_requantize = [(float(s), zp_for_module)
+                                          for s in derived_scales]
+            else:
+                derived_scale = y_scale / (x_scale * w_scale)
+                trailing_requantize = (derived_scale, zp_for_module, 8)
+                per_channel_requantize = None
+            if bias_name:
+                bias = np.asarray(_initializer_or_refuse(
+                    graph, bias_name, node.name, "B")).astype(np.int64)
+                if bias.shape != (cout,):
+                    raise Refusal(
+                        f"bias 'B' has shape {list(bias.shape)}; expected "
+                        f"a single length-Cout ({cout}) int32 array, one "
+                        f"value per output channel. Nothing emitted.",
+                        where=where)
+                bias = bias.astype(np.int32)
+        else:
+            bridge_scales.append(y_scale / (x_scale * w_scale))
+
+        prev_cout = cout
+
+    return (chain, weights2d, x_name, x_shape, conv_params, x_zero_point,
+           trailing_requantize, per_channel_requantize, bias,
+           uint8_output_shifted, bridge_scales)
+
+
 def _validate_conv_activation(activation, x_shape, x_zero_point=0):
     """The supplied activation must be exactly `x_shape` ([N, Cin, H, W]).
 
@@ -1529,17 +1892,21 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     Dispatches on how many MatMulInteger and QLinearConv nodes the graph
     has. One or more QLinearConv AND one or more MatMulInteger nodes goes
     through load_conv_matmul_chain, which itself refuses anything but
-    exactly one QLinearConv (the conv is always layer 0 -- see that
-    function's own module section header for why chaining a SECOND
-    convolution needs a materially different, not-yet-built capability).
-    Zero MatMulInteger nodes but a single QLinearConv goes through
-    load_qlinear_conv (standalone). Two or more MatMulInteger nodes and no
-    QLinearConv go through load_matmul_chain; exactly one of either goes
-    through the single-layer paths (load_matmul_integer,
-    load_qlinear_conv). Anything else -- more than one QLinearConv, or
-    stray Cast/QuantizeLinear nodes around a single MatMulInteger -- is
-    refused by the relevant loader's own "graph also contains ..." check,
-    which already says the right thing for that case.
+    exactly one QLinearConv (the conv is always layer 0 -- a SECOND
+    convolution feeding further MatMulInteger layers is out of scope for
+    both loaders; see load_conv_matmul_chain's own module section header).
+    Zero MatMulInteger nodes and two or more QLinearConv nodes goes
+    through load_conv_chain (a real, direct conv-to-conv chain -- see its
+    own module section header for why it needs no bridge node the way
+    every other chain this front end accepts does). Zero MatMulInteger
+    nodes and a single QLinearConv goes through load_qlinear_conv
+    (standalone). Two or more MatMulInteger nodes and no QLinearConv go
+    through load_matmul_chain; exactly one of either goes through the
+    single-layer paths (load_matmul_integer, load_qlinear_conv). Anything
+    else -- more than one QLinearConv, or stray Cast/QuantizeLinear nodes
+    around a single MatMulInteger -- is refused by the relevant loader's
+    own "graph also contains ..." check, which already says the right
+    thing for that case.
     """
     from onnx import TensorProto  # noqa: F401 (documents op_type below)
 
@@ -1575,6 +1942,44 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
         return emit_chain_module(
             [weight2d] + matmul_weights, patches, weight_syms=weight_syms,
             act_sym=act_sym, header=header, scales=bridge_scales)
+
+    if matmul_count == 0 and conv_count >= 2:
+        (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
+         trailing_requantize, per_channel_requantize, bias,
+         uint8_output_shifted, bridge_scales) = load_conv_chain(model)
+        activation = _validate_conv_activation(activation, x_shape,
+                                               x_zero_point)
+
+        patches0, out_shape0 = im2col_nchw(activation, *conv_params[0])
+        n_batch, out_h, out_w = out_shape0
+
+        taken = set()
+        weight_syms = [sanitize_symbol(n.input[3], taken) for n in conv_nodes]
+        act_sym = sanitize_symbol(x_name, taken)
+
+        header = provenance(model_path, model_bytes, activation_source)
+        header += (
+            f"//   conv im2col (layer 0): N={n_batch} OutH={out_h} "
+            f"OutW={out_w} -- the whole chain's printed output rows stay "
+            f"in (n, oh, ow) row-major order (emit_conv_chain_module "
+            f"threads M through every layer, exactly like "
+            f"emit_chain_module), reshape to [N, OutH, OutW, Cout] then "
+            f"transpose(0, 3, 1, 2) for ONNX's own [N, Cout, OutH, OutW] "
+            f"layout.\n")
+        if uint8_output_shifted:
+            header += (
+                f"//   NOTE: the last layer's y_zero_point is uint8, so "
+                f"its true output is uint8 too -- but cim.requantize's "
+                f"clamp is SIGNED. Every printed value below is "
+                f"(true_uint8_value - 128), EXACTLY (see "
+                f"load_qlinear_conv's own uint8_output_shifted note): add "
+                f"128 back to recover the real QLinearConv output.\n")
+        return emit_conv_chain_module(
+            weights2d, conv_params, patches0, out_shape0,
+            weight_syms=weight_syms, act_sym=act_sym, header=header,
+            scales=bridge_scales, last_bias=bias,
+            last_trailing_requantize=trailing_requantize,
+            last_per_channel_requantize=per_channel_requantize)
 
     if matmul_count == 0 and conv_count >= 1:
         (node, weight2d, x_name, x_shape, conv_params, x_zero_point,

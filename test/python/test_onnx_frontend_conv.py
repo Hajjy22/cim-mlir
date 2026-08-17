@@ -540,13 +540,24 @@ def test_refuses_non_notset_auto_pad(auto_pad):
 
 
 def test_refuses_a_second_qlinear_conv_node():
+    # This duplicates the SAME node (same output name, same activation
+    # input) rather than building a real chain, so import_model's
+    # conv_count >= 2 dispatch now routes it to load_conv_chain (PR C),
+    # not load_qlinear_conv -- and load_conv_chain refuses it for its own,
+    # equally accurate reason: two conv nodes whose own activation is the
+    # graph's own input is not a single linear chain (see its own
+    # docstring). Before load_conv_chain existed, ANY two-or-more-conv
+    # graph fell through to load_qlinear_conv's "only a single standalone
+    # convolution" refusal instead -- this test's match string tracks
+    # that change, not just the plain "still refused" fact, so it does not
+    # accidentally silently start validating the wrong loader's message.
     weight, x_shape, model = _base_model()
     extra = model.graph.node[0]
     duplicated = model.graph.node.add()
     duplicated.CopyFrom(extra)
     duplicated.name = "conv2"
     act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="only a single standalone"):
+    with pytest.raises(Refusal, match="own activation is not another"):
         import_model(model, act)
 
 

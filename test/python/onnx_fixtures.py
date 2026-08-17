@@ -367,6 +367,160 @@ def conv_matmul_chain_model(conv_weight, x_shape, matmul_weights,
     return model
 
 
+def conv_chain_model(weights, x_shape, x_scale=1.0, x_zero_point=0,
+                     x_dtype=TensorProto.INT8, w_scales=None,
+                     y_scales=None, strides=None, pads=None,
+                     dilations=None, last_bias=None,
+                     last_y_zero_point=0, last_y_dtype=TensorProto.INT8,
+                     check=True):
+    """A chain of two or more QLinearConv nodes, connected DIRECTLY --
+    conv_i's own "Y" feeds conv_(i+1)'s own "X" with no bridge node
+    between them, the way cim_frontend.onnx_import.load_conv_chain reads
+    (see its own module section header for why no bridge is needed here,
+    unlike conv_matmul_chain_model's required Transpose/Reshape, or
+    matmul_chain_model's required Cast/QuantizeLinear).
+
+    `weights[i]` is layer i's own [Cout_i, Cin_i, Kh_i, Kw_i] weight (ONNX
+    layout -- qlinear_conv_model's own convention), with Cin_i ==
+    Cout_(i-1) for i > 0. `w_scales[i]`/`y_scales[i]`/`strides[i]`/
+    `pads[i]`/`dilations[i]` are layer i's own; `w_scales`/`y_scales`
+    default to 1.0 for every layer, `strides`/`dilations` to (1, 1),
+    `pads` to (0, 0, 0, 0), if not given.
+
+    Only the LAST layer may have a non-zero y_zero_point
+    (`last_y_zero_point`, with matching `last_y_dtype`), a per-channel
+    w_scale (an array-like `w_scales[-1]` of length Cout of the last
+    layer), or a bias (`last_bias`, length-Cout int32) -- every earlier
+    layer is forced to y_zero_point=0, a scalar w_scale, and no bias,
+    matching load_conv_chain's own restriction (an intermediate bridge is
+    ONE unconditional scalar cim.requantize, with no cim.reduce_partial
+    step available). Every layer but the FIRST also gets x_zero_point=0,
+    x_dtype=INT8 -- not a parameter here, since load_conv_chain requires
+    it (an intermediate activation arrives already zero-centered, with no
+    zero-point shift available in the emitted IR) and a fixture that could
+    build a graph load_conv_chain would refuse defeats the point of a
+    "matches the reference" fixture. Only layer 0's `x_zero_point`/
+    `x_dtype` are configurable, exactly like qlinear_conv_model's own.
+    """
+    weights = [np.asarray(w) for w in weights]
+    n_layers = len(weights)
+    if n_layers < 2:
+        raise ValueError("conv_chain_model needs at least two conv layers")
+    if w_scales is None:
+        w_scales = [1.0] * n_layers
+    if y_scales is None:
+        y_scales = [1.0] * n_layers
+    if strides is None:
+        strides = [(1, 1)] * n_layers
+    if pads is None:
+        pads = [(0, 0, 0, 0)] * n_layers
+    if dilations is None:
+        dilations = [(1, 1)] * n_layers
+    for name, seq in (("w_scales", w_scales), ("y_scales", y_scales),
+                      ("strides", strides), ("pads", pads),
+                      ("dilations", dilations)):
+        if len(seq) != n_layers:
+            raise ValueError(f"{name} must have one entry per layer "
+                             f"({n_layers}), got {len(seq)}")
+
+    n, cin0, h0, w0 = x_shape
+    if weights[0].shape[1] != cin0:
+        raise ValueError(
+            f"x_shape's Cin ({cin0}) does not match layer 0's own Cin "
+            f"({weights[0].shape[1]})")
+    for i in range(1, n_layers):
+        if weights[i].shape[1] != weights[i - 1].shape[0]:
+            raise ValueError(
+                f"layer {i}'s Cin ({weights[i].shape[1]}) does not match "
+                f"layer {i - 1}'s Cout ({weights[i - 1].shape[0]})")
+
+    x_name = "X"
+    x_np_dtype = np.int8 if x_dtype == TensorProto.INT8 else np.uint8
+    initializers = []
+    nodes = []
+    cur_name = x_name
+    cur_h, cur_w = h0, w0
+    first_x_dtype = x_dtype
+    layer_y_dtype = TensorProto.INT8
+
+    for i, w in enumerate(weights):
+        cout, cin, kh, kw = w.shape
+        stride_h, stride_w = strides[i]
+        pad_top, pad_left, pad_bottom, pad_right = pads[i]
+        dilation_h, dilation_w = dilations[i]
+        dilated_kh = (kh - 1) * dilation_h + 1
+        dilated_kw = (kw - 1) * dilation_w + 1
+        out_h = (cur_h + pad_top + pad_bottom - dilated_kh) // stride_h + 1
+        out_w = (cur_w + pad_left + pad_right - dilated_kw) // stride_w + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError(
+                f"layer {i}: non-positive output size ({out_h}, {out_w}) "
+                f"for the given x_shape/weights/strides/pads/dilations")
+
+        is_first = i == 0
+        is_last = i == n_layers - 1
+        layer_x_scale = x_scale if is_first else 1.0
+        layer_x_zp = x_zero_point if is_first else 0
+        layer_x_np_dtype = x_np_dtype if is_first else np.int8
+
+        layer_y_scale = y_scales[i]
+        layer_y_zp = last_y_zero_point if is_last else 0
+        layer_y_dtype = last_y_dtype if is_last else TensorProto.INT8
+        layer_y_np_dtype = (np.int8 if layer_y_dtype == TensorProto.INT8
+                            else np.uint8)
+
+        w_scale_arr = np.asarray(w_scales[i], dtype=np.float32)
+        if w_scale_arr.ndim == 0:
+            w_scale_arr = w_scale_arr.reshape(())
+
+        p = f"L{i}_"
+        initializers += [
+            numpy_helper.from_array(w, name=p + "W"),
+            numpy_helper.from_array(
+                np.array(layer_x_scale, dtype=np.float32), name=p + "xs"),
+            numpy_helper.from_array(
+                np.array(layer_x_zp, dtype=layer_x_np_dtype),
+                name=p + "xzp"),
+            numpy_helper.from_array(w_scale_arr, name=p + "ws"),
+            numpy_helper.from_array(
+                np.array(0, dtype=np.int8), name=p + "wzp"),
+            numpy_helper.from_array(
+                np.array(layer_y_scale, dtype=np.float32), name=p + "ys"),
+            numpy_helper.from_array(
+                np.array(layer_y_zp, dtype=layer_y_np_dtype),
+                name=p + "yzp"),
+        ]
+        node_inputs = [cur_name, p + "xs", p + "xzp", p + "W", p + "ws",
+                      p + "wzp", p + "ys", p + "yzp"]
+        if is_last and last_bias is not None:
+            initializers.append(numpy_helper.from_array(
+                np.asarray(last_bias, dtype=np.int32), name=p + "B"))
+            node_inputs.append(p + "B")
+        out_name = f"L{i}_Y"
+        nodes.append(helper.make_node(
+            "QLinearConv", node_inputs, [out_name], name=f"conv{i}",
+            strides=[stride_h, stride_w],
+            pads=[pad_top, pad_left, pad_bottom, pad_right],
+            dilations=[dilation_h, dilation_w]))
+
+        cur_name = out_name
+        cur_h, cur_w = out_h, out_w
+
+    last_cout = weights[-1].shape[0]
+    graph = helper.make_graph(
+        nodes, "conv_chain",
+        [helper.make_tensor_value_info(x_name, first_x_dtype, list(x_shape))],
+        [helper.make_tensor_value_info(
+            cur_name, layer_y_dtype, [n, last_cout, cur_h, cur_w])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    if check:
+        onnx.checker.check_model(model)
+    return model
+
+
 def small_multi_layer_cnn_model(seed=0, check=True):
     """Three QLinearConv layers with two MaxPool ops between them --
     conv/pool/conv/pool/conv, loosely the early-layer shape of a real

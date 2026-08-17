@@ -247,11 +247,11 @@ MLIR emission: the convolution is always layer 0, so its activation is
 still the literal graph input and `im2col` still runs once in Python
 exactly as it does standalone; everything after that reuses the
 already-proven `MatMulInteger` chain bridge unchanged. Chaining a
-*second* convolution is a materially different, larger problem — the
-next layer's activation would only exist as an MLIR value once the first
-layer's compiled code actually runs, and the interpreter cannot even
-execute the index arithmetic a naive im2col loop would need — and is not
-supported by this front end.
+*second* convolution needs a real MLIR-level `im2col` instead — the next
+layer's activation only exists as an MLIR value once the first layer's
+compiled code actually runs, so its patches have to be gathered *in the
+emitted IR* — and that harder capability is a separate feature, described
+in its own section below.
 
 The bridge between the conv and the first matmul is `Transpose(perm=[0,
 2, 3, 1]) -> Reshape([M, Cout])`, **required in the graph, not merely
@@ -277,6 +277,55 @@ bias. Lifting any of these needs `emit_chain_module` itself to grow a
 per-channel/bias-aware bridge, not just the loader — not attempted here,
 on the same "don't invent capability a real model hasn't forced" basis
 the rest of this section follows.
+
+## Chained convolutions
+
+Two or more `QLinearConv` nodes, connected *directly* — `conv_i`'s own
+`"Y"` feeding `conv_(i+1)`'s own `"X"` — import as a real convolution
+chain, with no bridge node between layers at all. That is unlike every
+other chain this front end accepts: a matmul-to-matmul bridge is an
+explicit `Cast`/`QuantizeLinear` pair, and a conv-to-matmul bridge is an
+explicit `Transpose`/`Reshape` pair (see above). A conv-to-conv edge needs
+neither, because both `QLinearConv`'s own `"X"` input and `"Y"` output are
+already declared `[N, C, H, W]` per the ONNX spec — wiring one conv's `"Y"`
+straight into the next conv's own `"X"` is already a faithful,
+standards-compliant statement of the same function this compiler emits.
+
+Layer 0's activation is still the literal graph input, so its own `im2col`
+still runs once in Python exactly as it does standalone. Every layer after
+that is different: its own activation is the *previous* layer's bridged
+output, an MLIR value this front end has never seen as a concrete array,
+so its patches are gathered **in the emitted IR** — a real MLIR-level
+`im2col`. The interpreter cannot execute `arith.addi`/`arith.muli` or
+`scf.if` at all, which rules out the two obvious designs (an `scf.for`
+computing tap indices via arithmetic, or a fully-unrolled emission over
+every output position — IR size would scale with `OutH * OutW`, easily
+thousands). Instead, the gather unrolls over `Kh * Kw` kernel taps
+(small — 9 to 49 for a realistic kernel), each one a single, fully static,
+non-unit-stride `memref.subview` + `memref.copy` covering every output
+position for that tap in one shot — `memref.subview` already supports a
+static stride generically, so no loop and no arithmetic are needed.
+
+Layer `i >= 1`'s weight is flattened **channel-last** (`[Cout, Kh, Kw,
+Cin]`), the *opposite* order from layer 0's NCHW-sourced, Cin-major
+flatten — because layer `i`'s own activation is NHWC by construction of
+how the gather lays out patches columns (tap-major, channel-minor within
+each tap). Getting this backwards produces IR that verifies, compiles,
+and runs, and computes the wrong answer — the same shape of danger as
+"the transpose" below, and mutation-tested the same way.
+
+Unlike a chain ending in `MatMulInteger` (whose own `"Y"` *is* the raw
+accumulator), a chain ending in `QLinearConv` must apply that layer's own
+bias and requantize: `QLinearConv`'s `"Y"` is *defined* by the ONNX spec
+as the fully quantized result, not a raw accumulator. So only the
+**last** layer of a conv chain keeps `load_qlinear_conv`'s own full
+generality — an asymmetric (including `uint8`) output, a per-channel
+`w_scale`, and a bias. Every earlier layer keeps the same restriction a
+chained conv feeding matmul layers has: `y_zero_point == 0`, a scalar
+`w_scale`, no bias. Every layer but the *first* additionally needs
+`x_zero_point == 0` — its activation arrives already zero-centered,
+produced by the previous layer's own zero-point-0 bridge, and the emitted
+IR applies no zero-point shift to an intermediate activation.
 
 ## What it refuses, and why refusing is the point
 
@@ -305,7 +354,8 @@ is worse than a refusal.
 | a `QLinearConv` with a non-zero `w_zero_point` | its correction term is per-row (activation-dependent), not a fixed per-channel bias, so it is not one of the reshapes above |
 | a `QLinearConv` with a non-scalar `x_zero_point` or `y_zero_point` | per-tensor activation/output quantization is the near-universal convention, unlike per-channel weight scale |
 | a `QLinearConv` with `auto_pad` other than `NOTSET` | `SAME_UPPER`/`SAME_LOWER`/`VALID` all need shape-dependent padding math this front end does not replicate — including `VALID`, whose own oracle (`onnx.reference`) computes it with a formula that is wrong for `N != 1` or `Cin != 1` |
-| more than one `QLinearConv` node | only a single, standalone convolution is imported; not a chain of them, and not one feeding a matmul |
+| two or more `QLinearConv` nodes that do not form a single linear chain | branching, disconnected, or cyclic — `load_conv_chain` needs a strict producer/consumer line, not a DAG |
+| a non-`QLinearConv` node inside a `QLinearConv` chain | a conv-to-conv edge needs no bridge node at all (see above); anything else in that position is unsupported |
 
 ## The activation is required
 
@@ -427,6 +477,19 @@ else.
   *different*, later check also happens to print that word while
   describing a mislabeled node), fixed by matching the specific guard's
   own wording instead.
+- `test/python/test_onnx_frontend_conv_chain.py` — the conv-to-conv
+  counterpart: a two-layer differential, a combined stride/pad/dilation
+  differential on an interior layer, a batched (N > 1) differential, a
+  three-layer differential (exercising the channel-last weight flatten on
+  two different layers with distinct Cin/Cout, so a wrong flatten order
+  could not accidentally line up), a differential exercising the last
+  layer's own bias and an asymmetric (`uint8`) output together, an
+  anti-vacuity check that a perturbation in an *interior* layer (neither
+  first nor last) of a 3-layer chain is actually caught, and refusal tests
+  for a stray non-conv node, a branching or disconnected chain, a
+  non-zero `y_zero_point`/per-channel `w_scale`/bias on a non-last layer,
+  a non-zero `x_zero_point` on a non-first layer, a `uint8` output on a
+  non-last layer, and a `Cin`/`Cout` mismatch between adjacent layers.
 - `test/Transforms/onnx-imported-matmul.mlir` — importer output checked
   in, so the `mlir` CI job guards the shape without the ONNX packages.
 - `test/python/test_analyze.py` — `analyze_model`'s own contract: a valid

@@ -71,6 +71,128 @@ def _dense_2d(arr):
     return f"[{rows}]"
 
 
+def _emit_bias_and_requantize(acc_val, m, n, weight_sym, bias=None,
+                              per_channel_requantize=None,
+                              trailing_requantize=None, effective_bits=8):
+    """Shared tail: an optional bias-add, then an optional requantize,
+    applied to an `[m, n]` int32 accumulator named `acc_val`.
+
+    Factored out of `emit_module`'s own original inline logic so
+    `emit_conv_chain_module` can apply the EXACT same tail to a
+    conv-terminated chain's FINAL layer. That layer's real ONNX identity
+    is a `QLinearConv`, whose `"Y"` output is defined by the op itself as
+    the fully quantized result (bias, then per-channel or scalar
+    requantize, already applied) -- NOT a raw accumulator, unlike
+    `MatMulInteger`'s own `"Y"`, which the matmul-chain path can print
+    as-is. Printing the raw accumulator for a conv-terminated chain would
+    silently misrepresent what the graph's own declared output actually
+    is -- exactly the "structurally valid IR, confidently wrong number"
+    failure class this project exists to prevent -- so this helper exists
+    to make both call sites share one, single-source-of-truth
+    implementation rather than risk the two drifting apart.
+
+    Returns `(lines, allocs, bias_global, result_val, result_elem)`:
+      * `lines` -- new MLIR body text, to append right after the matmul
+        (or last layer's matmul) that produced `acc_val`.
+      * `allocs` -- `(name, type)` pairs needing their own
+        `memref.dealloc`, in allocation order (same ASan-driven
+        bookkeeping `emit_module` already does for its own allocations).
+      * `bias_global` -- a `memref.global` declaration string (empty if
+        `bias` is `None`) that MUST be placed at MODULE scope, before
+        `func.func @main()` opens -- unlike `lines`/`allocs`, the caller
+        is responsible for where this one goes.
+      * `result_val`, `result_elem` -- the SSA name and element type
+        (`"i8"` if either requantize path ran, else `"i32"`) of the final
+        value to print.
+    """
+    if trailing_requantize is not None and per_channel_requantize is not None:
+        raise ValueError(
+            "trailing_requantize and per_channel_requantize are mutually "
+            "exclusive -- pass one uniform scale or N per-channel ones, "
+            "not both")
+    if per_channel_requantize is not None and len(per_channel_requantize) != n:
+        raise ValueError(
+            f"per_channel_requantize must have one (scale, zero_point) "
+            f"pair per output channel (N = {n}), got "
+            f"{len(per_channel_requantize)}")
+
+    lines = []
+    allocs = []
+    bias_global = ""
+
+    if bias is not None:
+        bias = np.asarray(bias)
+        if bias.shape != (n,):
+            raise ValueError(
+                f"bias must be a length-N ({n}) int32 array, got shape "
+                f"{bias.shape}")
+        broadcast = np.tile(bias.reshape(1, n), (m, 1))
+        bias_global = (
+            f'memref.global "private" constant @{weight_sym}_bias : '
+            f"memref<{m}x{n}xi32> = dense<{_dense_2d(broadcast)}>\n")
+        i32mn = f"memref<{m}x{n}xi32>"
+        lines += [
+            f"  %biasInit = memref.get_global @{weight_sym}_bias : {i32mn}",
+            f"  %bias = memref.alloc() : {i32mn}",
+            f"  memref.copy %biasInit, %bias : {i32mn} to {i32mn}",
+            f"  %biased = cim.reduce_partial {acc_val}, %bias : ({i32mn}, "
+            f"{i32mn}) -> {i32mn}",
+        ]
+        # cim.reduce_partial always produces a fresh allocation (see
+        # Interpreter.cpp's runReducePartial: makeAllocation, never an
+        # in-place write into an operand), so %biased needs its own
+        # dealloc distinct from acc_val's.
+        allocs += [("%bias", i32mn), ("%biased", i32mn)]
+        acc_val = "%biased"
+
+    if per_channel_requantize is not None:
+        i8mn = f"memref<{m}x{n}xi8>"
+        lines.append(f"  %result = memref.alloc() : {i8mn}")
+        allocs.append(("%result", i8mn))
+        for i, (scale, zero_point) in enumerate(per_channel_requantize):
+            if not (float(scale) > 0.0):
+                raise ValueError(
+                    f"per_channel_requantize[{i}]'s scale must be "
+                    f"positive, got {scale}")
+            src_ty = f"memref<{m}x1xi32, strided<[{n}, 1], offset: {i}>>"
+            dst_ty = f"memref<{m}x1xi8, strided<[{n}, 1], offset: {i}>>"
+            col_ty = f"memref<{m}x1xi8>"
+            lines += [
+                f"  %col{i} = memref.subview {acc_val}[0, {i}] [{m}, 1] "
+                f"[1, 1] : memref<{m}x{n}xi32> to {src_ty}",
+                f"  %q{i} = cim.requantize %col{i} {{scale = "
+                f"{float(scale)!r} : f32, zero_point = {int(zero_point)} : "
+                f"i32, effective_bits = {int(effective_bits)} : i32}}",
+                f"    : {src_ty} -> {col_ty}",
+                f"  %rcol{i} = memref.subview %result[0, {i}] [{m}, 1] "
+                f"[1, 1] : {i8mn} to {dst_ty}",
+                f"  memref.copy %q{i}, %rcol{i} : {col_ty} to {dst_ty}",
+            ]
+            # %q{i} is cim.requantize's own fresh allocation (same
+            # reasoning as %biased above), and outlives its one use
+            # (the copy into %result) until the caller's own cleanup.
+            allocs.append((f"%q{i}", col_ty))
+        result_val, result_elem = "%result", "i8"
+    elif trailing_requantize is not None:
+        scale, zero_point, eff_bits = trailing_requantize
+        if not (float(scale) > 0.0):
+            raise ValueError(
+                f"trailing_requantize's scale must be positive, got {scale}")
+        i8mn = f"memref<{m}x{n}xi8>"
+        lines += [
+            f"  %q = cim.requantize {acc_val} {{scale = {float(scale)!r} : "
+            f"f32, zero_point = {int(zero_point)} : i32, effective_bits = "
+            f"{int(eff_bits)} : i32}}",
+            f"    : memref<{m}x{n}xi32> -> {i8mn}",
+        ]
+        allocs.append(("%q", i8mn))
+        result_val, result_elem = "%q", "i8"
+    else:
+        result_val, result_elem = acc_val, "i32"
+
+    return lines, allocs, bias_global, result_val, result_elem
+
+
 def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
                 trailing_requantize=None, bias=None,
                 per_channel_requantize=None, effective_bits=8):
@@ -153,16 +275,6 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
         raise ValueError(
             f"activation's K of {activation.shape[1]} does not match the "
             f"weight's K of {k}")
-    if trailing_requantize is not None and per_channel_requantize is not None:
-        raise ValueError(
-            "trailing_requantize and per_channel_requantize are mutually "
-            "exclusive -- pass one uniform scale or N per-channel ones, "
-            "not both")
-    if per_channel_requantize is not None and len(per_channel_requantize) != n:
-        raise ValueError(
-            f"per_channel_requantize must have one (scale, zero_point) "
-            f"pair per output channel (N = {n}), got "
-            f"{len(per_channel_requantize)}")
 
     rows = _dense_2d(weight)
     acts = _dense_2d(activation)
@@ -178,78 +290,14 @@ def emit_module(weight, activation, weight_sym="w", act_sym="a", header="",
         f"memref<{n}x{k}xi8>)",
         f"    outs(%out : memref<{m}x{n}xi32>)",
     ]
-    acc_val = "%out"
-    bias_global = ""
-
-    if bias is not None:
-        bias = np.asarray(bias)
-        if bias.shape != (n,):
-            raise ValueError(
-                f"bias must be a length-N ({n}) int32 array, got shape "
-                f"{bias.shape}")
-        broadcast = np.tile(bias.reshape(1, n), (m, 1))
-        bias_global = (
-            f'memref.global "private" constant @{weight_sym}_bias : '
-            f"memref<{m}x{n}xi32> = dense<{_dense_2d(broadcast)}>\n")
-        i32mn = f"memref<{m}x{n}xi32>"
-        lines += [
-            f"  %biasInit = memref.get_global @{weight_sym}_bias : {i32mn}",
-            f"  %bias = memref.alloc() : {i32mn}",
-            f"  memref.copy %biasInit, %bias : {i32mn} to {i32mn}",
-            f"  %biased = cim.reduce_partial %out, %bias : ({i32mn}, "
-            f"{i32mn}) -> {i32mn}",
-        ]
-        # cim.reduce_partial always produces a fresh allocation (see
-        # Interpreter.cpp's runReducePartial: makeAllocation, never an
-        # in-place write into an operand), so %biased needs its own
-        # dealloc distinct from %out's.
-        allocs += [("%bias", i32mn), ("%biased", i32mn)]
-        acc_val = "%biased"
-
-    if per_channel_requantize is not None:
-        i8mn = f"memref<{m}x{n}xi8>"
-        lines.append(f"  %result = memref.alloc() : {i8mn}")
-        allocs.append(("%result", i8mn))
-        for i, (scale, zero_point) in enumerate(per_channel_requantize):
-            if not (float(scale) > 0.0):
-                raise ValueError(
-                    f"per_channel_requantize[{i}]'s scale must be "
-                    f"positive, got {scale}")
-            src_ty = f"memref<{m}x1xi32, strided<[{n}, 1], offset: {i}>>"
-            dst_ty = f"memref<{m}x1xi8, strided<[{n}, 1], offset: {i}>>"
-            col_ty = f"memref<{m}x1xi8>"
-            lines += [
-                f"  %col{i} = memref.subview {acc_val}[0, {i}] [{m}, 1] "
-                f"[1, 1] : memref<{m}x{n}xi32> to {src_ty}",
-                f"  %q{i} = cim.requantize %col{i} {{scale = "
-                f"{float(scale)!r} : f32, zero_point = {int(zero_point)} : "
-                f"i32, effective_bits = {int(effective_bits)} : i32}}",
-                f"    : {src_ty} -> {col_ty}",
-                f"  %rcol{i} = memref.subview %result[0, {i}] [{m}, 1] "
-                f"[1, 1] : {i8mn} to {dst_ty}",
-                f"  memref.copy %q{i}, %rcol{i} : {col_ty} to {dst_ty}",
-            ]
-            # %q{i} is cim.requantize's own fresh allocation (same
-            # reasoning as %biased above), and outlives its one use
-            # (the copy into %result) until this function's own cleanup.
-            allocs.append((f"%q{i}", col_ty))
-        result_val, result_elem = "%result", "i8"
-    elif trailing_requantize is not None:
-        scale, zero_point, eff_bits = trailing_requantize
-        if not (float(scale) > 0.0):
-            raise ValueError(
-                f"trailing_requantize's scale must be positive, got {scale}")
-        i8mn = f"memref<{m}x{n}xi8>"
-        lines += [
-            f"  %q = cim.requantize {acc_val} {{scale = {float(scale)!r} : "
-            f"f32, zero_point = {int(zero_point)} : i32, effective_bits = "
-            f"{int(eff_bits)} : i32}}",
-            f"    : memref<{m}x{n}xi32> -> {i8mn}",
-        ]
-        allocs.append(("%q", i8mn))
-        result_val, result_elem = "%q", "i8"
-    else:
-        result_val, result_elem = acc_val, "i32"
+    tail_lines, tail_allocs, bias_global, result_val, result_elem = (
+        _emit_bias_and_requantize(
+            "%out", m, n, weight_sym, bias=bias,
+            per_channel_requantize=per_channel_requantize,
+            trailing_requantize=trailing_requantize,
+            effective_bits=effective_bits))
+    lines += tail_lines
+    allocs += tail_allocs
 
     quantized = trailing_requantize is not None or per_channel_requantize is not None
     print_call = "cim_print_i8" if quantized else "cim_print_i32"
@@ -424,6 +472,358 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     lines.append(f"  memref.dealloc %a0 : memref<{m}x{k0}xi8>")
     lines.append(
         f"  memref.dealloc %out{len(weights) - 1} : memref<{m}x{last_n}xi32>")
+    lines.append("  return")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
+                           weight_syms=None, act_sym="a", header="",
+                           scales=None, last_bias=None,
+                           last_trailing_requantize=None,
+                           last_per_channel_requantize=None,
+                           effective_bits=8):
+    """Two or more chained QLinearConv layers -- a REAL MLIR-level im2col
+    for every layer after the first, docs/roadmap.md's "chain convolution
+    layers" plan, part 2.
+
+    Layer 0's activation is still a Python-computed constant (the literal
+    graph input), so its own im2col already ran in Python exactly as it
+    does for a standalone conv -- `patches0`/`out_shape0` are exactly
+    load_qlinear_conv's own `im2col_nchw` output for that layer. Layer
+    i >= 1's activation is layer i-1's own bridged output, an MLIR SSA
+    value this function has never seen as a concrete array -- gathering
+    its im2col patches has to happen IN THE EMITTED IR, which is the new
+    capability this function adds.
+
+    THE DESIGN, AND WHY IT LOOKS LIKE THIS
+    ==========================================
+    Confirmed by hand against the real cim-opt/cim-run binaries before
+    this function was written: the interpreter's execute() is a closed
+    TypeSwitch that cannot evaluate `arith.addi`/`muli` or `scf.if` at
+    all. That rules out the two "obvious" im2col designs -- an scf.for
+    computing tap indices via arithmetic, and a fully-unrolled emission
+    over every output position (IR size scales with OutH*OutW, easily
+    thousands) -- and is why this one looks the way it does: unroll over
+    Kh*Kw kernel TAPS (small -- 9 to 49 for a realistic kernel) instead,
+    each one a single FULLY STATIC, non-unit-stride memref.subview +
+    memref.copy covering every output position for that tap in one shot.
+    memref.subview already supports a static stride generically (see
+    Interpreter.cpp's own runSubView); no loop, no arithmetic, needed.
+
+    Per bridge (layer i -> layer i+1, i from 0 to len(weights2d)-2):
+      1. `cim.requantize` layer i's raw int32 accumulator into int8 --
+         exactly emit_chain_module's own bridge, reused unchanged.
+      2. `memref.expand_shape` that bridged [M_i, Cout_i] activation into
+         a 4-D [N, H_i, W_i, Cout_i] view -- M_i's own (n, oh, ow)
+         row-major order (im2col_nchw's own convention, and what every
+         earlier bridge/matmul in this chain already commits to) IS this
+         reshape, not a guess at one.
+      3. A padded 4-D buffer (`memref.alloc` + `linalg.fill` zero +
+         `memref.copy` the interior in) -- the direct MLIR analogue of
+         im2col.py's own `_pad_nchw`: pad AFTER any zero-point shift
+         already happened (there is none here -- intermediate zero_point
+         is required to be 0, see load_conv_chain's own module header),
+         so zero is always the logically correct pad value. Always
+         allocated, even when this layer's own padding is zero, for
+         emission simplicity -- a redundant alloc+fill+copy costs
+         nothing real at this scale.
+      4. Kh*Kw taps, each one static-subview + copy into a fresh
+         contiguous slab + `memref.collapse_shape` back to 2-D + a copy
+         into the matching column-block of layer i+1's own patches
+         buffer -- exactly the composition hand-verified against a real
+         cim-opt/cim-run round trip (and an independent, non-im2col
+         manual convolution, for a real 2-layer chain with batching,
+         padding, stride, AND dilation on the interior layer all
+         together) before this function was written.
+
+    `weights2d[i]` is layer i's weight, ALREADY reshaped to [Cout_i, K_i]:
+    Cin-major ([Cout, Cin*Kh*Kw], load_qlinear_conv's own convention, no
+    transpose) for layer 0; CHANNEL-LAST ([Cout, Kh*Kw*Cin]) for layer
+    i >= 1 -- THE dangerous line in this feature, the same shape of bug
+    as onnx_import.py's own "THE TRANSPOSE" note: layer i>=1's activation
+    is NHWC (channel-last) by construction of how this function's own
+    gather lays out patches columns (tap-major, channel-minor within each
+    tap), so its weight must flatten to match, the OPPOSITE order from
+    layer 0's NCHW-sourced, Cin-major flatten. Getting this backwards
+    produces IR that verifies, compiles, and runs, and computes the wrong
+    answer -- see its own named test and mutation test.
+
+    `conv_params[i]` (i in 1..len(weights2d)-1) is layer i's own
+    `(kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+    pad_right, dilation_h, dilation_w)` -- exactly im2col_nchw's own
+    trailing arguments -- describing how to gather layer i-1's bridged
+    output into layer i's matmul input. `conv_params[0]` is unused.
+
+    `scales` has `len(weights2d) - 1` entries, bridge i's real positive
+    cim.requantize scale -- same convention, same "why any positive scale
+    is safe, and what a real (non-1.0) one changes about which oracle to
+    compare against" as emit_chain_module's own `scales` parameter.
+
+    `last_bias`, `last_trailing_requantize`, and `last_per_channel_
+    requantize` apply ONLY to the chain's own final layer, with exactly
+    `emit_module`'s own meaning for each (see its docstring) -- via the
+    shared `_emit_bias_and_requantize` helper, so the two stay a single
+    implementation. This matters because the final layer's real ONNX
+    identity is a `QLinearConv`, and unlike `MatMulInteger` (whose "Y" IS
+    the raw accumulator, which is what every earlier bridge in THIS chain
+    already prints when nothing more specific is asked for), QLinearConv's
+    own "Y" is DEFINED by the op itself as the fully quantized result --
+    bias added, then a scalar or per-channel requantize applied -- so a
+    chain that truly ends in a conv (rather than being fed on into a
+    MatMulInteger, PR B's own scope) needs this to faithfully reprint what
+    the graph itself declares as its output. Default `None` for all three
+    preserves this function's original raw-int32-final-accumulator
+    behavior exactly.
+
+    Deallocation follows emit_chain_module's own established convention
+    (only `%a0` and the final PRINTED buffer get an explicit
+    `memref.dealloc` -- `%out{n-1}` itself if no `last_*` tail ran, or
+    whichever buffer the tail produced otherwise), not emit_module's
+    stricter per-buffer one: this interpreter's `memref.dealloc` is a
+    no-op (Interpreter.cpp's own TypeSwitch), and every real allocation is
+    `std::shared_ptr`-owned, so it is freed exactly once, automatically,
+    when the interpreter's own `memrefs` map is destroyed at the end of
+    the run -- an "extra" live map entry until then is not a real leak,
+    confirmed clean under the same MLIR+ASan+UBSan configuration CI's
+    `mlir-asan` job uses.
+    """
+    weights2d = [np.asarray(w) for w in weights2d]
+    patches0 = np.asarray(patches0)
+    n_layers = len(weights2d)
+    if n_layers < 2:
+        raise ValueError("emit_conv_chain_module needs at least two conv layers")
+    if len(conv_params) != n_layers:
+        raise ValueError(
+            f"conv_params must have one entry per layer (n_layers = "
+            f"{n_layers}, entry 0 unused), got {len(conv_params)}")
+    if weight_syms is None:
+        weight_syms = [f"w{i}" for i in range(n_layers)]
+    if len(weight_syms) != n_layers:
+        raise ValueError("weight_syms must have one entry per layer")
+    if scales is None:
+        scales = [1.0] * (n_layers - 1)
+    if len(scales) != n_layers - 1:
+        raise ValueError(
+            f"scales must have one entry per bridge (n_layers - 1 = "
+            f"{n_layers - 1}), got {len(scales)}")
+    for i, s in enumerate(scales):
+        if not (s > 0.0):
+            raise ValueError(f"bridge {i}'s scale must be positive, got {s}")
+    for i, w in enumerate(weights2d):
+        if w.ndim != 2:
+            raise ValueError(f"layer {i}'s weight must be 2-D [Cout, K], "
+                             f"got shape {w.shape}")
+
+    n_batch, out_h, out_w = out_shape0
+    m0, k0 = patches0.shape
+    if m0 != n_batch * out_h * out_w:
+        raise ValueError(
+            f"patches0 has {m0} rows but out_shape0 implies "
+            f"{n_batch * out_h * out_w} (N*OutH*OutW). Nothing emitted.")
+    if weights2d[0].shape[1] != k0:
+        raise ValueError(
+            f"layer 0's weight K ({weights2d[0].shape[1]}) does not match "
+            f"patches0's K ({k0})")
+    for i in range(1, n_layers):
+        if weights2d[i].shape[1] != weights2d[i - 1].shape[0] * conv_params[i][0] * conv_params[i][1]:
+            raise ValueError(
+                f"layer {i}'s weight K ({weights2d[i].shape[1]}) does not "
+                f"match Kh*Kw*Cin (layer {i - 1}'s Cout={weights2d[i - 1].shape[0]}, "
+                f"layer {i}'s Kh={conv_params[i][0]}, Kw={conv_params[i][1]})")
+
+    # Every layer's own (M, OutH, OutW), computed once, purely from static
+    # shapes/geometry -- BEFORE any MLIR text is emitted. This is needed
+    # because the final layer's own bias global (if `last_bias` is given)
+    # must be declared at MODULE scope, before `func.func @main()` opens,
+    # but its shape depends on the final layer's own M, which a
+    # single-emission-pass design would only know after the whole
+    # per-layer loop below had already run. Kept in exactly one place so
+    # the loop's own per-layer gather geometry (which still needs each
+    # layer's OutH/OutW to size its subviews) reads from here rather than
+    # recomputing the same formula a second time and risking the two
+    # silently drifting apart.
+    layer_shapes = [(m0, out_h, out_w)]
+    ph, pw = out_h, out_w
+    for i in range(1, n_layers):
+        (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+         pad_right, dilation_h, dilation_w) = conv_params[i]
+        dilated_kh = (kh - 1) * dilation_h + 1
+        dilated_kw = (kw - 1) * dilation_w + 1
+        hp = ph + pad_top + pad_bottom
+        wp = pw + pad_left + pad_right
+        next_out_h = (hp - dilated_kh) // stride_h + 1
+        next_out_w = (wp - dilated_kw) // stride_w + 1
+        if next_out_h <= 0 or next_out_w <= 0:
+            raise ValueError(
+                f"layer {i}: non-positive output size "
+                f"({next_out_h}, {next_out_w}) for input ({ph}, {pw}), "
+                f"kernel ({kh}, {kw}), stride ({stride_h}, {stride_w}), "
+                f"pad ({pad_top}, {pad_bottom}, {pad_left}, {pad_right}), "
+                f"dilation ({dilation_h}, {dilation_w})")
+        layer_shapes.append((n_batch * next_out_h * next_out_w,
+                             next_out_h, next_out_w))
+        ph, pw = next_out_h, next_out_w
+
+    last_m = layer_shapes[-1][0]
+    last_cout = weights2d[-1].shape[0]
+    # _tail_allocs (the per-buffer dealloc list _emit_bias_and_requantize
+    # gives emit_module) is deliberately unused here: this function keeps
+    # its OWN leaky-by-convention discipline (see the module docstring
+    # above), not emit_module's stricter one, so only the final PRINTED
+    # buffer (`result_val`, below) gets an explicit dealloc.
+    tail_lines, _tail_allocs, bias_global, result_val, result_elem = (
+        _emit_bias_and_requantize(
+            f"%out{n_layers - 1}", last_m, last_cout, weight_syms[-1],
+            bias=last_bias,
+            per_channel_requantize=last_per_channel_requantize,
+            trailing_requantize=last_trailing_requantize,
+            effective_bits=effective_bits))
+    quantized = (last_trailing_requantize is not None
+                or last_per_channel_requantize is not None)
+    print_call = "cim_print_i8" if quantized else "cim_print_i32"
+    result_type = f"memref<{last_m}x{last_cout}x{result_elem}>"
+    unranked_type = f"memref<*x{result_elem}>"
+
+    lines = [header.rstrip("\n")] if header else []
+    for sym, w in zip(weight_syms, weights2d):
+        cout, k = w.shape
+        lines.append(
+            f'memref.global "private" constant @{sym} : memref<{cout}x{k}xi8> '
+            f"= dense<{_dense_2d(w)}>")
+    lines.append(
+        f'memref.global "private" constant @{act_sym} : memref<{m0}x{k0}xi8> '
+        f"= dense<{_dense_2d(patches0)}>")
+    if bias_global:
+        lines.append(bias_global.rstrip("\n"))
+    lines.append(f"func.func private @{print_call}({unranked_type})")
+    lines.append("func.func @main() {")
+    for sym, w in zip(weight_syms, weights2d):
+        cout, k = w.shape
+        lines.append(f"  %{sym} = memref.get_global @{sym} : memref<{cout}x{k}xi8>")
+    lines.append(f"  %aInit = memref.get_global @{act_sym} : memref<{m0}x{k0}xi8>")
+    lines.append(f"  %a0 = memref.alloc() : memref<{m0}x{k0}xi8>")
+    lines.append(
+        f"  memref.copy %aInit, %a0 : memref<{m0}x{k0}xi8> to memref<{m0}x{k0}xi8>")
+    # One shared zero constant for every layer's zero-fill (linalg.fill
+    # takes a scalar, not a splat attribute) -- hoisted once rather than
+    # redeclared per layer, since the value is always the same.
+    lines.append("  %zeroI8 = arith.constant 0 : i8")
+
+    act_val = "%a0"
+    cur_m, cur_k = m0, k0
+    cur_h, cur_w = out_h, out_w
+    tmp_counter = [0]
+
+    def fresh(prefix):
+        tmp_counter[0] += 1
+        return f"%{prefix}{tmp_counter[0]}"
+
+    for i, (sym, w) in enumerate(zip(weight_syms, weights2d)):
+        cout, k = w.shape
+        out_val = f"%out{i}"
+        lines.append(f"  {out_val} = memref.alloc() : memref<{cur_m}x{cout}xi32>")
+        lines.append(
+            f"  linalg.matmul_transpose_b ins({act_val}, %{sym} : "
+            f"memref<{cur_m}x{cur_k}xi8>, memref<{cout}x{k}xi8>)")
+        lines.append(f"    outs({out_val} : memref<{cur_m}x{cout}xi32>)")
+
+        if i == n_layers - 1:
+            # Last layer: apply the same bias/requantize tail emit_module
+            # applies to its own single conv, precomputed above (needed
+            # earlier for the bias global's own module-scope placement).
+            lines += tail_lines
+            break
+
+        bridged = f"%act{i + 1}"
+        lines.append(
+            f"  {bridged} = cim.requantize {out_val} {{scale = "
+            f"{float(scales[i])!r} : f32, zero_point = 0 : i32, "
+            f"effective_bits = 8 : i32}}")
+        lines.append(f"    : memref<{cur_m}x{cout}xi32> -> memref<{cur_m}x{cout}xi8>")
+
+        (kh, kw, stride_h, stride_w, pad_top, pad_bottom, pad_left,
+         pad_right, dilation_h, dilation_w) = conv_params[i + 1]
+        cin = cout  # layer i+1's Cin is layer i's own Cout.
+        h, w_ = cur_h, cur_w
+        dilated_kh = (kh - 1) * dilation_h + 1
+        dilated_kw = (kw - 1) * dilation_w + 1
+        hp = h + pad_top + pad_bottom
+        wp = w_ + pad_left + pad_right
+        next_m, next_out_h, next_out_w = layer_shapes[i + 1]
+        next_k = kh * kw * cin
+
+        exp_ty = f"memref<{n_batch}x{h}x{w_}x{cin}xi8>"
+        exp = fresh("aExp")
+        lines.append(
+            f"  {exp} = memref.expand_shape {bridged} [[0, 1, 2], [3]] : "
+            f"memref<{cur_m}x{cin}xi8> into {exp_ty}")
+
+        padded_ty = f"memref<{n_batch}x{hp}x{wp}x{cin}xi8>"
+        padded = fresh("padded")
+        lines.append(f"  {padded} = memref.alloc() : {padded_ty}")
+        lines.append(f"  linalg.fill ins(%zeroI8 : i8) outs({padded} : {padded_ty})")
+
+        inner_stride = [hp * wp * cin, wp * cin, cin, 1]
+        inner_off = pad_top * wp * cin + pad_left * cin
+        inner_ty = (f"memref<{n_batch}x{h}x{w_}x{cin}xi8, "
+                   f"strided<{inner_stride}, offset: {inner_off}>>")
+        inner = fresh("paddedInner")
+        lines.append(
+            f"  {inner} = memref.subview {padded}[0, {pad_top}, {pad_left}, 0] "
+            f"[{n_batch}, {h}, {w_}, {cin}] [1, 1, 1, 1] : {padded_ty} to {inner_ty}")
+        lines.append(f"  memref.copy {exp}, {inner} : {exp_ty} to {inner_ty}")
+
+        patches = fresh("patches")
+        patches_ty = f"memref<{next_m}x{next_k}xi8>"
+        lines.append(f"  {patches} = memref.alloc() : {patches_ty}")
+
+        for th in range(kh):
+            for tw in range(kw):
+                t = th * kw + tw
+                h_off = th * dilation_h
+                w_off = tw * dilation_w
+                tap_stride = [hp * wp * cin, wp * cin * stride_h,
+                              cin * stride_w, 1]
+                tap_off = h_off * wp * cin + w_off * cin
+                tap_ty = (f"memref<{n_batch}x{next_out_h}x{next_out_w}x{cin}xi8, "
+                         f"strided<{tap_stride}, offset: {tap_off}>>")
+                tap = fresh("tap")
+                lines.append(
+                    f"  {tap} = memref.subview {padded}[0, {h_off}, {w_off}, 0] "
+                    f"[{n_batch}, {next_out_h}, {next_out_w}, {cin}] "
+                    f"[1, {stride_h}, {stride_w}, 1] : {padded_ty} to {tap_ty}")
+
+                slab_ty = f"memref<{n_batch}x{next_out_h}x{next_out_w}x{cin}xi8>"
+                slab = fresh("tapSlab")
+                lines.append(f"  {slab} = memref.alloc() : {slab_ty}")
+                lines.append(f"  memref.copy {tap}, {slab} : {tap_ty} to {slab_ty}")
+
+                coll_ty = f"memref<{next_m}x{cin}xi8>"
+                coll = fresh("tapCollapsed")
+                lines.append(
+                    f"  {coll} = memref.collapse_shape {slab} [[0, 1, 2], [3]] "
+                    f": {slab_ty} into {coll_ty}")
+
+                col_stride = [next_k, 1]
+                col_off = t * cin
+                col_ty = (f"memref<{next_m}x{cin}xi8, "
+                         f"strided<{col_stride}, offset: {col_off}>>")
+                col = fresh("patchesCol")
+                lines.append(
+                    f"  {col} = memref.subview {patches}[0, {col_off}] "
+                    f"[{next_m}, {cin}] [1, 1] : {patches_ty} to {col_ty}")
+                lines.append(f"  memref.copy {coll}, {col} : {coll_ty} to {col_ty}")
+
+        act_val = patches
+        cur_m, cur_k = next_m, next_k
+        cur_h, cur_w = next_out_h, next_out_w
+
+    lines.append(f"  %u = memref.cast {result_val} : {result_type} to {unranked_type}")
+    lines.append(f"  func.call @{print_call}(%u) : ({unranked_type}) -> ()")
+    lines.append(f"  memref.dealloc %a0 : memref<{m0}x{k0}xi8>")
+    lines.append(f"  memref.dealloc {result_val} : {result_type}")
     lines.append("  return")
     lines.append("}")
     lines.append("")

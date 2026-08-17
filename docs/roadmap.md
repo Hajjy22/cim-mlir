@@ -2111,6 +2111,81 @@ out of scope for v0.1 across the board, not just here.
   uses (`-DCIM_SANITIZER=address,undefined -DCIM_ENABLE_WERROR=ON`),
   clang-tidy (clang-18 tree, zero findings), and cppcheck (zero findings).
 
+- **`QLinearConv -> QLinearConv` chaining (PR C, the "chain convolution
+  layers" plan's real, hard capability).** Depends on PR A's interpreter
+  support above. Unlike the conv->matmul chain, this needs a REAL MLIR-level
+  im2col for every layer after the first: layer `i >= 1`'s activation is
+  the previous layer's own bridged SSA value, not a concrete Python array,
+  so its patches have to be gathered IN THE EMITTED IR. Also unlike a
+  conv->matmul chain (or an ordinary matmul chain), a conv-to-conv edge
+  needs NO bridge node at all -- both `QLinearConv`'s own `X` and `Y` are
+  already declared `[N, C, H, W]` per the ONNX spec, so wiring one conv's
+  `Y` straight into the next conv's own `X` is already a faithful,
+  standards-compliant statement of the same function this compiler emits.
+
+  `python/cim_frontend/emit.py` gains `emit_conv_chain_module`: per bridge,
+  a `cim.requantize` (reused unchanged from `emit_chain_module`), an
+  `expand_shape` into a 4-D `[N, H, W, Cout]` view, a padded 4-D buffer
+  (`memref.alloc` + `linalg.fill` zero + `memref.copy` the interior in,
+  the direct analogue of `im2col.py`'s own `_pad_nchw`), and `Kh*Kw`
+  kernel taps, each one a single fully static, non-unit-stride
+  `memref.subview` + `memref.copy` into a fresh slab + `collapse_shape`
+  back to 2-D + a copy into the matching column-block of the next layer's
+  own patches buffer -- no `scf.for`, no arithmetic, exactly the design PR
+  A's own probe validated in advance. `python/cim_frontend/onnx_import.py`
+  gains `load_conv_chain`: chain-ordering discovery via producer/consumer
+  edges (not node-list order -- ONNX does not guarantee one), and the
+  channel-last weight flatten for every layer but the first (layer `i>=1`'s
+  activation is NHWC by construction of how the gather lays out patches
+  columns, the opposite flatten order from layer 0's NCHW-sourced one --
+  the same shape of danger as `onnx_import.py`'s own "THE TRANSPOSE" note,
+  and mutation-tested the same way: swapping the flatten order back to
+  Cin-major turns every correctness test red, for the right reason).
+
+  **A genuine design gap found mid-implementation, not anticipated by the
+  plan.** `emit_conv_chain_module`'s first draft always printed the
+  chain's final layer's raw int32 accumulator, mirroring
+  `emit_chain_module`'s own matmul-chain convention (`MatMulInteger`'s own
+  `"Y"` IS the raw accumulator, needing nothing further). That is wrong
+  for a chain ending in `QLinearConv`: the op's own `"Y"` is DEFINED by the
+  ONNX spec as the FULLY QUANTIZED result -- bias added, then a scalar or
+  per-channel requantize applied -- not a raw accumulator. Printing the
+  raw value would have silently misrepresented what the graph itself
+  declares as its output, exactly the "structurally valid IR, confidently
+  wrong number" failure class this project exists to prevent. Fixed by
+  factoring `emit_module`'s own bias/`per_channel_requantize`/
+  `trailing_requantize` tail logic out into a shared
+  `_emit_bias_and_requantize` helper, reused by both functions, and
+  restructuring `emit_conv_chain_module` to precompute every layer's own
+  output shape in a first pass, before emitting any MLIR text -- needed
+  because a bias global (if the final layer has one) must be declared at
+  module scope, before `func.func @main()` opens, but its own shape
+  depends on the final layer's own row count, which a single-pass design
+  only knows after the whole per-layer loop has already run. New `last_
+  bias`/`last_trailing_requantize`/`last_per_channel_requantize` parameters
+  apply ONLY to the final layer -- every earlier layer keeps
+  `load_conv_matmul_chain`'s own established restriction (`y_zero_point ==
+  0`, a scalar `w_scale`, no bias; every layer but the first additionally
+  needs `x_zero_point == 0`, since its activation arrives already
+  zero-centered and the emitted IR applies no zero-point shift to an
+  intermediate value).
+
+  Verified against the real compiled pipeline: a two-layer differential, a
+  combined stride/pad/dilation differential on an interior layer (the
+  parameters the tap-gather has to get right via static strides/offsets,
+  not arithmetic), a batched (N > 1) differential, a three-layer
+  differential (exercising the channel-last flatten on two different
+  layers with distinct Cin/Cout so a wrong order would not accidentally
+  line up), a differential exercising the last layer's own bias and an
+  asymmetric (`uint8`) output together, and an anti-vacuity check that a
+  perturbation in an INTERIOR layer (neither first nor last) of a 3-layer
+  chain is actually caught. Mutation-tested: the channel-last flatten
+  (reverted to Cin-major) turns every correctness test red; the
+  intermediate `x_zero_point`/`y_zero_point == 0` guards (each disabled in
+  turn) turn their own dedicated refusal tests red; dropping the final
+  layer's tail-logic wiring entirely produces IR referencing an undefined
+  SSA value, a hard compile failure, not a silent wrong number.
+
 ## M5 — Community and real hardware (future)
 - Real Erbium-8T hardware backend (`runtime/src/erbium/erbium_backend.cpp`
   currently stubs every entry point with `CIMRT_ERR_NO_DEVICE`).
