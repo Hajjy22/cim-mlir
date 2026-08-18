@@ -321,6 +321,7 @@ bool parseTargetSpec(std::istream &in, TargetSpec &outSpec, std::string *error) 
                  spec.capabilities.partialSumInPlace);
   r.optionalBool("capabilities.autonomous_control",
                  spec.capabilities.autonomousControl);
+  r.optionalBool("capabilities.max_in_place", spec.capabilities.maxInPlace);
 
   // Semantic checks. A target file that parses but describes an impossible
   // device produces confidently wrong cost numbers, which is worse than a

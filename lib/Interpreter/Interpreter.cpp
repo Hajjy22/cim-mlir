@@ -930,8 +930,9 @@ LogicalResult Interpreter::runReducePartial(ReducePartialOp op) {
   // decision (lib/Transforms/CIMLowerToTarget.cpp), made there directly
   // from its own, separately (and necessarily) parsed compile-time spec.
   //
-  // No cim.reduce_max equivalent: that op has no in-place cimrt variant,
-  // deliberately (see cimrt.h), so its fold is only the out-of-place shape.
+  // runReduceMax below reads the same info struct's own max_in_place
+  // field for its identical decision -- a SEPARATE flag, since a target
+  // can support one fold and not the other (cimrt.h).
   cimrt_device_info info{};
   if (cimrt_query(dev, &info) != CIMRT_OK) {
     releaseStagedHere();
@@ -1025,41 +1026,71 @@ LogicalResult Interpreter::runReduceMax(ReduceMaxOp op) {
   // counts the same events. A single operand issues no call at all and
   // forwards its value: a 1x1 pooling window is the identity.
   //
-  // Out-of-place only. There is no cimrt_reduce_max_inplace to gate on a
-  // capability, so unlike reduce_partial there is no branch here.
+  // capabilities.max_in_place, read the same way runReducePartial reads
+  // partial_sum_in_place just above -- a SEPARATE flag (cimrt.h's own
+  // cimrt_device_info doc comment explains why a target can support one
+  // fold and not the other).
+  cimrt_device_info info{};
+  if (cimrt_query(dev, &info) != CIMRT_OK) {
+    releaseStagedHere();
+    return op.emitError("cim.reduce_max: cimrt_query failed");
+  }
+  const bool inPlace = info.max_in_place;
+
   cimrt_buffer *acc = staged.front();
   std::vector<uint8_t> outBytes(totalBytes);
-  llvm::SmallVector<cimrt_buffer *> intermediates;
-  auto releaseIntermediates = [&]() {
-    for (cimrt_buffer *buf : intermediates)
-      cimrt_free(buf);
-    intermediates.clear();
-  };
-  for (size_t i = 1; i < staged.size(); ++i) {
-    cimrt_buffer *winner = nullptr;
-    if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &winner) != CIMRT_OK) {
-      releaseIntermediates();
-      releaseStagedHere();
-      return op.emitError("failed to allocate a reduction accumulator");
+  cimrt_status readStatus;
+  if (inPlace) {
+    // Same safety argument as runReducePartial's own in-place branch:
+    // every entry in `staged` -- including staged[0], about to become
+    // `acc` -- is ALREADY this call's own fresh, private buffer, never a
+    // live handle borrowed from somewhere else, so folding directly into
+    // staged[0] is safe with no cimrt_copy first.
+    for (size_t i = 1; i < staged.size(); ++i) {
+      const cimrt_status status = cimrt_reduce_max_inplace(
+          dev, acc, staged[i], static_cast<size_t>(staging.count),
+          staging.elemBits);
+      if (status != CIMRT_OK) {
+        releaseStagedHere();
+        return op.emitError("cimrt_reduce_max_inplace failed: ")
+               << cimrt_status_string(status);
+      }
     }
-    intermediates.push_back(winner);
-    // out must not alias a or b (cimrt.h), which the fresh buffer
-    // guarantees.
-    const cimrt_status status =
-        cimrt_reduce_max(dev, winner, acc, staged[i],
-                         static_cast<size_t>(staging.count), staging.elemBits);
-    if (status != CIMRT_OK) {
-      releaseIntermediates();
-      releaseStagedHere();
-      return op.emitError("cimrt_reduce_max failed: ")
-             << cimrt_status_string(status);
+    readStatus = cimrt_read(acc, 0, outBytes.data(), totalBytes);
+    releaseStagedHere();
+  } else {
+    llvm::SmallVector<cimrt_buffer *> intermediates;
+    auto releaseIntermediates = [&]() {
+      for (cimrt_buffer *buf : intermediates)
+        cimrt_free(buf);
+      intermediates.clear();
+    };
+    for (size_t i = 1; i < staged.size(); ++i) {
+      cimrt_buffer *winner = nullptr;
+      if (cimrt_alloc(dev, totalBytes, CIMRT_SPACE_NEAR, &winner) !=
+          CIMRT_OK) {
+        releaseIntermediates();
+        releaseStagedHere();
+        return op.emitError("failed to allocate a reduction accumulator");
+      }
+      intermediates.push_back(winner);
+      // out must not alias a or b (cimrt.h), which the fresh buffer
+      // guarantees.
+      const cimrt_status status = cimrt_reduce_max(
+          dev, winner, acc, staged[i], static_cast<size_t>(staging.count),
+          staging.elemBits);
+      if (status != CIMRT_OK) {
+        releaseIntermediates();
+        releaseStagedHere();
+        return op.emitError("cimrt_reduce_max failed: ")
+               << cimrt_status_string(status);
+      }
+      acc = winner;
     }
-    acc = winner;
+    readStatus = cimrt_read(acc, 0, outBytes.data(), totalBytes);
+    releaseIntermediates();
+    releaseStagedHere();
   }
-  const cimrt_status readStatus =
-      cimrt_read(acc, 0, outBytes.data(), totalBytes);
-  releaseIntermediates();
-  releaseStagedHere();
   if (readStatus != CIMRT_OK)
     return op.emitError("failed to read the reduction result: ")
            << cimrt_status_string(readStatus);

@@ -1426,20 +1426,24 @@ private:
   /// N-operand reduce becomes N-1 chained pairwise SIGNED maxes, matching
   /// Interpreter.cpp's runReduceMax's own left-to-right fold.
   ///
-  /// Deliberately just lowerReducePartial's out-of-place branch with
-  /// cimrt_reduce_max substituted for cimrt_reduce_add -- there is no
-  /// in-place counterpart here (no cimrt_reduce_max_inplace exists): PR A's
-  /// own runtime/include/cimrt.h doc comment records that reduce_partial
-  /// shipped out-of-place first too, with in-place landing later as
-  /// separate, motivated work. Not duplicated by copy-paste of a helper --
-  /// this function inlines the same shape directly, the same way
-  /// lowerReducePartial's own two branches are each written out rather than
-  /// factored, since the accumulator-threading logic is only a few lines
-  /// once the shared byteSizeOf/stageForRead/allocBuffer/freeBuffer/
-  /// checkOk/getOrInsertFunc/finish machinery is reused.
+  /// Structurally lowerReducePartial's own two branches (general and
+  /// capabilities-gated in-place) with cimrt_reduce_max/
+  /// cimrt_reduce_max_inplace substituted for cimrt_reduce_add/
+  /// cimrt_reduce_add_inplace, gated on its own capabilities.max_in_place
+  /// flag rather than reusing partial_sum_in_place -- a compare-and-select
+  /// is a different datapath element from an adder (cimrt_reduce_max's own
+  /// doc comment in cimrt.h), so a target can support one fold and not the
+  /// other. reduce_max shipped out-of-place first, same as reduce_partial
+  /// did; the in-place branch landed later as separate, motivated work
+  /// (docs/roadmap.md). Not factored into a shared helper with
+  /// lowerReducePartial -- each function inlines its own shape directly,
+  /// since the accumulator-threading logic is only a few lines once the
+  /// shared byteSizeOf/stageForRead/allocBuffer/freeBuffer/checkOk/
+  /// getOrInsertFunc/finish machinery is reused, and reduce_max additionally
+  /// needs the materialization step below that reduce_partial does not.
   ///
-  /// NON-CONTIGUOUS OPERANDS ARE REFUSED, NOT MATERIALIZED -- see this
-  /// function's own diagnostic below for why: byteSizeOf and hostPointer
+  /// NON-CONTIGUOUS OPERANDS ARE MATERIALIZED, NOT REFUSED -- see this
+  /// function's own comment below for why: byteSizeOf and hostPointer
   /// both assume a contiguous (identity-layout) memref, an invariant that
   /// holds for every operand cim-partition itself ever builds but NOT for
   /// a hand-emitted, non-unit-stride memref.subview -- exactly the shape
@@ -1449,7 +1453,8 @@ private:
   /// `pool_params` docstring). Staging such an operand as if it were
   /// contiguous would silently copy the wrong bytes: a confident wrong
   /// answer, not a crash -- exactly the failure class this project refuses
-  /// to ship.
+  /// to ship, and exactly why it is materialized into a fresh contiguous
+  /// copy instead.
   ///
   /// So a non-identity-layout operand is MATERIALIZED here instead of
   /// staged directly: a fresh, identity-layout `memref.alloc` (hoisted
@@ -1590,6 +1595,49 @@ private:
 
     Value countVal = constI64(b, loc, count);
     Value bitsVal = constI32(b, loc, static_cast<int32_t>(bits));
+
+    // capabilities.max_in_place (spec target-format.md): the identical
+    // decision lowerReducePartial makes from capabilities.
+    // partial_sum_in_place, using its own separate flag -- see
+    // cimrt_reduce_max_inplace's own doc comment in cimrt.h for why this
+    // is a separate ABI call rather than a relaxed cimrt_reduce_max, and
+    // why operand 0's own staged buffer is copied into a fresh one rather
+    // than mutated directly (stageOperand can hand back an ALREADY-LIVE
+    // handle, not always a fresh one, whenever the operand is already
+    // device-space or was a hoisted materialization; either way it may
+    // have other uses this pass cannot see).
+    if (spec.capabilities.maxInPlace) {
+      OpBuilder accAllocB = creationBuilder(b);
+      Value acc = allocBuffer(accAllocB, loc, dev, *bytes, stageSpace);
+      noteHoisted(acc);
+
+      bool firstScratch = false;
+      Value first = stageOperand(0, firstScratch);
+      auto copyFn = getOrInsertFunc("cimrt_copy",
+                                    b.getFunctionType({ptrTy, ptrTy}, {i32Ty}));
+      Value copyStatus =
+          b.create<func::CallOp>(loc, copyFn, ValueRange{acc, first})
+              .getResult(0);
+      checkOk(b, loc, copyStatus, "cimrt_copy failed");
+      if (firstScratch)
+        freeBuffer(b, loc, first);
+
+      auto inplaceFn = getOrInsertFunc(
+          "cimrt_reduce_max_inplace",
+          b.getFunctionType({ptrTy, ptrTy, ptrTy, i64Ty, i32Ty}, {i32Ty}));
+      for (size_t i = 1; i < operands.size(); ++i) {
+        bool rhsScratch = false;
+        Value rhs = stageOperand(i, rhsScratch);
+        Value status = b.create<func::CallOp>(
+                             loc, inplaceFn,
+                             ValueRange{dev, acc, rhs, countVal, bitsVal})
+                            .getResult(0);
+        checkOk(b, loc, status, "cimrt_reduce_max_inplace failed");
+        if (rhsScratch)
+          freeBuffer(b, loc, rhs);
+      }
+      return finish(acc, /*accIsOwnScratch=*/true);
+    }
 
     auto fn = getOrInsertFunc(
         "cimrt_reduce_max",

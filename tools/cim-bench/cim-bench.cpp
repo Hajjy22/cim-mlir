@@ -335,6 +335,8 @@ int main(int argc, char **argv) {
                 spec.capabilities.doubleBufferProgram ? "true" : "false");
     std::printf("capabilities.partial_sum_in_place=%s\n",
                 spec.capabilities.partialSumInPlace ? "true" : "false");
+    std::printf("capabilities.max_in_place=%s\n",
+                spec.capabilities.maxInPlace ? "true" : "false");
     std::printf("capabilities.autonomous_control=%s\n",
                 spec.capabilities.autonomousControl ? "true" : "false");
     return 0;

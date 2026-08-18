@@ -1,6 +1,19 @@
 // RUN: cim-opt %s --cim-detect --cim-partition=target-yaml=%S/../targets/tiny-4x4.yaml \
 // RUN:   | cim-run --target-yaml=%S/../targets/tiny-4x4.yaml --profile - \
 // RUN:   | FileCheck %s
+//
+// Second run: the identical module, against the ONE target that declares
+// capabilities.max_in_place -- so Interpreter.cpp's runReduceMax takes its
+// cimrt_reduce_max_inplace branch instead of the general one. Same CHECK
+// lines apply unchanged: the profile line counts CALLS, not which cimrt_
+// function made them, and the in-place fold is required to compute the
+// identical signed-max answer -- proving that branch reachable end to end,
+// not just structurally present (test/Transforms/
+// cim-lower-to-target-reduce-max-inplace.mlir covers the compiled-lowering
+// shape; this covers the interpreter).
+// RUN: cim-opt %s --cim-detect --cim-partition=target-yaml=%S/../targets/tiny-4x4-max-inplace.yaml \
+// RUN:   | cim-run --target-yaml=%S/../targets/tiny-4x4-max-inplace.yaml --profile - \
+// RUN:   | FileCheck %s
 
 // cim.reduce_max end to end through the shipped binaries, in the exact shape
 // a MaxPool's kernel window uses: several STRIDED memref.subview taps of one

@@ -64,6 +64,20 @@ typedef struct cimrt_device_info {
    * separately-parsed TargetSpec -- this is the runtime-side route to the
    * identical decision, not a second, independent parse of the YAML. */
   bool partial_sum_in_place;
+  /* capabilities.max_in_place (target-format.md): the identical question
+   * for cim.reduce_max -- can this hardware fold a compare-and-select
+   * chain into its first operand's own storage rather than a fresh
+   * destination buffer per step? A SEPARATE flag from partial_sum_in_place
+   * above, not the same bit reused: an adder and a comparator are
+   * different datapath elements (see costs.reduce_max's own doc comment
+   * for why they get separate cost entries too), so a target can support
+   * one in-place fold and not the other -- test/targets/
+   * tiny-4x4-max-inplace.yaml exists specifically to exercise that
+   * independence (max_in_place: true, partial_sum_in_place: false). Read
+   * by Interpreter.cpp's runReduceMax the same way partial_sum_in_place is
+   * read by runReducePartial, and by lowerReduceMax at compile time from
+   * its own separately-parsed TargetSpec. */
+  bool max_in_place;
 } cimrt_device_info;
 
 /* Populated by cimrt_profile_stop. Spec Sec. 8: profiling is mandatory,
@@ -298,6 +312,38 @@ cimrt_status cimrt_reduce_add_inplace(cimrt_device *dev, cimrt_buffer *acc,
 cimrt_status cimrt_reduce_max(cimrt_device *dev, cimrt_buffer *out,
                                const cimrt_buffer *a, const cimrt_buffer *b,
                                size_t count, uint32_t bits);
+
+/* In-place elementwise SIGNED maximum, the capabilities.max_in_place-gated
+ * sibling of cimrt_reduce_max above: acc[i] = max(acc[i], rhs[i]) over
+ * `count` signed integers of `bits`-wide elements each, using the same
+ * sign-extending compare cimrt_reduce_max documents (NOT a raw-byte
+ * compare -- the same hazard applies here unchanged).
+ *
+ * Exists for the identical reason cimrt_reduce_add_inplace exists next to
+ * cimrt_reduce_add: cimrt_reduce_max forbids `out` aliasing either operand
+ * so its own contract stays simple and unconditional, and this is a
+ * SEPARATE function for the case that refusal exists to rule out. Picked
+ * between by lowerReduceMax's compiled lowering and the interpreter's
+ * runReduceMax exactly the way the reduce_partial pair is picked between,
+ * from capabilities.max_in_place rather than capabilities.
+ * partial_sum_in_place -- a target may support one fold and not the other
+ * (cimrt_device_info's own doc comment above explains why).
+ *
+ * `acc` and `rhs` must be different buffers, matching
+ * cimrt_reduce_add_inplace's identical rule and for the same reason: this
+ * is not a shape cim.reduce_max's own lowering ever produces (every
+ * operand staged into it is either a fresh copy or an independent live
+ * handle), and self-accumulation almost certainly indicates a caller bug.
+ * `bits` must be a positive multiple of 8, matching cimrt_reduce_max.
+ *
+ * Counted identically to cimrt_reduce_max, into the same
+ * reduce_maxes_issued counter, charged against the same costs.reduce_max
+ * entry: this is the same hardware step -- a compare-and-select between
+ * two already-computed values -- realized a different way, not a
+ * different cost the target schema has any separate entry for. */
+cimrt_status cimrt_reduce_max_inplace(cimrt_device *dev, cimrt_buffer *acc,
+                                       const cimrt_buffer *rhs, size_t count,
+                                       uint32_t bits);
 
 /* --- sync --- */
 cimrt_status cimrt_barrier(cimrt_device *dev);

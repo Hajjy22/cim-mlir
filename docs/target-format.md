@@ -54,6 +54,7 @@ rather than say so.
 |---|---|
 | `double_buffer_program` | Can the target program tile *i+1* while computing on tile *i*? No pass reorders anything in v0.1; the cost report uses this only for a clearly-labeled *projection* of what overlap would save. |
 | `partial_sum_in_place` | Can `cim.reduce_partial` accumulate without an extra buffer? When true, an *N*-operand reduce allocates one accumulator for the whole chain instead of one per step. |
+| `max_in_place` | The identical question for `cim.reduce_max`: can this hardware fold a compare-and-select chain into its first operand's own storage? A **separate** flag from `partial_sum_in_place`, not the same capability reused — an adder and a comparator are different datapath elements (the same reason `reduce_max`'s cost entry is separate from `reduce_partial`'s above), so a target may support one fold and not the other. |
 | `autonomous_control` | Host-less execution supported? Parsed and echoed, read by no pass — v0.1 has nothing host-less to drive. A test diffs two otherwise-identical targets to keep that true. |
 
 ## A known discrepancy in the spec

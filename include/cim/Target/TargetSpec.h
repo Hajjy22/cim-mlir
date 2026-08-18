@@ -110,6 +110,7 @@ struct CapabilitiesSpec {
   bool doubleBufferProgram = false;
   bool partialSumInPlace = false;
   bool autonomousControl = false;
+  bool maxInPlace = false;
 };
 
 /// Mirrors the full YAML schema from spec Section 7 (see targets/*.yaml).

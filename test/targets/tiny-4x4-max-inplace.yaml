@@ -1,0 +1,64 @@
+# test/targets/tiny-4x4-max-inplace.yaml
+#
+# The capabilities.max_in_place counterpart to tiny-4x4-no-inplace.yaml:
+# identical to tiny-4x4.yaml except partial_sum_in_place is FALSE and
+# max_in_place is TRUE -- the opposite combination from every other tiny
+# test target (tiny-4x4.yaml declares partial_sum_in_place: true and
+# leaves max_in_place unset, i.e. false). This is the one fixture that
+# exercises "this target CAN fold cim.reduce_max in place but CANNOT fold
+# cim.reduce_partial in place" -- proving the two capabilities are read
+# independently, not as one bit doing double duty. See cimrt.h's own
+# cimrt_device_info doc comment for why they are separate flags.
+
+name: tiny-4x4-max-inplace
+description: Tiny synthetic target for tests (2 tiles of 4x4, max_in_place only)
+version: 0.1
+
+class: digital_cim
+
+provenance: estimated  # synthetic; not measured, not modelling any real part
+
+tiles:
+  count: 2
+  rows: 4
+  cols: 4
+  weight_dtype: i8
+  activation_dtype: i8
+  accumulator_dtype: i32
+  persistent: true
+  persistence: nonvolatile
+
+costs:
+  program:
+    latency_ns: 1000
+    energy_pj: 10000
+  mvm:
+    latency_ns: 10
+    energy_pj: 100
+  requantize:
+    latency_ns: 5
+    energy_pj: 50
+  reduce_partial:
+    latency_ns: 2
+    energy_pj: 20
+  # PLACEHOLDER, not measured: no hardware data exists for a
+  # compare-and-select datapath on any of these targets. Deliberately
+  # DIFFERENT from reduce_partial above so that charging a pooling
+  # window against the adder's entry by mistake shows up as a wrong
+  # number instead of an identical one.
+  reduce_max:
+    latency_ns: 3
+    energy_pj: 25
+  transfer:
+    bandwidth_gbps: 1.0
+    energy_pj_per_byte: 1.0
+  standby_leakage_uw_per_tile: 0.0
+
+precision:
+  output_effective_bits: 8
+
+capabilities:
+  double_buffer_program: false
+  partial_sum_in_place: false
+  max_in_place: true
+  autonomous_control: false

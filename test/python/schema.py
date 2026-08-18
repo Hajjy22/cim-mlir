@@ -65,6 +65,7 @@ CANONICAL_ORDER = [
     "precision.output_effective_bits",
     "capabilities.double_buffer_program",
     "capabilities.partial_sum_in_place",
+    "capabilities.max_in_place",
     "capabilities.autonomous_control",
 ]
 
@@ -82,6 +83,7 @@ DOUBLE_FIELDS = ("costs.program.latency_ns", "costs.program.energy_pj",
                  "costs.standby_leakage_uw_per_tile")
 BOOL_FIELDS = ("tiles.persistent", "capabilities.double_buffer_program",
                "capabilities.partial_sum_in_place",
+               "capabilities.max_in_place",
                "capabilities.autonomous_control")
 
 
@@ -332,6 +334,7 @@ def _documents(draw):
         required=[],
         optional=[("double_buffer_program", _bools),
                   ("partial_sum_in_place", _bools),
+                  ("max_in_place", _bools),
                   ("autonomous_control", _bools)]))
 
     top_required = [

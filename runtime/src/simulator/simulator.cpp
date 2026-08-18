@@ -170,6 +170,7 @@ cimrt_status cimrt_query(cimrt_device *dev, cimrt_device_info *out) {
   out->tile_cols = dev->spec.tiles.cols;
   out->persistent = dev->spec.tiles.persistent;
   out->partial_sum_in_place = dev->spec.capabilities.partialSumInPlace;
+  out->max_in_place = dev->spec.capabilities.maxInPlace;
   return CIMRT_OK;
 }
 
@@ -513,6 +514,39 @@ cimrt_status cimrt_reduce_max(cimrt_device *dev, cimrt_buffer *out,
     // nothing -- unlike an add, a max cannot leave its operands' range.
     const uint64_t raw = static_cast<uint64_t>(winner);
     std::memcpy(out->data.data() + i * bytes, &raw, bytes);
+  }
+
+  dev->cost.recordReduceMax();
+  return CIMRT_OK;
+}
+
+cimrt_status cimrt_reduce_max_inplace(cimrt_device *dev, cimrt_buffer *acc,
+                                      const cimrt_buffer *rhs, size_t count,
+                                      uint32_t bits) {
+  if (!dev || !acc || !rhs)
+    return CIMRT_ERR_INVALID_ARG;
+  if (acc == rhs)
+    return CIMRT_ERR_INVALID_ARG; // cimrt.h: not a shape cim.reduce_max
+                                  // ever produces.
+  const uint32_t bytes = bitsToBytes(bits);
+  if (bytes == 0)
+    return CIMRT_ERR_INVALID_ARG;
+  if (acc->data.size() != count * bytes || rhs->data.size() != count * bytes)
+    return CIMRT_ERR_SHAPE_MISMATCH;
+
+  for (size_t i = 0; i < count; ++i) {
+    // Same sign-extending compare as cimrt_reduce_max above, for the same
+    // reason: a raw-byte compare would read an int8 -1 as 0xFF and beat 5.
+    const int64_t lhs = signExtend(acc->data.data() + i * bytes, bytes);
+    const int64_t r = signExtend(rhs->data.data() + i * bytes, bytes);
+    const int64_t winner = lhs > r ? lhs : r;
+
+    // Truncating store into the first operand's own storage instead of a
+    // third buffer -- the same fold cimrt_reduce_add_inplace does, and
+    // `winner` always fits `bytes` for the same reason cimrt_reduce_max's
+    // own store does: it is one of the two inputs unchanged.
+    const uint64_t raw = static_cast<uint64_t>(winner);
+    std::memcpy(acc->data.data() + i * bytes, &raw, bytes);
   }
 
   dev->cost.recordReduceMax();
