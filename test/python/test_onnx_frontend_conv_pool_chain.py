@@ -54,12 +54,19 @@ SEED = int(os.environ.get("CIM_TEST_SEED", "0x5eed1234abcd"), 0)
 
 
 def _independent_maxpool_nchw(x, kh, kw, stride_h, stride_w,
-                              pad_top, pad_bottom, pad_left, pad_right):
+                              pad_top, pad_bottom, pad_left, pad_right,
+                              dilation_h=1, dilation_w=1):
     """A direct, by-hand [N, C, H, W] MaxPool loop -- see this file's own
     module docstring for why it deliberately does not call im2col.py's own
     `output_size()`/`_pad_nchw()`. Pads with -128 (INT8_MIN) directly: the
     literal statement of what a signed-int8 MaxPool's implicit padding
     means -- a padded position never wins a max against a real one.
+
+    `dilation_h`/`dilation_w` (default 1, ordinary pooling) space the taps
+    inside each window `dilation` elements apart via a strided slice --
+    same idea as `im2col.py`'s own dilation support, deliberately
+    reimplemented here rather than shared, for the same "don't test the
+    pipeline against itself" reason the whole function exists.
     """
     x = np.asarray(x, dtype=np.int64)
     n, c, h, w = x.shape
@@ -67,14 +74,17 @@ def _independent_maxpool_nchw(x, kh, kw, stride_h, stride_w,
                     (pad_left, pad_right)),
                mode="constant", constant_values=-128)
     hp, wp = xp.shape[2], xp.shape[3]
-    out_h = (hp - kh) // stride_h + 1
-    out_w = (wp - kw) // stride_w + 1
+    dilated_kh = (kh - 1) * dilation_h + 1
+    dilated_kw = (kw - 1) * dilation_w + 1
+    out_h = (hp - dilated_kh) // stride_h + 1
+    out_w = (wp - dilated_kw) // stride_w + 1
     out = np.empty((n, c, out_h, out_w), dtype=np.int64)
     for oh in range(out_h):
         h0 = oh * stride_h
         for ow in range(out_w):
             w0 = ow * stride_w
-            window = xp[:, :, h0:h0 + kh, w0:w0 + kw]
+            window = xp[:, :, h0:h0 + dilated_kh:dilation_h,
+                       w0:w0 + dilated_kw:dilation_w]
             out[:, :, oh, ow] = window.max(axis=(2, 3))
     return out
 
@@ -137,6 +147,44 @@ def test_the_independent_maxpool_oracle_matches_onnx_reference():
         "suspect, not (necessarily) the front end")
 
 
+def test_the_independent_maxpool_oracle_matches_onnx_reference_with_dilation():
+    # Same self-check, at real dilation (2, 2) plus real padding -- proving
+    # the independent oracle's own dilation support (added alongside
+    # MaxPool dilation acceptance in the front end) agrees with
+    # onnx.reference before it is trusted to check this front end's output
+    # below. A deliberately asymmetric kernel/dilation/stride combination,
+    # not a repeated (2, 2) everywhere, so a swapped h/w axis in either
+    # implementation could not accidentally cancel out.
+    rng = np.random.default_rng(SEED + 83)
+    x = rng.integers(-100, 100, size=(2, 3, 9, 8)).astype(np.int64)
+    kh, kw, stride_h, stride_w = 2, 3, 2, 2
+    dilation_h, dilation_w = 2, 1
+    pad = (1, 0, 0, 1)  # top, bottom, left, right
+
+    got = _independent_maxpool_nchw(x, kh, kw, stride_h, stride_w, *pad,
+                                    dilation_h=dilation_h,
+                                    dilation_w=dilation_w)
+
+    model = onnx_helper.make_model(
+        onnx_helper.make_graph(
+            [onnx_helper.make_node(
+                "MaxPool", ["X"], ["Y"], kernel_shape=[kh, kw],
+                strides=[stride_h, stride_w],
+                dilations=[dilation_h, dilation_w],
+                pads=[pad[0], pad[2], pad[1], pad[3]])],
+            "pool_only",
+            [onnx_helper.make_tensor_value_info(
+                "X", TensorProto.INT8, list(x.shape))],
+            [onnx_helper.make_tensor_value_info(
+                "Y", TensorProto.INT8, list(got.shape))]),
+        opset_imports=[onnx_helper.make_opsetid("", 13)])
+    want = onnx_reference_eval(model, x.astype(np.int8), act_name="X")
+    assert np.array_equal(got.ravel(), want), (
+        "the independent oracle's own dilation support disagrees with "
+        "onnx.reference -- the oracle itself is suspect, not "
+        "(necessarily) the front end")
+
+
 # --- correctness, through the real cim-opt/cim-run pipeline ---------------
 
 def test_a_conv_pool_conv_chain_matches_the_reference(cim_opt, cim_run):
@@ -188,6 +236,28 @@ def test_overlapping_pool_windows_match_the_reference(cim_opt, cim_run):
     model = conv_pool_chain_model(
         [w0, w1], x_shape,
         pools={0: dict(kernel_shape=(3, 3), strides=(2, 2))})
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_a_dilated_pool_matches_the_reference(cim_opt, cim_run):
+    # dilations != (1, 1) on the pool itself -- accepted, not refused
+    # (onnx_import.py's own module header explains why this is not an
+    # oracle gap the way stride == 1 is). Real, asymmetric padding too, so
+    # the -128 fill is exercised at the same time as the dilated tap
+    # pattern, not as two separate claims.
+    rng = np.random.default_rng(SEED + 84)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 9, 9)
+    act = rng.integers(-40, -20, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape,
+        pools={0: dict(kernel_shape=(2, 2), strides=(2, 2),
+                      pads=(1, 1, 0, 0), dilations=(2, 2))})
     outputs, want = _run(model, act, cim_opt, cim_run)
     assert np.array_equal(outputs, want), (
         f"compiled output {outputs.tolist()} != ONNX reference "
@@ -273,6 +343,25 @@ def test_refuses_a_pool_with_stride_one():
 
     act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
     with pytest.raises(Refusal, match="cannot evaluate"):
+        import_model(model, act)
+
+
+def test_refuses_a_pool_with_non_positive_dilation():
+    # dilations != (1, 1) is now accepted (see test_a_dilated_pool_matches_
+    # the_reference above) -- but a non-positive entry is still refused,
+    # the same "not a sampling pattern any real accelerator can express"
+    # rule _conv_geometry already applies to a convolution's own dilation.
+    rng = np.random.default_rng(SEED + 85)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape,
+        pools={0: dict(kernel_shape=(2, 2), dilations=(0, 1))})
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="dilations"):
         import_model(model, act)
 
 

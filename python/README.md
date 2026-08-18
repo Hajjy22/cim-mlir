@@ -82,6 +82,14 @@ Emitted as `Kh * Kw` static strided `memref.subview` taps folded by one `cim.red
 That op compares **signed**, matching what ONNX `MaxPool` on int8 actually computes
 (`max(5, -1) == 5`, not `-1`'s raw byte).
 
+**Dilation (`dilations != (1, 1)`) is accepted**, the same as on a convolution — the
+emitted gather already threaded dilation through its tap-offset formula byte-for-byte
+identically to the conv-to-conv gather (same `output_size()` call, same `th * dilation_h`
+pattern), so this was a refusal to lift rather than a feature to build. Confirmed against
+`onnx.reference` first: unlike `strides == 1`, dilation is not an oracle gap — a real
+dilated, strided, padded integer `MaxPool` evaluates cleanly there, and the `-128` pad
+value still loses to a real value at any dilation.
+
 The pad value is **`-128`**, not `0` — a convolution's correct pad value is wrong here,
 since `0` can beat a real negative activation it should lose to. Confirmed against three
 independent implementations.

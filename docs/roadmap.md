@@ -141,6 +141,7 @@ Closed so far:
 | **Packaging** | `python/pyproject.toml`, installed and exercised fresh by CI. |
 | **Units** | The pJ-as-written convention is pinned by a test on a non-unit fixture, so the alternative readings actually differ. |
 | **`max_in_place`** | `cimrt_reduce_max_inplace` plus its own capability flag — the identical fold `partial_sum_in_place` gives `cim.reduce_partial`, given to `cim.reduce_max` through a **separate** flag rather than reusing that one, since a compare-and-select is a different datapath element from an adder and a target may support one fold and not the other. `test/targets/tiny-4x4-max-inplace.yaml` declares the opposite combination from every other test target (`max_in_place: true`, `partial_sum_in_place: false`) specifically to prove the two flags are read independently, not one bit doing double duty. |
+| **`MaxPool` dilation** | `dilations != (1, 1)` accepted on a pool the same as on a convolution — this was a refusal to lift, not a feature to build: `emit_conv_chain_module`'s own pooling gather already threaded dilation through byte-for-byte identically to the conv-to-conv gather, dead code until the loader's refusal came out. Confirmed against `onnx.reference` first — unlike `strides == 1`, dilation is not an oracle gap. |
 
 Still open:
 
@@ -149,8 +150,7 @@ Still open:
 - `cim-legalize-precision` with real `effective_bits` modeling; there is still no
   calibration step anywhere in the pipeline to derive a scale from.
 - `scf.if` and loop-carried `iter_args` in `cim-lower-to-target`.
-- Pooling composed with the conv-to-matmul bridge; `MaxPool` dilation; `Relu`,
-  `GlobalAveragePool`, `Concat`.
+- Pooling composed with the conv-to-matmul bridge; `Relu`, `GlobalAveragePool`, `Concat`.
 - Grouped/depthwise convolution.
 
 ## M5 — Community and real hardware (future)

@@ -1910,6 +1910,24 @@ def load_conv_chain(model):
 # onnxruntime, and a hand-written NumPy max-pool) agreeing exactly on an
 # all-negative int8 input with real padding, at strides >= 2.
 #
+# DILATION (`dilations != (1, 1)`) IS ACCEPTED
+# ============================================================================
+# Unlike the stride restriction above, dilation is not an oracle gap:
+# onnx.reference evaluates a real dilated, strided, padded integer MaxPool
+# cleanly. `emit_conv_chain_module`'s own `pool_params` gather (emit.py)
+# already threads dilation through byte-for-byte the same way its
+# conv-to-conv gather does -- the same `output_size()` call, the same
+# `th * dilation_h` / `tw * dilation_w` tap-offset formula -- because a
+# pooling window's taps are a sampling pattern over the same padded buffer
+# a convolution's taps are, and "DILATION IS A SAMPLING PATTERN" (see
+# im2col.py's own note) does not care what op folds the taps afterward.
+# Confirmed against onnx.reference before this was accepted, not assumed
+# from the conv path's own correctness: a real dilated+strided+padded
+# integer MaxPool evaluates cleanly there, and the `-128` pad value above
+# still loses to a real, less-negative value at dilation != 1 exactly as
+# it does at dilation == 1 -- the padding formula has no idea what pattern
+# the taps sample either.
+#
 # WHAT IS STILL REFUSED
 # =======================
 #   * `ceil_mode=1` -- im2col.py's shared `output_size()` (and
@@ -1918,12 +1936,6 @@ def load_conv_chain(model):
 #   * `auto_pad` other than `NOTSET` -- the same onnx.reference
 #     shape-dependent-padding-formula bug `_conv_geometry` already refuses
 #     it for on a convolution.
-#   * `dilations` other than `(1, 1)` -- not checked against a real
-#     cim-opt/cim-run round trip; MaxPool's dilations attribute exists in
-#     the ONNX schema but is rare in practice, and adding it is a small,
-#     separate extension once a real model forces it (this front end's own
-#     "don't invent capability a real model hasn't forced" discipline, see
-#     load_qlinear_conv's own module header).
 #   * `storage_order=1` (column-major) -- this front end never produces
 #     MaxPool's own optional `Indices` output, so there is nothing for a
 #     non-default storage order to apply to; refused as a signal the caller
@@ -1999,11 +2011,25 @@ def _pool_geometry(node, where):
             f"dilations={dilations} has {len(dilations)} entries; a 2-D "
             f"MaxPool needs exactly 2. Nothing emitted.", where=where)
     dilation_h, dilation_w = dilations
-    if dilation_h != 1 or dilation_w != 1:
+    # Accepted, not refused: emit_conv_chain_module's own pool_params
+    # gather (see its own docstring) is byte-for-byte the same
+    # dilation-aware tap-offset formula (`th * dilation_h`, `tw *
+    # dilation_w`) and the same output_size() call its conv-gather sibling
+    # already uses at every dilation -- "DILATION IS A SAMPLING PATTERN"
+    # (im2col.py's own note) applies identically to a pooling window's
+    # taps as to a convolution's. Confirmed against onnx.reference before
+    # this refusal was lifted, not assumed from the conv path's own
+    # correctness: a real dilated, strided, PADDED integer MaxPool
+    # evaluates cleanly there (unlike stride=1, dilation is not a gap in
+    # what the oracle can verify), and an all-negative activation with a
+    # single less-negative real value confirms -128 padding still loses
+    # to it exactly as the non-dilated case already established -- the
+    # padding formula does not care what pattern the taps sample.
+    if dilation_h <= 0 or dilation_w <= 0:
         raise Refusal(
-            f"dilations={dilations}; only (1, 1) is imported for a "
-            f"MaxPool -- see this section's own module header. Nothing "
-            f"emitted.", where=where)
+            f"dilations={dilations}; both entries must be positive -- "
+            f"not a sampling pattern any real accelerator (or numpy's own "
+            f"strided slicing) can express. Nothing emitted.", where=where)
 
     pads = _int_list_attr(node, "pads", [0, 0, 0, 0])
     if len(pads) != 4:
