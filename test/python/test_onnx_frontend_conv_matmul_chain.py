@@ -246,6 +246,33 @@ def test_refuses_more_than_one_qlinear_conv_in_a_chain():
         import_model(model, act)
 
 
+def test_refuses_a_grouped_conv():
+    # Grouped/depthwise convolution is accepted STANDALONE
+    # (test_onnx_frontend_conv.py's own tests), via load_qlinear_conv's
+    # allow_grouped=True -- but _conv_geometry's default is still
+    # allow_grouped=False for every chain loader, this one included. A
+    # grouped conv's own weight/im2col shape has not been threaded through
+    # this loader's channel-count bookkeeping (Cin == the previous layer's
+    # own Cout, here always ungrouped), so accepting it here would need
+    # real new work, not just flipping a flag -- see _conv_geometry's own
+    # allow_grouped docstring note.
+    cout, cin, kh, kw = 4, 2, 2, 2
+    rng = np.random.default_rng(SEED + 38)
+    conv_w = rng.integers(-4, 5, size=(cout, cin, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin, 5, 5)
+    mm_w = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_matmul_chain_model(conv_w, x_shape, [mm_w])
+    for node in model.graph.node:
+        if node.op_type == "QLinearConv":
+            node.attribute.append(onnx_helper.make_attribute("group", 2))
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="group"):
+        import_model(model, act)
+
+
 def test_refuses_a_nonzero_conv_y_zero_point():
     cout, cin, kh, kw = 2, 2, 2, 2
     rng = np.random.default_rng(SEED + 38)

@@ -143,6 +143,7 @@ Closed so far:
 | **`max_in_place`** | `cimrt_reduce_max_inplace` plus its own capability flag — the identical fold `partial_sum_in_place` gives `cim.reduce_partial`, given to `cim.reduce_max` through a **separate** flag rather than reusing that one, since a compare-and-select is a different datapath element from an adder and a target may support one fold and not the other. `test/targets/tiny-4x4-max-inplace.yaml` declares the opposite combination from every other test target (`max_in_place: true`, `partial_sum_in_place: false`) specifically to prove the two flags are read independently, not one bit doing double duty. |
 | **`MaxPool` dilation** | `dilations != (1, 1)` accepted on a pool the same as on a convolution — this was a refusal to lift, not a feature to build: `emit_conv_chain_module`'s own pooling gather already threaded dilation through byte-for-byte identically to the conv-to-conv gather, dead code until the loader's refusal came out. Confirmed against `onnx.reference` first — unlike `strides == 1`, dilation is not an oracle gap. |
 | **Pooling composed with the conv-to-matmul bridge** | `load_conv_pool_chain_matmul_chain`: a `MaxPool` may now sit between a conv chain's own last layer and its first matmul layer, not only strictly between two convs. Composed from existing pieces — `_discover_conv_pool_chain`'s interior detection plus `load_conv_chain_matmul_chain`'s own Transpose/Reshape bridge — with one new arithmetic claim: the bridge's own `M` must reflect the pooled spatial size, not the raw last conv's. `emit_conv_chain_module` needed one real fix, not just wiring: its own `pool_params` validation pre-emptively refused this exact bridge index under a stale assumption ("the next layer must be a conv to gather from the pool") that predated a matmul tail ever being able to follow a pool at all; the emission code itself already handled it correctly. Mutation-tested by disabling the new M-shrink step, which fails clean as a `Refusal` (wrong Reshape target shape), not a wrong number. |
+| **Grouped/depthwise convolution** | `QLinearConv` with `group > 1` decomposes into `group` independent `linalg.matmul_transpose_b` ops, each with its own correctly-sized weight and activation, concatenated column-wise into one output buffer — not a single block-diagonal matmul with cross-group entries zeroed, because that would make `cim-partition` program real (mostly-zero) tiles and `cim.mvm` burn real cycles multiplying by zero, exactly the dishonest efficiency this project's own cost model exists to catch. Each group is independently recognized by `cim-detect`, confirmed by direct probing. Verified against independent NumPy convolution loops before writing any front-end code (both a real grouped case and a fully depthwise case matched `onnx.reference` exactly — no oracle gap, unlike `MaxPool`'s `stride == 1`). Standalone only: the chain loaders still refuse `group != 1`, since a grouped conv's own shape has not been threaded through their channel bookkeeping. |
 
 Still open:
 
@@ -152,7 +153,8 @@ Still open:
   calibration step anywhere in the pipeline to derive a scale from.
 - `scf.if` and loop-carried `iter_args` in `cim-lower-to-target`.
 - `Relu`, `GlobalAveragePool`, `Concat`.
-- Grouped/depthwise convolution.
+- Grouped/depthwise convolution composed into a chain (matmul head, conv chain, or
+  pooling bridge) — landed standalone only so far.
 
 ## M5 — Community and real hardware (future)
 

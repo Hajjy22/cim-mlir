@@ -133,18 +133,24 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
                        y_zero_point=0, x_dtype=TensorProto.INT8,
                        y_dtype=TensorProto.INT8, bias=None,
                        strides=(1, 1), pads=(0, 0, 0, 0),
-                       dilations=(1, 1),
+                       dilations=(1, 1), group=1,
                        auto_pad="NOTSET", node_name="conv", check=True):
     """A graph of one QLinearConv: Y = requantize(conv(X, weight) [+ B]).
 
-    `weight` is [Cout, Cin, Kh, Kw] -- ONNX's own layout, and (unlike
-    matmul_integer_model's [K, N]) the SAME layout
+    `weight` is [Cout, Cin/group, Kh, Kw] -- ONNX's own layout, and
+    (unlike matmul_integer_model's [K, N]) the SAME layout
     cim_frontend.onnx_import.load_qlinear_conv consumes directly; see
     im2col.py's own module docstring for why a conv kernel needs no
     transpose the way a matmul's weight does. `x_shape` is the
     activation's [N, Cin, H, W] -- required up front, since QLinearConv's
     output shape (and so the graph's declared output value_info) depends
     on it before any real activation values exist.
+
+    `group` (default 1, an ordinary convolution) is ONNX's own grouped-
+    convolution attribute: `weight`'s own Cin axis (`weight.shape[1]`) is
+    then Cin/group, not the activation's own total Cin, matching ONNX's
+    own grouped-conv weight layout (see load_qlinear_conv's own docstring
+    for how the loader reads it). `group == Cin == Cout` is depthwise.
 
     `w_scale` is a single float (uniform across output channels) or an
     array-like of length Cout (real per-channel quantization -- see
@@ -160,9 +166,10 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
     weight = np.asarray(weight)
     cout, cin, kh, kw = weight.shape
     n, x_cin, h, w = x_shape
-    if x_cin != cin:
+    if x_cin != cin * group:
         raise ValueError(
-            f"x_shape's Cin ({x_cin}) does not match weight's Cin ({cin})")
+            f"x_shape's Cin ({x_cin}) does not match weight's Cin/group "
+            f"({cin}) times group ({group}) = {cin * group}")
 
     stride_h, stride_w = strides
     dilation_h, dilation_w = dilations
@@ -206,7 +213,8 @@ def qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
         initializers.append(numpy_helper.from_array(
             np.asarray(bias, dtype=np.int32), name="B"))
         node_inputs.append("B")
-    node_kwargs = {"strides": list(strides), "dilations": list(dilations)}
+    node_kwargs = {"strides": list(strides), "dilations": list(dilations),
+                   "group": group}
     if auto_pad == "NOTSET":
         node_kwargs["pads"] = list(pads)
     else:

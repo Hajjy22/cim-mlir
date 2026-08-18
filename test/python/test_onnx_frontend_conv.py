@@ -11,12 +11,15 @@ per-inference cost at all in this project's execution model. `QLinearConv`
 is reshaped into the SAME (weight[N, K], activation[M, K]) shape a plain
 MatMulInteger already produces -- see im2col.py's own module docstring for
 the exact reshape, and load_qlinear_conv's module section header
-(onnx_import.py) for what is deliberately still refused (grouped
-convolution, a non-zero w_zero_point, non-explicit padding) and why each
-is a real scope boundary rather than an oversight. Dilation is accepted
-(see im2col.py's own "DILATION IS A SAMPLING PATTERN" note) -- it changes
-which source pixels a kernel tap reads, not the shape of anything, unlike
-the three restrictions that remain.
+(onnx_import.py) for what is deliberately still refused (a non-zero
+w_zero_point, non-explicit padding) and why each is a real scope boundary
+rather than an oversight. Dilation is accepted (see im2col.py's own
+"DILATION IS A SAMPLING PATTERN" note) -- it changes which source pixels a
+kernel tap reads, not the shape of anything. Grouped (and depthwise)
+convolution is accepted too, but NOT as a reshape: it decomposes into
+`group` independent matmuls instead -- see
+emit.emit_grouped_conv_module's own docstring for why, and this file's
+own grouped/depthwise tests below.
 
 PER-CHANNEL SCALE, BIAS, AND ASYMMETRIC ZERO POINTS ARE ALSO RESHAPES
 ------------------------------------------------------------------------
@@ -163,6 +166,120 @@ def test_a_batched_conv_matches_the_quantized_reference(cim_opt, cim_run):
     assert np.array_equal(got, want.reshape(3, cout, 2, 2)), (
         f"compiled {got.tolist()} != ONNX's own quantized reference "
         f"{want.tolist()}")
+
+
+def test_a_grouped_conv_matches_the_quantized_reference(cim_opt, cim_run):
+    # group=2, Cin=4, Cout=6 -- a REAL grouped conv (Cin/group=2, not the
+    # degenerate Cin/group=1 depthwise case below), so this exercises the
+    # general "group's own weight slice keeps its own Cin/group input
+    # channels" shape, not just the special case. See emit.
+    # emit_grouped_conv_module's own docstring for why this decomposes
+    # into `group` independent matmuls rather than one padded dense one.
+    rng = np.random.default_rng(SEED + 24)
+    cout, cin_per_group, kh, kw, group = 6, 2, 2, 2, 2
+    weight = rng.integers(-6, 7, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=5.0, group=group)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=4, out_w=4)
+    assert np.array_equal(got, want.reshape(1, cout, 4, 4)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_a_depthwise_conv_matches_the_quantized_reference(cim_opt, cim_run):
+    # group == Cin == Cout: the degenerate, most common real case
+    # (MobileNet-style networks) -- each output channel reads exactly one
+    # input channel, Cin/group == 1.
+    rng = np.random.default_rng(SEED + 25)
+    channels, kh, kw = 4, 3, 3
+    weight = rng.integers(-6, 7, size=(channels, 1, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, channels, 6, 6)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=5.0, group=channels)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, channels, out_h=4, out_w=4)
+    assert np.array_equal(got, want.reshape(1, channels, 4, 4)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_a_batched_grouped_conv_matches_the_quantized_reference(cim_opt,
+                                                                 cim_run):
+    # M > 1 batching composes with grouping the same way it already does
+    # with im2col's own batch flattening (test_a_batched_conv_matches_
+    # the_quantized_reference above) -- a combination neither feature's
+    # own tests exercise on its own.
+    rng = np.random.default_rng(SEED + 26)
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    weight = rng.integers(-5, 6, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (2, cin_per_group * group, 4, 4)
+    act = rng.integers(-5, 6, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=5.0, group=group)
+    want = onnx_reference_eval(model, act, act_name="X")
+    assert np.abs(want).max() < 100
+
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=3, out_w=3, n=2)
+    assert np.array_equal(got, want.reshape(2, cout, 3, 3)), (
+        f"compiled {got.tolist()} != ONNX's own quantized reference "
+        f"{want.tolist()}")
+
+
+def test_a_wrong_weight_in_one_group_would_actually_be_caught(cim_opt,
+                                                               cim_run):
+    # Anti-vacuity: a perturbation confined to group 1's own weight must
+    # change the compiled result -- proving group 1's own matmul (not just
+    # group 0's) is actually threaded into the concatenated output, not
+    # silently dropped or overwritten by the other group's own subview
+    # copy.
+    rng = np.random.default_rng(SEED + 27)
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    weight = rng.integers(-6, 7, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    act = rng.integers(-6, 7, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, x_scale=1.0, w_scale=1.0,
+                               y_scale=5.0, group=group)
+    got = _run_conv(cim_opt, cim_run, model, act, cout, out_h=4, out_w=4)
+
+    bad_weight = weight.copy()
+    cout_per_group = cout // group
+    bad_weight[cout_per_group] += 1  # group 1's own first output channel
+    bad_model = qlinear_conv_model(bad_weight, x_shape, x_scale=1.0,
+                                   w_scale=1.0, y_scale=5.0, group=group)
+    bad_got = _run_conv(cim_opt, cim_run, bad_model, act, cout, out_h=4,
+                        out_w=4)
+    assert not np.array_equal(bad_got, got), (
+        "perturbing group 1's own weight did not change the compiled "
+        "output -- its matmul is not actually reaching the concatenated "
+        "result")
+
+
+def test_refuses_a_group_that_does_not_evenly_divide_cout():
+    rng = np.random.default_rng(SEED + 28)
+    weight = rng.integers(-4, 5, size=(3, 2, 2, 2),
+                          dtype=np.int64).astype(np.int8)  # Cout=3, group=2
+    x_shape = (1, 4, 4, 4)
+    act = np.zeros(x_shape, dtype=np.int8)
+
+    model = qlinear_conv_model(weight, x_shape, group=2)
+    with pytest.raises(Refusal, match="group"):
+        import_model(model, act)
 
 
 def test_a_dilated_conv_matches_the_quantized_reference(cim_opt, cim_run):
@@ -409,27 +526,17 @@ def _base_model(cout=2, cin=2, kh=2, kw=2, h=4, w=4, **kwargs):
     return weight, x_shape, qlinear_conv_model(weight, x_shape, **kwargs)
 
 
-def test_refuses_a_grouped_convolution():
-    weight, x_shape, model = _base_model()
-    model.graph.node[0].attribute.append(
-        onnx.helper.make_attribute("group", 2))
-    act = np.zeros(x_shape, dtype=np.int8)
-    with pytest.raises(Refusal, match="group"):
-        import_model(model, act)
-
-
 def test_refuses_a_non_positive_dilation():
     # A real dilation (>= 1) is accepted -- see
     # test_a_dilated_conv_matches_the_quantized_reference below -- but 0
     # or negative is not a sampling pattern this front end (or a real
     # accelerator) can express. Set through qlinear_conv_model's own
     # `dilations` kwarg, not by appending a second `dilations` attribute
-    # onto the node by hand the way the grouped-conv refusal test appends
-    # `group`: the fixture now always emits ITS OWN `dilations` attribute
-    # (default (1, 1)), so appending a second one would leave the node
-    # with two, and onnx_import.py's `_int_list_attr` reads the FIRST
-    # match -- silently validating the fixture's own (1, 1), not this
-    # test's (0, 1), and never refusing at all.
+    # onto the node by hand: the fixture always emits ITS OWN `dilations`
+    # attribute (default (1, 1)), so appending a second one would leave
+    # the node with two, and onnx_import.py's `_int_list_attr` reads the
+    # FIRST match -- silently validating the fixture's own (1, 1), not
+    # this test's (0, 1), and never refusing at all.
     weight, x_shape, model = _base_model(dilations=(0, 1))
     act = np.zeros(x_shape, dtype=np.int8)
     with pytest.raises(Refusal, match="dilations"):

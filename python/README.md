@@ -44,6 +44,7 @@ reasons.
 | A conv chain -> matmul chain | The realistic full-CNN shape |
 | `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
 | `MaxPool` composed with the conv->matmul bridge | A pool between the chain's own last conv and its first matmul layer — max is scale-invariant, so this needs no bridge of its own beyond moving the Transpose/Reshape's own source |
+| A grouped or depthwise `QLinearConv` (`group > 1`), standalone | `group` independent im2col matmuls, one per channel slice, concatenated into one output — not chained, and not composed with the matmul bridge or pooling yet |
 
 Per layer, operands must be: constant int8 weights, rank 2 (or 4 for conv), all dimensions
 statically known, opset 10 or later.
@@ -99,6 +100,34 @@ Pooling compiles all the way to a real-target binary, not just `cim-run`:
 `cim-lower-to-target` materializes each non-contiguous pooling tap into a fresh contiguous
 buffer before staging it.
 
+### Grouped/depthwise convolution details
+
+`QLinearConv` with `group > 1` splits both input and output channels into `group` slices;
+ONNX stores the weight already sliced, `[Cout, Cin/group, Kh, Kw]`, so each group's own
+kernel carries only its own `Cin/group` input channels — no cin-axis slicing needed, only
+a cout-axis split of the weight and a cin-axis split of the activation. Depthwise is the
+special case `group == Cin == Cout` (`Cin/group == 1`).
+
+This is emitted as `group` **independent** `linalg.matmul_transpose_b` ops, each over its
+own correctly-sized weight and im2col'd activation slice, concatenated column-wise into
+one `[M, Cout]` output buffer via `memref.subview` copies — the same per-column pattern
+`per_channel_requantize` already uses elsewhere in this file. Each group is then
+independently recognized as its own `cim-detect` candidate, confirmed by direct probing.
+
+The alternative — one `[Cout, Cin, Kh, Kw]` dense matmul with cross-group weight entries
+forced to zero — would reuse the plain matmul emitter unchanged, but was rejected: it would
+make `cim-partition` program real (mostly-zero) tiles and `cim.mvm` burn real cycles
+multiplying by zero, exactly the dishonest efficiency this project's own cost model exists
+to make impossible to hide.
+
+Verified against independent NumPy convolution loops before any front-end code was
+written — both a real grouped case and a fully depthwise case matched `onnx.reference`
+exactly, so there is no oracle gap here (unlike `MaxPool`'s `strides == 1`).
+
+Standalone only, for now: the chain loaders (conv chain, conv-to-matmul bridge, pooling)
+still refuse `group != 1`, since a grouped conv's own weight/im2col shape has not been
+threaded through their channel-count bookkeeping.
+
 ## What it refuses, and why refusing is the point
 
 The failure mode of guessing here is not a crash. Dropping an unrecognized op emits a
@@ -117,7 +146,7 @@ confident wrong number is worse than a refusal.
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
 | a bridge with a non-positive scale, or a missing/non-zero zero point | `cim.requantize` needs a positive scale and an explicit int8 zero point of 0 |
 | a value read by more than one node along a chain | needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
-| a grouped/depthwise conv (`group != 1`) | each group is an independent matmul over a channel slice, not one reshape |
+| a grouped/depthwise conv (`group != 1`) **inside a chain** (conv chain, matmul bridge, or pooling) | accepted standalone (see above); the chain loaders don't yet thread a grouped shape through their channel bookkeeping |
 | a conv with non-zero `w_zero_point` | its correction term is per-row and activation-dependent, not a fixed per-channel bias |
 | a conv with a non-scalar `x_zero_point`/`y_zero_point` | per-tensor activation quantization is the near-universal convention |
 | `auto_pad` other than `NOTSET`, on conv or pool | needs shape-dependent padding math this front end does not replicate. `VALID` is refused too, because `onnx.reference`'s own formula for it is wrong for `N != 1` or `Cin != 1` — an oracle bug, sidestepped rather than reproduced |

@@ -73,6 +73,180 @@ def _dense_2d(arr):
     return f"[{rows}]"
 
 
+def emit_grouped_conv_module(weight_groups, activation_groups, weight_syms=None,
+                             act_syms=None, header="", trailing_requantize=None,
+                             bias=None, per_channel_requantize=None,
+                             effective_bits=8):
+    """A self-contained module computing a GROUPED (or depthwise, group ==
+    Cin == Cout) convolution's `group` independent matmuls, concatenated
+    along the output-channel axis into one `[M, Cout]` int32 accumulator,
+    then (optionally) bias-added and requantized exactly like
+    `emit_module`'s own tail (`_emit_bias_and_requantize`, shared).
+
+    `weight_groups[g]` is group g's own `[Cout_g, K_g]` int8 weight,
+    ALREADY output-major -- exactly `emit_module`'s own `weight` convention
+    (see its docstring), just one array per group instead of one for the
+    whole op. `activation_groups[g]` is that group's own `[M, K_g]` (or
+    `[K_g]` for M == 1) int8 im2col patches -- a REAL, separate im2col of
+    that group's own `Cin/group` channel slice (onnx_import.py's own
+    `load_qlinear_conv` computes it that way), not a slice of one shared
+    array: a grouped conv's groups genuinely see disjoint input channels,
+    so there is no single dense activation to slice from at this level.
+
+    WHY G SEPARATE MATMULS, NOT ONE PADDED DENSE ONE: a grouped conv is
+    mathematically equivalent to one `[Cout, Cin, Kh, Kw]` matmul with
+    every cross-group weight entry forced to zero (a block-diagonal
+    matrix) -- reusing `emit_module` unchanged. Rejected: `cim-partition`
+    would then have to PROGRAM those zero weights into real tiles, and
+    `cim.mvm` would spend real cycles multiplying by them. For a real
+    depthwise conv (`group == Cin == Cout`, so `Cin/group == 1`) that is
+    `(Cin - 1)/Cin` of the programmed weight and the compute doing
+    NOTHING -- exactly the dishonest efficiency story this project's own
+    cost model exists to make impossible to hide (`docs/abstraction.md`).
+    G independently-sized matmuls, each its own genuine `cim-detect`
+    candidate (its own `memref.get_global` weight, its own staged
+    activation -- the identical shape `emit_module`'s own single matmul
+    already presents to `cim-detect`), is the only version that reports a
+    truthful cost.
+
+    `weight_syms`/`act_syms`, if given, are length-`group` lists of
+    already-sanitized, already-unique symbol names (default `w0`/`a0`,
+    `w1`/`a1`, ...) -- the caller's job, exactly like `emit_module`'s own
+    `weight_sym`/`act_sym`, since only the caller (`onnx_import.py`) knows
+    what else is already `taken` in the surrounding module.
+
+    `bias`, `trailing_requantize`, `per_channel_requantize`,
+    `effective_bits` are exactly `emit_module`'s own same-named parameters,
+    applied to the CONCATENATED `[M, Cout]` accumulator -- a grouped
+    conv's own quantization is per-output-channel or per-tensor, same as
+    any other conv, with no group-awareness needed once the groups'
+    results sit in one buffer.
+    """
+    weight_groups = [np.asarray(w) for w in weight_groups]
+    activation_groups = [np.asarray(a) for a in activation_groups]
+    group = len(weight_groups)
+    if group < 1:
+        raise ValueError("weight_groups must have at least one group")
+    if len(activation_groups) != group:
+        raise ValueError(
+            f"weight_groups has {group} entries but activation_groups has "
+            f"{len(activation_groups)}; exactly one activation array per "
+            f"group is required")
+
+    norm_acts = []
+    for i, a in enumerate(activation_groups):
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        elif a.ndim != 2:
+            raise ValueError(
+                f"group {i}'s activation must be 1-D [K] or 2-D [M, K], "
+                f"got shape {a.shape}")
+        norm_acts.append(a)
+    activation_groups = norm_acts
+
+    m = activation_groups[0].shape[0]
+    for i, a in enumerate(activation_groups):
+        if a.shape[0] != m:
+            raise ValueError(
+                f"group {i}'s activation has M={a.shape[0]}, but group 0's "
+                f"has M={m} -- every group shares the same output spatial "
+                f"positions, since grouping only splits channels")
+    for i, (w, a) in enumerate(zip(weight_groups, activation_groups)):
+        if w.ndim != 2:
+            raise ValueError(
+                f"group {i}'s weight must be 2-D [Cout_g, K_g], got shape "
+                f"{w.shape}")
+        if w.shape[1] != a.shape[1]:
+            raise ValueError(
+                f"group {i}'s weight K ({w.shape[1]}) does not match its "
+                f"activation K ({a.shape[1]})")
+
+    if weight_syms is None:
+        weight_syms = [f"w{i}" for i in range(group)]
+    if act_syms is None:
+        act_syms = [f"a{i}" for i in range(group)]
+    if len(weight_syms) != group or len(act_syms) != group:
+        raise ValueError(
+            "weight_syms and act_syms must each have one entry per group")
+
+    cout_per_group = [w.shape[0] for w in weight_groups]
+    cout = sum(cout_per_group)
+
+    globals_text = ""
+    lines = []
+    allocs = []
+    for i, (w, a, wsym, asym) in enumerate(
+            zip(weight_groups, activation_groups, weight_syms, act_syms)):
+        n_g, k_g = w.shape
+        wty = f"memref<{n_g}x{k_g}xi8>"
+        aty = f"memref<{m}x{k_g}xi8>"
+        outty = f"memref<{m}x{n_g}xi32>"
+        globals_text += (
+            f'memref.global "private" constant @{wsym} : {wty} = '
+            f"dense<{_dense_2d(w)}>\n"
+            f'memref.global "private" constant @{asym} : {aty} = '
+            f"dense<{_dense_2d(a)}>\n")
+        lines += [
+            f"  %w{i} = memref.get_global @{wsym} : {wty}",
+            f"  %aInit{i} = memref.get_global @{asym} : {aty}",
+            f"  %a{i} = memref.alloc() : {aty}",
+            f"  memref.copy %aInit{i}, %a{i} : {aty} to {aty}",
+            f"  %outg{i} = memref.alloc() : {outty}",
+            f"  linalg.matmul_transpose_b ins(%a{i}, %w{i} : {aty}, {wty})",
+            f"    outs(%outg{i} : {outty})",
+        ]
+        allocs.append((f"%a{i}", aty))
+        allocs.append((f"%outg{i}", outty))
+
+    # Concatenate the group's own per-group accumulators into one
+    # [m, cout] buffer -- the SAME memref.subview-copy pattern
+    # _emit_bias_and_requantize's own per_channel_requantize path already
+    # uses per COLUMN, here used per CONTIGUOUS BLOCK of columns instead
+    # (each group's own Cout_g columns are contiguous, by construction --
+    # ONNX's own group-major weight layout groups output channels the
+    # same way this concatenation does).
+    i32mcout = f"memref<{m}x{cout}xi32>"
+    lines.append(f"  %out = memref.alloc() : {i32mcout}")
+    allocs.append(("%out", i32mcout))
+    offset = 0
+    for i, n_g in enumerate(cout_per_group):
+        src_ty = f"memref<{m}x{n_g}xi32>"
+        dst_ty = f"memref<{m}x{n_g}xi32, strided<[{cout}, 1], offset: {offset}>>"
+        lines += [
+            f"  %outCol{i} = memref.subview %out[0, {offset}] [{m}, {n_g}] "
+            f"[1, 1] : {i32mcout} to {dst_ty}",
+            f"  memref.copy %outg{i}, %outCol{i} : {src_ty} to {dst_ty}",
+        ]
+        offset += n_g
+
+    tail_lines, tail_allocs, bias_global, result_val, result_elem = (
+        _emit_bias_and_requantize(
+            "%out", m, cout, weight_syms[0], bias=bias,
+            per_channel_requantize=per_channel_requantize,
+            trailing_requantize=trailing_requantize,
+            effective_bits=effective_bits))
+    lines += tail_lines
+    allocs += tail_allocs
+
+    quantized = trailing_requantize is not None or per_channel_requantize is not None
+    print_call = "cim_print_i8" if quantized else "cim_print_i32"
+    result_type = f"memref<{m}x{cout}x{result_elem}>"
+    unranked_type = f"memref<*x{result_elem}>"
+    body = "\n".join(lines)
+    dealloc_lines = "\n".join(
+        f"  memref.dealloc {name} : {ty}" for name, ty in allocs)
+    return f"""\
+{header}{globals_text}{bias_global}func.func private @{print_call}({unranked_type})
+func.func @main() {{
+{body}
+  %u = memref.cast {result_val} : {result_type} to {unranked_type}
+  func.call @{print_call}(%u) : ({unranked_type}) -> ()
+{dealloc_lines}
+  return
+}}
+"""
+
+
 def _emit_bias_and_requantize(acc_val, m, n, weight_sym, bias=None,
                               per_channel_requantize=None,
                               trailing_requantize=None, effective_bits=8):

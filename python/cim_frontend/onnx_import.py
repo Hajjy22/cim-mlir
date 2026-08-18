@@ -50,8 +50,8 @@ import hashlib
 
 import numpy as np
 
-from .emit import (emit_chain_module, emit_conv_chain_module, emit_module,
-                   sanitize_symbol)
+from .emit import (emit_chain_module, emit_conv_chain_module,
+                   emit_grouped_conv_module, emit_module, sanitize_symbol)
 from .im2col import im2col_nchw
 from .refusal import Refusal
 
@@ -619,10 +619,16 @@ def load_matmul_chain(model):
 #
 # What is STILL refused, because it is not one of these reshapes:
 #
-#   * group != 1: each group is really an independent matmul over a slice
-#     of channels, not one reshape. Silently computing group=1's answer
-#     for a grouped (e.g. depthwise) conv would be a confident wrong
-#     number, not a shape error.
+#   * group != 1 IS ACCEPTED, but not as a reshape: each group is really
+#     an independent matmul over a slice of channels, so this is decomposed
+#     into `group` separate matmuls (`emit.emit_grouped_conv_module`) with
+#     their results concatenated, rather than treated as one reshape of
+#     the group=1 case. Silently computing group=1's answer for a grouped
+#     (e.g. depthwise) conv would be a confident wrong number, not a shape
+#     error -- and the block-diagonal-matmul alternative (which WOULD
+#     reduce to a reshape) was rejected on efficiency-honesty grounds; see
+#     that function's own docstring. Standalone only (`load_qlinear_conv`)
+#     -- no chain loader accepts it yet.
 #   * a non-zero w_zero_point (asymmetric WEIGHT quantization): the cross
 #     term `w_zp * X` above is per-ROW (activation-dependent), not a fixed
 #     per-channel correction the way a bias is -- genuinely not a reshape
@@ -785,7 +791,7 @@ def _str_attr(node, name, default):
     return attr.s.decode("utf-8")
 
 
-def _conv_geometry(node, weight, where):
+def _conv_geometry(node, weight, where, allow_grouped=False):
     """group/dilations/auto_pad/kernel_shape/pads/strides -- validated the
     same way for every QLinearConv node this front end reads, whether
     standalone (load_qlinear_conv) or the first layer of a chain
@@ -795,18 +801,44 @@ def _conv_geometry(node, weight, where):
     docs/roadmap.md's Phase 1 hardening entry) -- one copy, called from
     both places, cannot go stale relative to itself.
 
+    `allow_grouped`, default False, preserves every existing caller's
+    behavior byte-for-byte: `group != 1` is refused exactly as before.
+    Only `load_qlinear_conv` (a standalone conv, group's own least risky
+    scope) passes True -- every chain loader still refuses grouping, since
+    a grouped conv's own im2col/matmul shape (this function's own return
+    below is unaffected by it) has not been threaded through any chain's
+    channel-count bookkeeping. `group` itself is deliberately NOT added to
+    this function's return tuple even when allowed: every caller of this
+    function unpacks a fixed 8-tuple, and adding a 9th element would force
+    every one of them to change whether or not they care about groups --
+    `load_qlinear_conv` reads `group` itself, via the identical
+    `_int_attr` this function already calls internally, rather than this
+    shared function's own signature growing for one caller's benefit.
+
     Returns (dilation_h, dilation_w, pad_top, pad_bottom, pad_left,
     pad_right, stride_h, stride_w).
     """
     cout, cin, kh, kw = weight.shape
 
     group = _int_attr(node, "group", 1)
-    if group != 1:
+    if not allow_grouped and group != 1:
         raise Refusal(
             f"group={group}; only group=1 (a plain, non-grouped "
-            f"convolution) is imported. Each group is really an "
+            f"convolution) is imported here. Each group is really an "
             f"independent matmul over a slice of channels, not one "
-            f"reshape. Nothing emitted.", where=where)
+            f"reshape -- see load_qlinear_conv for the one place a "
+            f"grouped convolution IS accepted, standalone only. Nothing "
+            f"emitted.", where=where)
+    if allow_grouped:
+        if group < 1:
+            raise Refusal(
+                f"group={group}; must be a positive integer. Nothing "
+                f"emitted.", where=where)
+        if cout % group != 0:
+            raise Refusal(
+                f"group={group} does not evenly divide Cout={cout} -- "
+                f"each group must produce the same number of output "
+                f"channels. Nothing emitted.", where=where)
 
     dilations = _int_list_attr(node, "dilations", [1, 1])
     if len(dilations) != 2:
@@ -864,7 +896,24 @@ def load_qlinear_conv(model):
 
     Returns (node, weight2d[Cout, Cin*Kh*Kw], x_name, x_shape[N,Cin,H,W],
     conv_params, x_zero_point, trailing_requantize, per_channel_requantize,
-    bias, uint8_output_shifted) where:
+    bias, uint8_output_shifted, group, weight_groups) where:
+
+    - `group` is the node's own `group` attribute (default 1). `group > 1`
+      (a grouped, or -- when `group == Cin == Cout` -- depthwise
+      convolution) is accepted HERE ONLY, not by any chain loader: see
+      `_conv_geometry`'s own `allow_grouped` note for why. When
+      `group == 1`, `weight2d` is exactly as documented below and
+      `weight_groups` is `None`. When `group > 1`, `weight2d` is `None`
+      and `weight_groups` is a length-`group` list of that group's own
+      `[Cout/group, (Cin/group)*Kh*Kw]` weight slice instead -- ONNX's own
+      layout already stores each group's kernel with only its own
+      `Cin/group` input channels (`weight.shape[1]`), so no cin-axis slice
+      is needed, only a cout-axis one (each group's own contiguous
+      `Cout/group`-wide block). The caller must im2col each group's own
+      `Cin/group` ACTIVATION channel slice separately (a grouped conv's
+      groups genuinely see disjoint channels) and pass both lists straight
+      through to `emit.emit_grouped_conv_module` -- see its own docstring
+      for why G separate matmuls, not one block-diagonal one.
 
     - `conv_params` is (kh, kw, stride_h, stride_w, pad_top, pad_bottom,
       pad_left, pad_right, dilation_h, dilation_w) -- exactly
@@ -898,8 +947,9 @@ def load_qlinear_conv(model):
       int8-output case, where the emitted result needs no adjustment.
 
     Raises Refusal for anything outside the scope this module's own
-    header comment names (grouped/dilated convolution, a non-zero
-    w_zero_point, a per-channel x/y zero point, non-explicit padding).
+    header comment names (a non-zero w_zero_point, a per-channel x/y zero
+    point, non-explicit padding) -- grouped/depthwise convolution
+    (`group != 1`) and dilation are both accepted here.
     """
     from onnx import numpy_helper
 
@@ -1008,7 +1058,9 @@ def load_qlinear_conv(model):
         bias = bias.astype(np.int32)
 
     (dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right,
-     stride_h, stride_w) = _conv_geometry(node, weight, where)
+     stride_h, stride_w) = _conv_geometry(node, weight, where,
+                                          allow_grouped=True)
+    group = _int_attr(node, "group", 1)
 
     x_info = next((v for v in graph.input if v.name == x_name), None)
     if x_info is None:
@@ -1029,22 +1081,48 @@ def load_qlinear_conv(model):
             f"the activation operand '{x_name}' has rank {len(x_shape)}; a "
             f"2-D convolution's input is rank 4 [N, Cin, H, W]. Nothing "
             f"emitted.", where=where)
-    if x_shape[1] != cin:
+    # ONNX's own grouped-conv layout: the weight's own Cin (`cin` above)
+    # is already Cin/group, so the activation's REAL Cin is cin * group --
+    # exactly cin itself when group == 1, so this check is unchanged for
+    # every non-grouped caller.
+    if x_shape[1] != cin * group:
         raise Refusal(
             f"activation has Cin={x_shape[1]} but the weight is "
-            f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+            f"{list(weight.shape)} (Cin/group={cin}, group={group}, so "
+            f"the expected total Cin is {cin * group}). Nothing emitted.",
             where=where)
 
-    # Cout-major already -- see im2col.py's own note on why, unlike
-    # MatMulInteger's B, this weight needs no transpose.
-    weight2d = np.ascontiguousarray(weight.reshape(cout, cin * kh * kw))
+    if group == 1:
+        # Cout-major already -- see im2col.py's own note on why, unlike
+        # MatMulInteger's B, this weight needs no transpose.
+        weight2d = np.ascontiguousarray(weight.reshape(cout, cin * kh * kw))
+        weight_groups = None
+    else:
+        # Each group's own Cout/group-wide, contiguous slice of `weight`'s
+        # own leading (Cout) axis already carries only that group's own
+        # Cin/group input channels (ONNX's own grouped-conv weight
+        # layout) -- no cin-axis slicing needed, only cout-axis. See
+        # emit.emit_grouped_conv_module's own docstring for why this
+        # becomes `group` separate matmuls rather than one padded dense
+        # one.
+        weight2d = None
+        cout_per_group = cout // group
+        weight_groups = [
+            np.ascontiguousarray(
+                weight[g * cout_per_group:(g + 1) * cout_per_group]
+                .reshape(cout_per_group, cin * kh * kw))
+            for g in range(group)
+        ]
 
     # round(res / derived_scale) == round(res * (x_scale * w_scale /
     # y_scale)), QLinearConv's own reference formula for `res` an integer
     # (raw, pre-scale) accumulator -- see this function's own docstring.
     # w_scale is either a single float (uniform) or a length-Cout array
     # (per-channel); the two cases produce trailing_requantize XOR
-    # per_channel_requantize, matching emit.emit_module's own split.
+    # per_channel_requantize, matching emit.emit_module's own split. This
+    # is unaffected by grouping: w_scale is indexed by output channel
+    # (0..Cout), the same total range regardless of how groups partition
+    # it.
     if isinstance(w_scale, np.ndarray):
         derived_scales = y_scale / (x_scale * w_scale)
         trailing_requantize = None
@@ -1060,7 +1138,7 @@ def load_qlinear_conv(model):
                   dilation_h, dilation_w)
     return (node, weight2d, x_name, tuple(x_shape), conv_params,
            x_zero_point, trailing_requantize, per_channel_requantize, bias,
-           uint8_output_shifted)
+           uint8_output_shifted, group, weight_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -3570,23 +3648,11 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     if matmul_count == 0 and conv_count >= 1:
         (node, weight2d, x_name, x_shape, conv_params, x_zero_point,
          trailing_requantize, per_channel_requantize, bias,
-         uint8_output_shifted) = load_qlinear_conv(model)
+         uint8_output_shifted, group, weight_groups) = load_qlinear_conv(model)
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
 
-        patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
-                                                        *conv_params)
-
-        taken = set()
-        weight_sym = sanitize_symbol(node.input[3], taken)  # w
-        act_sym = sanitize_symbol(x_name, taken)
-
         header = provenance(model_path, model_bytes, activation_source)
-        header += (
-            f"//   conv im2col: N={n_batch} OutH={out_h} OutW={out_w} -- "
-            f"raw matmul output rows are in (n, oh, ow) row-major order, "
-            f"reshape to [N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) "
-            f"for ONNX's own [N, Cout, OutH, OutW] layout.\n")
         if uint8_output_shifted:
             header += (
                 f"//   NOTE: this node's y_zero_point is uint8, so its true "
@@ -3595,9 +3661,58 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
                 f"128), EXACTLY (see load_qlinear_conv's own "
                 f"uint8_output_shifted note): add 128 back to recover the "
                 f"real QLinearConv output.\n")
-        return emit_module(
-            weight2d, patches, weight_sym=weight_sym, act_sym=act_sym,
-            header=header, trailing_requantize=trailing_requantize,
+
+        if group == 1:
+            patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
+                                                            *conv_params)
+
+            taken = set()
+            weight_sym = sanitize_symbol(node.input[3], taken)  # w
+            act_sym = sanitize_symbol(x_name, taken)
+
+            header += (
+                f"//   conv im2col: N={n_batch} OutH={out_h} OutW={out_w} -- "
+                f"raw matmul output rows are in (n, oh, ow) row-major order, "
+                f"reshape to [N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) "
+                f"for ONNX's own [N, Cout, OutH, OutW] layout.\n")
+            return emit_module(
+                weight2d, patches, weight_sym=weight_sym, act_sym=act_sym,
+                header=header, trailing_requantize=trailing_requantize,
+                per_channel_requantize=per_channel_requantize, bias=bias)
+
+        # group > 1: a real, separate im2col per group, over that group's
+        # own Cin/group channel slice of the activation -- see
+        # load_qlinear_conv's own docstring for why groups genuinely see
+        # disjoint channels, and emit.emit_grouped_conv_module's own for
+        # why this becomes `group` independent matmuls, not one padded
+        # dense one.
+        cin_per_group = x_shape[1] // group
+        patches_groups = []
+        out_shape = None
+        for g in range(group):
+            xg = activation[:, g * cin_per_group:(g + 1) * cin_per_group, :, :]
+            pg, out_shape = im2col_nchw(xg, *conv_params)
+            patches_groups.append(pg)
+        n_batch, out_h, out_w = out_shape
+
+        taken = set()
+        weight_syms = [sanitize_symbol(f"{node.input[3]}_g{g}", taken)
+                       for g in range(group)]
+        act_syms = [sanitize_symbol(f"{x_name}_g{g}", taken)
+                   for g in range(group)]
+
+        header += (
+            f"//   grouped conv im2col: group={group}, N={n_batch} "
+            f"OutH={out_h} OutW={out_w} -- one real im2col per group, over "
+            f"that group's own Cin/group channel slice; raw matmul output "
+            f"rows are in (n, oh, ow) row-major order, reshape to "
+            f"[N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) for ONNX's "
+            f"own [N, Cout, OutH, OutW] layout, exactly as the ungrouped "
+            f"case above.\n")
+        return emit_grouped_conv_module(
+            weight_groups, patches_groups, weight_syms=weight_syms,
+            act_syms=act_syms, header=header,
+            trailing_requantize=trailing_requantize,
             per_channel_requantize=per_channel_requantize, bias=bias)
 
     if matmul_count >= 2:
