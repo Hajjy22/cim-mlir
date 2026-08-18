@@ -43,6 +43,7 @@ reasons.
 | A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]` |
 | A conv chain -> matmul chain | The realistic full-CNN shape |
 | `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
+| `MaxPool` composed with the conv->matmul bridge | A pool between the chain's own last conv and its first matmul layer — max is scale-invariant, so this needs no bridge of its own beyond moving the Transpose/Reshape's own source |
 
 Per layer, operands must be: constant int8 weights, rank 2 (or 4 for conv), all dimensions
 statically known, opset 10 or later.
@@ -123,7 +124,7 @@ confident wrong number is worse than a refusal.
 | a chain of convs that is not strictly linear | branching, disconnected, or cyclic |
 | a `MaxPool` with `strides == 1` | `onnx.reference` cannot evaluate an integer `MaxPool` at stride 1 at all — a gap in what can be *verified*, not what can be compiled |
 | a `MaxPool` with `ceil_mode == 1` | this front end's output-size formula is floor-based |
-| a `MaxPool` outside a conv chain, or at its edges | pooling needs a real conv on both sides, to gather from and be gathered into |
+| a `MaxPool` fed by a matmul layer, or before the chain's own first conv | pooling needs a real gather source on both sides — feeding a matmul is fine (max is scale-invariant), being fed by one is not |
 
 ## Two things worth knowing
 
@@ -198,6 +199,7 @@ Without the optional dependencies these skip; they never fail.
 | `test_onnx_frontend_conv_chain.py` | Conv-to-conv chains, including the channel-last weight flatten |
 | `test_onnx_frontend_conv_chain_matmul_chain.py` | A conv stem feeding a fully-connected head |
 | `test_onnx_frontend_conv_pool_chain.py` | `MaxPool`, against an independent hand-written NumPy oracle |
+| `test_onnx_frontend_conv_pool_chain_matmul_chain.py` | Pooling composed with the conv->matmul bridge: a trailing pool alone, interior and trailing together, padded, batched, anti-vacuity, and the dispatch regression guard for the unpooled case |
 | `test_analyze.py`, `test_workload_json_differential.py`, `test_cim_bench_analyze.py` | `--emit-workload` and the C++ JSON reader that consumes it |
 
 Each differential also carries an **anti-vacuity check**: a deliberate perturbation in an

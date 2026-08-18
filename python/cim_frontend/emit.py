@@ -603,15 +603,21 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     entry, reusing it rather than inventing a second shape, since a
     MaxPool window's own geometry is validated the same way a
     convolution's is (see im2col.py's shared `output_size`). `bridge_index`
-    i (0 <= i < n_conv_layers - 1, i.e. strictly inside the convolutional
-    portion of the chain -- pooling into or out of a plain matmul layer is
-    not supported here) means "insert a MaxPool between layer i's own
-    bridge and layer i+1's own gather". A pool at bridge i is emitted
-    right after that bridge's `cim.requantize` (which still runs
-    unconditionally -- MaxPool carries no quantization of its own, so it
-    consumes that requantize's own int8 output directly and needs no
-    `scales[i]` entry of its own beyond it) and BEFORE layer i+1 does its
-    own gather, as:
+    i means "insert a MaxPool between layer i's own bridge and layer i+1's
+    own consumer" -- which may be another conv layer's gather (0 <= i <
+    n_conv_layers - 1, strictly inside the convolutional portion) OR, when
+    the chain has a matmul tail, the FIRST matmul layer's own flat
+    activation (i == n_conv_layers - 1 exactly, i.e. the chain's own last
+    conv): a MaxPool's output is scale-invariant and needs no gather of
+    its own to feed a matmul, so `bridged`/`cur_m` thread through it
+    identically either way -- only the range check below distinguishes
+    the two, not separate emission code. Pooling OUT of a plain matmul
+    layer (a pool reading a matmul's own output) is still not supported.
+    A pool at bridge i is emitted right after that bridge's
+    `cim.requantize` (which still runs unconditionally -- MaxPool carries
+    no quantization of its own, so it consumes that requantize's own int8
+    output directly and needs no `scales[i]` entry of its own beyond it)
+    and BEFORE layer i+1's own consumer runs, as:
       1. `memref.expand_shape` the bridged `[M_i, Cout_i]` activation into
          4-D `[N, H_i, W_i, Cout_i]` -- identical to a conv layer's own
          first gather step.
@@ -681,15 +687,24 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             "own definition, needing no further tail.")
     if pool_params is None:
         pool_params = {}
+    # The chain's own last conv layer (index n_conv_layers - 1) may be
+    # pooled before a matmul tail consumes it (bridged/cur_m thread
+    # through a pool identically to a plain requantize bridge -- see this
+    # function's own pool_params docstring) -- but NOT when the chain ends
+    # in that same conv layer (ends_in_conv): the `i == n_layers - 1`
+    # branch above breaks out of the loop before ever consulting
+    # pool_params, so a pool_params entry there would silently never be
+    # emitted rather than raise -- validated here as a range check
+    # instead, so that silent-drop can never happen.
+    max_pool_bridge = n_conv_layers - 1 if ends_in_conv else n_conv_layers
     for i in pool_params:
-        if not (0 <= i < n_conv_layers - 1):
+        if not (0 <= i < max_pool_bridge):
             raise ValueError(
                 f"pool_params has an entry for bridge {i}, but a pool is "
                 f"only supported strictly inside the convolutional portion "
-                f"of the chain (0 <= bridge < n_conv_layers - 1 = "
-                f"{n_conv_layers - 1}) -- layer {i + 1} must itself be a "
-                f"convolution for its own gather to consume the pooled "
-                f"activation. Nothing emitted.")
+                f"of the chain, optionally right after its own last conv "
+                f"layer when a matmul tail follows (0 <= bridge < "
+                f"{max_pool_bridge}). Nothing emitted.")
     if weight_syms is None:
         weight_syms = [f"w{i}" for i in range(n_layers)]
     if len(weight_syms) != n_layers:
