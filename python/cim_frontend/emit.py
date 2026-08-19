@@ -502,7 +502,7 @@ func.func @main() {{
 
 
 def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
-                      header="", scales=None):
+                      header="", scales=None, relu_flags=None):
     """A chain of matmuls, each layer's accumulator bridged into the next
     via a real `cim.requantize` -- int8 in, int32 accumulator out, narrowed
     back to int8 before it becomes the next layer's activation.
@@ -513,6 +513,27 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     quantized multi-layer INT8 model uses. Defaults to 1.0 for every
     bridge, which is why passing nothing is safe and unchanged from
     before this parameter existed.
+
+    `relu_flags`, if given, is a list of `len(weights) - 1` booleans, one
+    per bridge -- True means an ONNX `Relu` node sits between that
+    bridge's QuantizeLinear and the next layer, and the bridged
+    activation is signed-max'd against zero before continuing. This is
+    exactly right and not an approximation: the bridge's own
+    `zero_point == 0` (enforced by onnx_import.py's `_validate_bridge`
+    for every interior layer already) means the dequantized value is
+    `scale * q`, whose sign matches `q`'s -- so `Relu(dequant(q)) >= 0`
+    iff `q >= 0`, and Relu in the quantized domain is exactly
+    `max(q, 0)`, with no new arithmetic and no new dialect op:
+    `cim.reduce_max` already computes a signed elementwise max of N
+    same-shaped buffers (it was built for MaxPool), and one of its
+    "taps" here is simply a fresh zero-filled buffer instead of a second
+    strided view of an activation. Confirmed against onnx.reference
+    directly (Relu on a signed int8 tensor computes max(x, 0) byte for
+    byte) and against a real cim-opt/cim-run round trip of this exact
+    matmul -> requantize -> reduce_max(x, 0) -> matmul shape before this
+    parameter was written. Defaults to no bridge having a Relu, which is
+    why passing nothing is safe and unchanged from before this parameter
+    existed.
 
     Why `scale=1.0` (the default) is safe to compare against an
     UNQUANTIZED ONNX oracle, despite requantize normally being the thing
@@ -580,6 +601,12 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     for i, s in enumerate(scales):
         if not (s > 0.0):
             raise ValueError(f"bridge {i}'s scale must be positive, got {s}")
+    if relu_flags is None:
+        relu_flags = [False] * (len(weights) - 1)
+    if len(relu_flags) != len(weights) - 1:
+        raise ValueError(
+            f"relu_flags must have one entry per bridge (len(weights) - 1 = "
+            f"{len(weights) - 1}), got {len(relu_flags)}")
 
     for i, w in enumerate(weights):
         if w.ndim != 2:
@@ -622,6 +649,12 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     lines.append(f"  %a0 = memref.alloc() : memref<{m}x{k0}xi8>")
     lines.append(
         f"  memref.copy %aInit, %a0 : memref<{m}x{k0}xi8> to memref<{m}x{k0}xi8>")
+    # Hoisted once, same idea as emit_conv_chain_module's own %zeroI8 for
+    # pooling: only declared when at least one bridge actually has a
+    # Relu, so a chain with no Relu emits byte-identical text to before
+    # this parameter existed.
+    if any(relu_flags):
+        lines.append("  %zeroI8 = arith.constant 0 : i8")
 
     act_val = "%a0"
     for i, (sym, w) in enumerate(zip(weight_syms, weights)):
@@ -639,6 +672,22 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
                 f"{float(scales[i])!r} : f32, "
                 f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
             lines.append(f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}xi8>")
+            if relu_flags[i]:
+                # ONNX Relu on this bridge, expressed as this bridge's
+                # own docstring explains: signed max against a fresh
+                # zero-filled buffer, via the SAME cim.reduce_max
+                # MaxPool already uses -- no new op.
+                zero_val = f"%reluZero{i + 1}"
+                lines.append(f"  {zero_val} = memref.alloc() : memref<{m}x{n}xi8>")
+                lines.append(
+                    f"  linalg.fill ins(%zeroI8 : i8) outs({zero_val} : "
+                    f"memref<{m}x{n}xi8>)")
+                relu_val = f"%relu{i + 1}"
+                lines.append(
+                    f"  {relu_val} = cim.reduce_max {act_val}, {zero_val} : "
+                    f"(memref<{m}x{n}xi8>, memref<{m}x{n}xi8>) -> "
+                    f"memref<{m}x{n}xi8>")
+                act_val = relu_val
 
     last_n = weights[-1].shape[0]
     lines.append(

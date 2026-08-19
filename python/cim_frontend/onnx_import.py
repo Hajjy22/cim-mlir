@@ -408,13 +408,63 @@ def _validate_bridge(graph, producer, consumers, expected_source, act_name,
     return scale
 
 
+def _strip_optional_relu(producer, consumers, act_name, where):
+    """If `act_name` is produced by an ONNX `Relu` node, validates it is
+    genuinely interposed (its own output read by nothing but the caller,
+    which is implicit -- the caller only reaches here because `act_name`
+    IS what it is about to consume) and returns `(relu_node.input[0],
+    True)`: the tensor Relu itself reads, so the caller can carry on
+    validating the bridge underneath as if Relu were not there at all.
+    Otherwise returns `(act_name, False)` unchanged.
+
+    ONLY the immediate-producer position is recognized -- a `Relu`
+    anywhere else in the graph is not silently accepted; it falls through
+    to whatever "any other op" refusal the caller's own allowed-op-type
+    check already raises. This function does not decide what is allowed
+    in the graph as a whole, only whether THIS ONE edge has a Relu on it.
+
+    THE SEMANTICS ARE EXACT, NOT AN APPROXIMATION: every interior bridge
+    already requires `zero_point == 0` (`_validate_bridge`'s own check,
+    unconditionally, whether or not a Relu sits on it) -- so the
+    dequantized value is `scale * q` with `scale > 0`, which has the same
+    sign as `q` itself. `Relu(scale * q) >= 0` iff `q >= 0`, so Relu on
+    the quantized int8 value is exactly `max(q, 0)`, checked directly
+    against onnx.reference before this function was written (Relu on a
+    signed int8 tensor computes max(x, 0) byte for byte -- no oracle
+    gap). See emit.emit_chain_module's own `relu_flags` docstring for how
+    that translates into MLIR: `cim.reduce_max` against a fresh
+    zero-filled buffer, the same op MaxPool already uses, so this needs
+    no new dialect capability.
+    """
+    relu_node = producer.get(act_name)
+    if relu_node is None or relu_node.op_type != "Relu":
+        return act_name, False
+    if len(relu_node.input) != 1:
+        raise Refusal(
+            f"Relu '{relu_node.name or 'Relu'}' has "
+            f"{len(relu_node.input)} inputs; ONNX Relu is unary. Nothing "
+            f"emitted.", where=where)
+    readers = consumers.get(act_name, [])
+    if len(readers) != 1:
+        raise Refusal(
+            f"Relu '{relu_node.name or 'Relu'}''s own output is read by "
+            f"{len(readers)} node(s); this front end imports a strictly "
+            f"linear chain, and a value read more than once needs "
+            f"buffer-liveness reasoning it does not do. Nothing "
+            f"emitted.", where=where)
+    return relu_node.input[0], True
+
+
 def load_matmul_chain(model):
     """Two or more MatMulInteger nodes bridged as described above.
 
-    Returns (nodes, weights, first_activation_name, scales), where
-    `weights[i]` is layer i's weight ALREADY transposed to cim.mvm's
-    [N, K] convention, and `scales[i]` is bridge i's real, positive
-    QuantizeLinear scale (see _validate_bridge's own docstring).
+    Returns (nodes, weights, first_activation_name, scales, relu_flags),
+    where `weights[i]` is layer i's weight ALREADY transposed to
+    cim.mvm's [N, K] convention, `scales[i]` is bridge i's real, positive
+    QuantizeLinear scale (see _validate_bridge's own docstring), and
+    `relu_flags[i]` is True iff an ONNX `Relu` node sits directly between
+    bridge i's QuantizeLinear and layer i+1 -- see _strip_optional_relu's
+    own docstring for why that is accepted and exact.
     """
     from onnx import numpy_helper
 
@@ -428,16 +478,37 @@ def load_matmul_chain(model):
             "load_matmul_chain requires at least two MatMulInteger nodes; "
             "use load_matmul_integer for a single layer.")
 
+    producer = {out: n for n in graph.node for out in n.output}
+    consumers = {}
+    for n in graph.node:
+        for inp in n.input:
+            if inp:
+                consumers.setdefault(inp, []).append(n)
+
+    # A Relu is allowed ONLY at the one position that matters: directly
+    # producing a later layer's own input. Anything else typed Relu --
+    # off on some unrelated branch, sitting between Cast and
+    # QuantizeLinear, duplicated -- is NOT in this set, and so still
+    # falls into the "others" refusal below exactly like any other
+    # unrecognized op. This is a position check, not a type allow-list.
+    relu_bridge_ids = set()
+    for i in range(1, len(matmul_nodes)):
+        candidate = producer.get(matmul_nodes[i].input[0])
+        if candidate is not None and candidate.op_type == "Relu":
+            relu_bridge_ids.add(id(candidate))
+
     allowed = {ACCEPTED_OP, "Cast", "QuantizeLinear"}
-    others = [n for n in graph.node if n.op_type not in allowed]
+    others = [n for n in graph.node
+             if n.op_type not in allowed and id(n) not in relu_bridge_ids]
     if others:
         kinds = sorted({n.op_type for n in others})
         raise Refusal(
             f"graph also contains {', '.join(kinds)}. A chain of "
             f"{ACCEPTED_OP} nodes may only be bridged by Cast(to=float32) -> "
-            f"QuantizeLinear(scale=1.0, zero_point=0) -- ignoring any other "
-            f"op would emit a module that computes something other than the "
-            f"model. Nothing emitted.")
+            f"QuantizeLinear(scale=1.0, zero_point=0), optionally followed "
+            f"by Relu directly on that bridge's own output -- ignoring any "
+            f"other op would emit a module that computes something other "
+            f"than the model. Nothing emitted.")
 
     if len(graph.output) != 1:
         raise Refusal(
@@ -450,15 +521,9 @@ def load_matmul_chain(model):
             f"accumulator, with no trailing op, is supported. Nothing "
             f"emitted.")
 
-    producer = {out: n for n in graph.node for out in n.output}
-    consumers = {}
-    for n in graph.node:
-        for inp in n.input:
-            if inp:
-                consumers.setdefault(inp, []).append(n)
-
     weights = []
     scales = []
+    relu_flags = []
     first_act_name = None
     for i, node in enumerate(matmul_nodes):
         where = f"node '{node.name or ACCEPTED_OP}' (layer {i})"
@@ -519,9 +584,12 @@ def load_matmul_chain(model):
                     f"is {list(weight.shape)}. Nothing emitted.", where=where)
             first_act_name = a_name
         else:
+            bridge_source, has_relu = _strip_optional_relu(
+                producer, consumers, a_name, where)
             scales.append(_validate_bridge(
                 graph, producer, consumers, matmul_nodes[i - 1].output[0],
-                a_name, where))
+                bridge_source, where))
+            relu_flags.append(has_relu)
             if weight.shape[0] != weights[-1].shape[0]:
                 raise Refusal(
                     f"layer {i}'s K ({weight.shape[0]}) does not match layer "
@@ -531,7 +599,7 @@ def load_matmul_chain(model):
         # THE transpose, same as the single-layer path.
         weights.append(np.ascontiguousarray(weight.T))
 
-    return matmul_nodes, weights, first_act_name, scales
+    return matmul_nodes, weights, first_act_name, scales, relu_flags
 
 
 # ---------------------------------------------------------------------------
@@ -3716,7 +3784,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             per_channel_requantize=per_channel_requantize, bias=bias)
 
     if matmul_count >= 2:
-        nodes, weights, first_act_name, scales = load_matmul_chain(model)
+        nodes, weights, first_act_name, scales, relu_flags = load_matmul_chain(model)
         activation = _validate_activation(activation, weights[0].shape[1])
 
         taken = set()
@@ -3726,7 +3794,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
         header = provenance(model_path, model_bytes, activation_source)
         return emit_chain_module(weights, activation, weight_syms=weight_syms,
                                  act_sym=act_sym, header=header,
-                                 scales=scales)
+                                 scales=scales, relu_flags=relu_flags)
 
     node, weight, act_name = load_matmul_integer(model)
     activation = _validate_activation(activation, weight.shape[1])

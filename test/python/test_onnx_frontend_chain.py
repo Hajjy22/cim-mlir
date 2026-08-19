@@ -199,6 +199,74 @@ def test_a_wrong_weight_in_a_later_layer_would_actually_be_caught(cim_opt,
     assert np.array_equal(np.asarray(outputs), want)
 
 
+# --- Relu directly on a bridge -----------------------------------------------
+
+def test_a_relu_in_a_chain_matches_the_quantized_reference(cim_opt, cim_run):
+    # w0 is signed and large enough that layer 0's raw accumulator has
+    # both positive and negative entries for this activation, so Relu
+    # actually clips something rather than passing everything through
+    # unchanged -- see the fixture-assumption assertion below.
+    k0, n0, n1 = 4, 6, 5
+    rng = np.random.default_rng(SEED + 20)
+    w0 = rng.integers(-10, 11, size=(k0, n0), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-10, 11, size=(n0, n1), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-10, 11, size=k0, dtype=np.int64).astype(np.int8)
+
+    model = matmul_chain_model([w0, w1], relu_flags=[True])
+    bridge_acc = act.astype(np.int64) @ w0.astype(np.int64)
+    assert (bridge_acc < 0).any() and (bridge_acc > 0).any(), (
+        "fixture assumption broken: layer 0's accumulator must have both "
+        "a negative and a positive entry for this test to actually "
+        "exercise Relu's clip, not just pass values through")
+
+    want = onnx_reference_eval(model, act)
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(model, act))
+    assert np.array_equal(np.asarray(outputs), want), (
+        f"compiled Relu chain output {list(outputs)} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_a_relu_on_every_bridge_of_a_three_layer_chain(cim_opt, cim_run):
+    # Both bridges flagged, on the same three-layer shape the rest of
+    # this file already exercises without Relu -- proves relu_flags
+    # threads through more than one bridge, not just bridge 0.
+    weights = _chain_weights(THREE_LAYER_SHAPES, SEED + 21)
+    model = matmul_chain_model(weights, relu_flags=[True, True])
+    act = np.random.default_rng(SEED + 22).integers(
+        -127, 128, size=THREE_LAYER_SHAPES[0][0], dtype=np.int64).astype(np.int8)
+
+    want = onnx_reference_eval(model, act)
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(model, act))
+    assert np.array_equal(np.asarray(outputs), want)
+
+
+def test_a_missing_relu_would_actually_be_caught(cim_opt, cim_run):
+    # Anti-vacuity: compiling the SAME weights/activation with and
+    # without the Relu flag must produce different output whenever the
+    # bridge accumulator actually goes negative -- proving the compiled
+    # module really branches on relu_flags rather than the reduce_max
+    # step being emitted-but-inert (e.g. a self-max that never clips).
+    k0, n0, n1 = 4, 6, 5
+    rng = np.random.default_rng(SEED + 23)
+    w0 = rng.integers(-10, 11, size=(k0, n0), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-10, 11, size=(n0, n1), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-10, 11, size=k0, dtype=np.int64).astype(np.int8)
+
+    with_relu = matmul_chain_model([w0, w1], relu_flags=[True])
+    without_relu = matmul_chain_model([w0, w1], relu_flags=[False])
+    want_with = onnx_reference_eval(with_relu, act)
+    want_without = onnx_reference_eval(without_relu, act)
+    assert not np.array_equal(want_with, want_without), (
+        "fixture assumption broken: Relu made no difference for this "
+        "weight/activation pair")
+
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(with_relu, act))
+    assert np.array_equal(np.asarray(outputs), want_with)
+
+
 # --- a real, calibrated (non-1.0) bridge scale ------------------------------
 
 def test_a_real_calibrated_scale_matches_the_quantized_reference(cim_opt,
@@ -345,4 +413,42 @@ def test_refuses_a_fan_out_reading_the_bridged_activation_twice():
     model.graph.node.insert(mm1_index, extra)
     act = np.ones(THREE_LAYER_SHAPES[0][0], dtype=np.int8)
     with pytest.raises(Refusal, match="read by 2 node"):
+        import_model(model, act)
+
+
+def test_refuses_a_relu_that_is_not_directly_on_a_bridge():
+    # A Relu node exists in the graph, but does not directly produce a
+    # LATER layer's own input -- it sits off to the side, reading the
+    # bridge's own output without being read by anything (a stray,
+    # disconnected node). _strip_optional_relu's own position check only
+    # recognizes a Relu at the ONE spot that matters
+    # (matmul_nodes[i].input[0]'s own producer); this one is not in that
+    # position, so it must still fall into the ordinary "graph also
+    # contains ..." refusal, exactly like any other unrecognized op --
+    # proving the allow-list addition is a position check, not a type
+    # check.
+    from onnx import helper as onnx_helper
+
+    weights = _chain_weights(THREE_LAYER_SHAPES[:2], SEED)
+    model = matmul_chain_model(weights, check=False)
+    stray = onnx_helper.make_node("Relu", ["q0"], ["stray_relu"],
+                                  name="stray_relu_node")
+    model.graph.node.append(stray)
+    act = np.ones(THREE_LAYER_SHAPES[0][0], dtype=np.int8)
+    with pytest.raises(Refusal, match="also contains Relu"):
+        import_model(model, act)
+
+
+def test_refuses_a_relu_with_more_than_one_input():
+    # A malformed/adversarial Relu (real ONNX Relu is strictly unary) --
+    # _strip_optional_relu's own input-count check, not something ONNX's
+    # checker would even allow through in practice, but the importer must
+    # not assume well-formedness it has not verified.
+    weights = _chain_weights(THREE_LAYER_SHAPES[:2], SEED)
+    model = matmul_chain_model(weights, relu_flags=[True], check=False)
+    relu_node = next(n for n in model.graph.node if n.op_type == "Relu")
+    del relu_node.input[:]
+    relu_node.input.extend(["q0", "q0"])
+    act = np.ones(THREE_LAYER_SHAPES[0][0], dtype=np.int8)
+    with pytest.raises(Refusal, match="unary"):
         import_model(model, act)

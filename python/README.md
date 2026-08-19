@@ -37,7 +37,7 @@ reasons.
 | Graph shape | Notes |
 |---|---|
 | One `MatMulInteger` | The v0.1 contract in one node: int8 A, int8 B, int32 Y |
-| A chain of `MatMulInteger` | Bridged by `Cast(float32) -> QuantizeLinear(scale, zero_point=0)` |
+| A chain of `MatMulInteger` | Bridged by `Cast(float32) -> QuantizeLinear(scale, zero_point=0)`, optionally followed by `Relu` directly on that bridge's own output |
 | One `QLinearConv` | Via im2col, entirely in Python — no new MLIR op |
 | `QLinearConv` -> `MatMulInteger` chain | Bridged by `Transpose(perm=[0,2,3,1]) -> Reshape([M, Cout])` |
 | A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]` |
@@ -99,6 +99,30 @@ independent implementations.
 Pooling compiles all the way to a real-target binary, not just `cim-run`:
 `cim-lower-to-target` materializes each non-contiguous pooling tap into a fresh contiguous
 buffer before staging it.
+
+### `Relu` details (on a `MatMulInteger` chain)
+
+`Relu` is accepted directly on a bridge's own output — `Cast -> QuantizeLinear -> Relu ->`
+the next layer — needing no new dialect capability. Every interior bridge already requires
+`zero_point == 0`, so the dequantized value `scale * q` (`scale > 0`) has the same sign as
+the quantized value `q` itself: `Relu(scale * q) >= 0` iff `q >= 0`, so Relu on the
+quantized activation is exactly `max(q, 0)`. That is computed by the same `cim.reduce_max`
+`MaxPool` already uses, against a fresh zero-filled buffer instead of a second pooling tap
+— reusing an existing op rather than adding one.
+
+Confirmed against `onnx.reference` directly (Relu on a signed int8 tensor computes
+`max(x, 0)` byte for byte — no oracle gap) and against a real `cim-opt`/`cim-run` round
+trip of the exact `matmul -> requantize -> reduce_max(x, 0) -> matmul` shape before any
+front-end code was written.
+
+Only the exact bridge position is recognized: a `Relu` node must be the immediate producer
+of a later layer's own input. A `Relu` anywhere else in the graph — off on an unrelated
+branch, between `Cast` and `QuantizeLinear`, duplicated — is not silently accepted; it
+falls into the same "graph also contains ..." refusal as any other unrecognized op. This is
+a position check, not a type allow-list.
+
+Matmul-chain only, for now: a `QLinearConv` chain, the conv-to-matmul bridge, and pooling
+do not thread a Relu flag yet.
 
 ### Grouped/depthwise convolution details
 

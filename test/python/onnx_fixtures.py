@@ -60,10 +60,11 @@ def matmul_integer_model(weight, act_name="A", weight_name="W",
 
 
 def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
-                       scales=None):
+                       scales=None, relu_flags=None):
     """A linear chain of MatMulInteger nodes, each bridged into the next by
     the one pattern python/cim_frontend/onnx_import.py accepts:
-    Cast(to=float32) -> QuantizeLinear(scale, zero_point=0, int8 out).
+    Cast(to=float32) -> QuantizeLinear(scale, zero_point=0, int8 out),
+    optionally followed by Relu directly on that bridge's own output.
 
     `weights` is a list of [K_i, N_i] int8 arrays in ONNX's own layout
     (NOT transposed), with K_i == N_(i-1) for i > 0 -- same convention as
@@ -74,6 +75,11 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
     `len(weights) - 1` positive floats, one per bridge -- a real,
     calibrated scale instead of the default 1.0 (see onnx_import.py's own
     "WHY THIS EXACT BRIDGE" note on what a non-1.0 scale changes).
+    `relu_flags`, if given, is a list of `len(weights) - 1` booleans, one
+    per bridge -- True inserts a Relu node directly on that bridge's
+    QuantizeLinear output, before the next MatMulInteger reads it (see
+    onnx_import.py's `_strip_optional_relu` for what the importer accepts
+    here and why it is exact).
     """
     weights = [np.asarray(w) for w in weights]
     if scales is None:
@@ -82,6 +88,12 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
         raise ValueError(
             f"scales must have one entry per bridge (len(weights) - 1 = "
             f"{len(weights) - 1}), got {len(scales)}")
+    if relu_flags is None:
+        relu_flags = [False] * (len(weights) - 1)
+    if len(relu_flags) != len(weights) - 1:
+        raise ValueError(
+            f"relu_flags must have one entry per bridge (len(weights) - 1 "
+            f"= {len(weights) - 1}), got {len(relu_flags)}")
     nodes = []
     initializers = []
     cur = act_name
@@ -109,6 +121,11 @@ def matmul_chain_model(weights, act_name="A", check=True, act_shape=None,
                 "QuantizeLinear", [float_name, scale_name, zp_name],
                 [q_name], name=f"quant{i}"))
             cur = q_name
+            if relu_flags[i]:
+                relu_name = f"relu{i}"
+                nodes.append(helper.make_node(
+                    "Relu", [cur], [relu_name], name=f"relu_node{i}"))
+                cur = relu_name
 
     k0 = weights[0].shape[0]
     n_last = weights[-1].shape[1]
