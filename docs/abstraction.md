@@ -2,6 +2,40 @@
 
 This is the most valuable file in the repository. Everything else follows from it.
 
+## Pipeline at a glance
+
+```mermaid
+flowchart LR
+    onnx["ONNX\n(.onnx file)"] --> fe["Frontend\n(python/cim_frontend)"]
+    fe --> mlir["MLIR\n(linalg / memref / scf)"]
+    mlir --> dialect["CIM Dialect\n(cim-detect)"]
+    dialect --> compiler["Compiler\ncim-partition -> cim-placement\n-> cim-legalize-precision -> cim-insert-transfers\n-> cim-lower-to-target"]
+    compiler --> runtime["Runtime\n(cimrt ABI)"]
+    runtime --> hw{{"CIM Hardware /\nSimulator"}}
+
+    hw --> reram["ReRAM"]
+    hw --> pcm["PCM"]
+    hw --> sram["SRAM"]
+    hw --> other["Other CIM"]
+    hw --> sim["Simulator"]
+
+    sim -.->|"cim-run --profile\n(measured cost feeds cim-bench)"| compiler
+```
+
+The tile abstraction below (`!cim.tile`, one target YAML per chip) is what lets one
+compiler and one dialect target every box in that bottom row without a
+per-backend recompile — see "The unifying abstraction: the tile" below.
+
+**What is actually wired up today**, so this diagram is not read as more finished than
+it is: the **Simulator** backend (`runtime/src/simulator`) is real and is what every test
+and benchmark in this repo runs against. The **Erbium-8T** hardware backend
+(`runtime/src/erbium`) exists as a stub — every entry point currently returns
+`CIMRT_ERR_NO_DEVICE` (see `docs/roadmap.md`'s M5). ReRAM/PCM/SRAM/"Other CIM" are not
+separate backend implementations; they are points on the five axes of variation below,
+each describable by a target YAML today with no dialect or compiler change required, the
+central claim this document exists to make. Real ReRAM/PCM silicon becoming a working
+`cimrt` backend is future work, tracked in `docs/roadmap.md`'s M5.
+
 ## The problem
 
 CIM/PIM hardware exists and some of it ships. What does not exist is a way to run a normal
