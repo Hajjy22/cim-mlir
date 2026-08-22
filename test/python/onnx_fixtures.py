@@ -1021,6 +1021,12 @@ def conv_pool_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
     n_conv - 1` (a pool between the last conv and the conv->matmul
     bridge) is valid here -- the one position `conv_pool_chain_model`
     itself refuses (it has no bridge for such a pool to feed into).
+    `relu_after`, unlike `conv_chain_matmul_chain_model`'s own identical
+    parameter, also accepts bridge index `n_conv - 1` -- a Relu directly
+    before that same trailing pool (or, with no pool there, directly
+    before the conv->matmul bridge itself), ONNX's own
+    `Conv -> Relu -> MaxPool -> Transpose` order (the per-layer loop
+    below already inserts Relu before any pool at the same bridge).
     """
     conv_weights = [np.asarray(w) for w in conv_weights]
     n_conv = len(conv_weights)
@@ -1037,10 +1043,11 @@ def conv_pool_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
     if relu_after is None:
         relu_after = set()
     for i in relu_after:
-        if not (0 <= i < n_conv - 1):
+        if not (0 <= i < n_conv):
             raise ValueError(
                 f"relu_after has bridge {i}, but this chain only has "
-                f"conv-conv bridges 0 <= bridge < {n_conv - 1}")
+                f"conv-conv bridges 0 <= bridge < {n_conv - 1} plus the "
+                f"trailing (pool or matmul) bridge at {n_conv - 1}")
     if conv_w_scales is None:
         conv_w_scales = [1.0] * n_conv
     if conv_y_scales is None:

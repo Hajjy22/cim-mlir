@@ -30,6 +30,8 @@ sys.path.insert(0, os.path.join(
 
 pytest.importorskip("onnx", reason="the ONNX front end's oracle")
 
+from onnx import helper as onnx_helper  # noqa: E402
+
 from cim_frontend.onnx_import import import_model  # noqa: E402
 from cim_frontend.refusal import Refusal  # noqa: E402
 from onnx_fixtures import (conv_pool_chain_matmul_chain_model,  # noqa: E402
@@ -134,6 +136,113 @@ def test_a_relu_composed_with_an_interior_pool_matches_the_reference(
     assert np.array_equal(outputs, want), (
         f"compiled output {outputs.tolist()} != ONNX reference "
         f"{want.tolist()}")
+
+
+def test_a_relu_directly_before_the_trailing_pool_matches_the_reference(
+        cim_opt, cim_run):
+    # Conv -> Relu -> MaxPool -> Transpose: the one bridge position this
+    # loader's own module header used to name as unrecognized. No
+    # emitter change needed -- every bridge emit_conv_chain_module emits
+    # already has zero_point == 0, the only thing Relu's own
+    # reduce_max(x, 0) composition needs -- this is pure discovery-side
+    # wiring, the same "one extra position past what the interior walk
+    # covers" pattern used for the trailing pool itself.
+    rng = np.random.default_rng(SEED + 99)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 9, 9)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w],
+        pools={1: dict(kernel_shape=(2, 2))}, relu_after={1})
+    no_relu_model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], pools={1: dict(kernel_shape=(2, 2))})
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_a_relu_directly_before_the_matmul_bridge_with_no_trailing_pool_matches_the_reference(
+        cim_opt, cim_run):
+    # The same bridge position, but with no pool sitting there (the
+    # interior pool at bridge 0 satisfies this loader's own "at least
+    # one MaxPool in the graph" requirement) -- proves the trailing
+    # Relu-hop works whether or not a pool follows it at the SAME
+    # bridge, exactly load_conv_chain_matmul_chain's own unpooled
+    # acceptance.
+    rng = np.random.default_rng(SEED + 99)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 9, 9)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w],
+        pools={0: dict(kernel_shape=(2, 2))}, relu_after={1})
+    no_relu_model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], pools={0: dict(kernel_shape=(2, 2))})
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_refuses_a_relu_before_the_trailing_pool_with_a_stray_extra_reader():
+    # A second reader of the trailing Relu's own output -- the "must
+    # feed exactly one reader" guard the trailing Relu-hop adds,
+    # mirroring load_conv_chain_matmul_chain's own identical bridge
+    # fan-out check.
+    rng = np.random.default_rng(SEED + 100)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    mm_w = rng.integers(-4, 5, size=(2, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w],
+        pools={1: dict(kernel_shape=(2, 2))}, relu_after={1}, check=False)
+    stray = onnx_helper.make_node(
+        "Relu", ["L1_relu"], ["stray_out"], name="stray_relu_reader")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="must feed exactly one reader"):
+        import_model(model, act)
+
+
+def test_refuses_a_disconnected_relu_elsewhere_when_a_trailing_relu_is_present():
+    # A Relu that is not on any edge this loader (or
+    # _discover_conv_pool_chain, which it calls) ever walks, present
+    # alongside a LEGITIMATE trailing Relu in the same graph.
+    rng = np.random.default_rng(SEED + 101)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    mm_w = rng.integers(-4, 5, size=(2, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w],
+        pools={1: dict(kernel_shape=(2, 2))}, relu_after={1}, check=False)
+    stray = onnx_helper.make_node("Relu", ["X"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly"):
+        import_model(model, act)
 
 
 def test_a_padded_trailing_pool_matches_the_reference(cim_opt, cim_run):

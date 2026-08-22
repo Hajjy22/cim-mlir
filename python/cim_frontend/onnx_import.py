@@ -3338,13 +3338,14 @@ def load_conv_pool_chain_matmul_chain(model):
     load_conv_pool_chain itself never produces, since it has no bridge to
     sit before). `relu_bridges` is a set of bridge indices with a Relu --
     exactly `emit_conv_chain_module`'s own `relu_bridges` parameter --
-    but ONLY for the interior conv-conv positions
-    `_discover_conv_pool_chain` recognizes (the same Relu/MaxPool
-    ordering `load_conv_pool_chain` accepts); a Relu directly before the
-    matmul bridge (the one trailing position this function adds pooling
-    support for, above) is not yet recognized, matching
-    `load_conv_chain_matmul_chain`'s own identical scope note. Pass every
-    return value straight through to emit.emit_conv_chain_module.
+    for the interior conv-conv positions `_discover_conv_pool_chain`
+    recognizes (the same Relu/MaxPool ordering `load_conv_pool_chain`
+    accepts), AND directly before the trailing pool (or, with no pool
+    there, directly before the matmul bridge itself) -- ONNX's own
+    `Conv -> Relu -> MaxPool -> Transpose` order, mirroring
+    `load_conv_chain_matmul_chain`'s own identical bridge-Relu
+    acceptance. Pass every return value straight through to
+    emit.emit_conv_chain_module.
 
     Raises Refusal for anything outside this function's own scope: fewer
     than two QLinearConv nodes, no MatMulInteger node, no MaxPool node (use
@@ -3404,13 +3405,28 @@ def load_conv_pool_chain_matmul_chain(model):
         graph, convs)
     producer = {out: n for n in graph.node for out in n.output}
 
-    # The one position _discover_conv_pool_chain never considers: a pool
-    # directly between the chain's own LAST conv and whatever comes next.
-    # That function stops walking once len(chain) == len(convs), so it
-    # never looks past chain[-1] at all -- deliberately, since interior
-    # pool detection has no idea a matmul bridge exists to look for.
+    # The positions _discover_conv_pool_chain never considers: an
+    # optional Relu, then an optional pool, directly between the
+    # chain's own LAST conv and whatever comes next. That function stops
+    # walking once len(chain) == len(convs), so it never looks past
+    # chain[-1] at all -- deliberately, since interior detection has no
+    # idea a matmul bridge exists to look for.
     bridge_src = chain[-1].output[0]
     bridge_readers = consumers.get(bridge_src, [])
+    if len(bridge_readers) == 1 and bridge_readers[0].op_type == "Relu":
+        bridge_relu = bridge_readers[0]
+        relu_out = bridge_relu.output[0]
+        relu_readers = consumers.get(relu_out, [])
+        if len(relu_readers) != 1:
+            raise Refusal(
+                f"Relu '{bridge_relu.name}''s output is read by "
+                f"{len(relu_readers)} node(s); a Relu directly before "
+                f"the trailing pool (or matmul bridge) must feed "
+                f"exactly one reader. Nothing emitted.")
+        relu_after[len(chain) - 1] = bridge_relu
+        bridge_src = relu_out
+        bridge_readers = relu_readers
+
     if len(bridge_readers) == 1 and bridge_readers[0].op_type == ACCEPTED_POOL_OP:
         trailing_pool = bridge_readers[0]
         trailing_where = (f"node '{trailing_pool.name or ACCEPTED_POOL_OP}' "
@@ -3442,9 +3458,9 @@ def load_conv_pool_chain_matmul_chain(model):
     if unused_relus:
         raise Refusal(
             f"{len(unused_relus)} Relu node(s) are not positioned "
-            f"directly between two consecutive chain layers this loader "
-            f"discovered (a Relu directly before the matmul bridge is "
-            f"not yet recognized). Nothing emitted.")
+            f"directly between two consecutive chain layers, or directly "
+            f"before the trailing pool (or matmul bridge), that this "
+            f"loader discovered. Nothing emitted.")
 
     # pool_params, exactly load_conv_pool_chain's own construction --
     # computed here, before the per-layer loop below, since _pool_geometry
