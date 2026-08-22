@@ -51,6 +51,7 @@ import hashlib
 import numpy as np
 
 from .emit import (emit_chain_module, emit_conv_chain_module,
+                   emit_grouped_conv_matmul_chain_module,
                    emit_grouped_conv_module, emit_module, sanitize_symbol)
 from .im2col import im2col_nchw
 from .refusal import Refusal
@@ -871,17 +872,23 @@ def _conv_geometry(node, weight, where, allow_grouped=False):
 
     `allow_grouped`, default False, preserves every existing caller's
     behavior byte-for-byte: `group != 1` is refused exactly as before.
-    Only `load_qlinear_conv` (a standalone conv, group's own least risky
-    scope) passes True -- every chain loader still refuses grouping, since
-    a grouped conv's own im2col/matmul shape (this function's own return
-    below is unaffected by it) has not been threaded through any chain's
-    channel-count bookkeeping. `group` itself is deliberately NOT added to
-    this function's return tuple even when allowed: every caller of this
-    function unpacks a fixed 8-tuple, and adding a 9th element would force
-    every one of them to change whether or not they care about groups --
-    `load_qlinear_conv` reads `group` itself, via the identical
-    `_int_attr` this function already calls internally, rather than this
-    shared function's own signature growing for one caller's benefit.
+    `load_qlinear_conv` (a standalone conv) and `load_conv_matmul_chain`
+    (a conv feeding a matmul chain, where the conv is ALWAYS the chain's
+    own layer 0 -- its grouped output only has to be a flat `[M, Cout]`
+    buffer to feed emit_chain_module's own bridge unchanged, which
+    `emit.emit_grouped_conv_matmul_chain_module` already produces) both
+    pass True. Every OTHER chain loader -- a conv chained directly into
+    further convs, or composed with a pooling bridge -- still refuses
+    grouping: there, a grouped layer's own per-group Cin/Cout has to
+    thread through gather/reshape machinery built for one dense channel
+    count, which is real, unstarted work, not a flag flip. `group` itself
+    is deliberately NOT added to this function's return tuple even when
+    allowed: every caller of this function unpacks a fixed 8-tuple, and
+    adding a 9th element would force every one of them to change whether
+    or not they care about groups -- each `allow_grouped=True` caller
+    reads `group` itself, via the identical `_int_attr` this function
+    already calls internally, rather than this shared function's own
+    signature growing for their benefit.
 
     Returns (dilation_h, dilation_w, pad_top, pad_bottom, pad_left,
     pad_right, stride_h, stride_w).
@@ -968,8 +975,9 @@ def load_qlinear_conv(model):
 
     - `group` is the node's own `group` attribute (default 1). `group > 1`
       (a grouped, or -- when `group == Cin == Cout` -- depthwise
-      convolution) is accepted HERE ONLY, not by any chain loader: see
-      `_conv_geometry`'s own `allow_grouped` note for why. When
+      convolution) is accepted here and by `load_conv_matmul_chain`, not
+      by any OTHER chain loader: see `_conv_geometry`'s own
+      `allow_grouped` note for why. When
       `group == 1`, `weight2d` is exactly as documented below and
       `weight_groups` is `None`. When `group > 1`, `weight2d` is `None`
       and `weight_groups` is a length-`group` list of that group's own
@@ -1280,7 +1288,8 @@ def load_conv_matmul_chain(model):
     layers, bridged as described above.
 
     Returns (conv_node, matmul_nodes, weight2d, x_name, x_shape,
-    conv_params, x_zero_point, matmul_weights, bridge_scales) where:
+    conv_params, x_zero_point, matmul_weights, bridge_scales, group,
+    weight_groups) where:
 
     - `weight2d`/`x_name`/`x_shape`/`conv_params`/`x_zero_point` are
       exactly load_qlinear_conv's own returns for the conv layer -- the
@@ -1295,14 +1304,29 @@ def load_conv_matmul_chain(model):
       formula, exactly as a standalone conv's `trailing_requantize` scale
       is); `bridge_scales[1:]` are the real QuantizeLinear scales between
       matmul layers, exactly as load_matmul_chain's own `scales` returns.
-      Pass `[weight2d] + matmul_weights`, the im2col'd patches matrix, and
-      `bridge_scales` straight through to emit.emit_chain_module.
+      When `group == 1`, pass `[weight2d] + matmul_weights`, the im2col'd
+      patches matrix, and `bridge_scales` straight through to
+      emit.emit_chain_module.
+    - `group`/`weight_groups` are exactly load_qlinear_conv's own
+      same-named returns -- `group == 1` (the ordinary case) leaves
+      `weight_groups` `None` and `weight2d` as documented above; `group >
+      1` leaves `weight2d` `None` and `weight_groups` a length-`group`
+      list of that group's own `[Cout/group, (Cin/group)*Kh*Kw]` weight
+      slice, exactly load_qlinear_conv's own convention -- the caller
+      im2cols each group's own activation channel slice separately
+      (again exactly load_qlinear_conv's own pattern) and passes both
+      lists to emit.emit_grouped_conv_matmul_chain_module instead, with
+      `bridge_scales[0]` as that function's own `conv_bridge_scale` and
+      `bridge_scales[1:]` as its own `scales`.
 
     Raises Refusal for anything outside this function's own scope (see
     this module's section header above): more than one QLinearConv, a
     non-zero conv y_zero_point, a per-channel conv w_scale, a conv bias,
     or anything load_qlinear_conv/load_matmul_chain would themselves
-    refuse on their own respective layers.
+    refuse on their own respective layers. A grouped/depthwise conv
+    (`group > 1`) is accepted -- see `_conv_geometry`'s own
+    `allow_grouped` docstring for why every OTHER chain loader still
+    refuses it while this one and load_qlinear_conv do not.
     """
     from onnx import numpy_helper
 
@@ -1417,7 +1441,9 @@ def load_conv_matmul_chain(model):
             f"misinterpreted downstream. Nothing emitted.", where=where)
 
     (dilation_h, dilation_w, pad_top, pad_bottom, pad_left, pad_right,
-     stride_h, stride_w) = _conv_geometry(conv_node, weight, where)
+     stride_h, stride_w) = _conv_geometry(conv_node, weight, where,
+                                          allow_grouped=True)
+    group = _int_attr(conv_node, "group", 1)
 
     x_info = next((v for v in graph.input if v.name == x_name), None)
     if x_info is None:
@@ -1438,15 +1464,35 @@ def load_conv_matmul_chain(model):
             f"the activation operand '{x_name}' has rank {len(x_shape)}; a "
             f"2-D convolution's input is rank 4 [N, Cin, H, W]. Nothing "
             f"emitted.", where=where)
-    if x_shape[1] != cin:
+    if x_shape[1] != cin * group:
         raise Refusal(
             f"activation has Cin={x_shape[1]} but the weight is "
-            f"{list(weight.shape)} (Cin={cin}). Nothing emitted.",
+            f"{list(weight.shape)} (Cin/group={cin}, group={group}, so "
+            f"the expected total Cin is {cin * group}). Nothing emitted.",
             where=where)
 
-    # Cout-major already -- see im2col.py's own note on why a conv kernel
-    # needs no transpose the way MatMulInteger's B does.
-    weight2d = np.ascontiguousarray(weight.reshape(cout, cin * kh * kw))
+    if group == 1:
+        # Cout-major already -- see im2col.py's own note on why a conv
+        # kernel needs no transpose the way MatMulInteger's B does.
+        weight2d = np.ascontiguousarray(weight.reshape(cout, cin * kh * kw))
+        weight_groups = None
+    else:
+        # Exactly load_qlinear_conv's own group-splitting logic: each
+        # group's own contiguous Cout/group-wide slice of `weight`'s
+        # leading axis already carries only that group's own Cin/group
+        # input channels (ONNX's own layout), so only a cout-axis split
+        # is needed. See emit.emit_grouped_conv_matmul_chain_module's
+        # own docstring for why the conv's own output stays G separate
+        # matmuls all the way through the bridge into the first matmul
+        # layer, not a single padded dense one.
+        weight2d = None
+        cout_per_group = cout // group
+        weight_groups = [
+            np.ascontiguousarray(
+                weight[g * cout_per_group:(g + 1) * cout_per_group]
+                .reshape(cout_per_group, cin * kh * kw))
+            for g in range(group)
+        ]
     conv_scale = y_scale / (x_scale * w_scale)
 
     # Output spatial size -- same formula as im2col_nchw's own (see that
@@ -1597,7 +1643,8 @@ def load_conv_matmul_chain(model):
                   pad_top, pad_bottom, pad_left, pad_right,
                   dilation_h, dilation_w)
     return (conv_node, matmul_nodes, weight2d, x_name, tuple(x_shape),
-           conv_params, x_zero_point, matmul_weights, bridge_scales)
+           conv_params, x_zero_point, matmul_weights, bridge_scales,
+           group, weight_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -3537,31 +3584,70 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
 
     if conv_count == 1 and matmul_count >= 1:
         (conv_node, matmul_nodes, weight2d, x_name, x_shape, conv_params,
-         x_zero_point, matmul_weights, bridge_scales) = (
-            load_conv_matmul_chain(model))
+         x_zero_point, matmul_weights, bridge_scales, group,
+         weight_groups) = load_conv_matmul_chain(model)
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
 
-        patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
-                                                        *conv_params)
+        header = provenance(model_path, model_bytes, activation_source)
+
+        if group == 1:
+            patches, (n_batch, out_h, out_w) = im2col_nchw(activation,
+                                                            *conv_params)
+
+            taken = set()
+            weight_syms = [sanitize_symbol(conv_node.input[3], taken)]
+            weight_syms += [sanitize_symbol(n.input[1], taken)
+                           for n in matmul_nodes]
+            act_sym = sanitize_symbol(x_name, taken)
+
+            header += (
+                f"//   conv im2col (layer 0): N={n_batch} OutH={out_h} "
+                f"OutW={out_w} -- the whole chain's printed output rows "
+                f"stay in (n, oh, ow) row-major order (emit_chain_module "
+                f"threads M through every layer unchanged), reshape to "
+                f"[N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) for "
+                f"ONNX's own [N, Cout, OutH, OutW] layout.\n")
+            return emit_chain_module(
+                [weight2d] + matmul_weights, patches, weight_syms=weight_syms,
+                act_sym=act_sym, header=header, scales=bridge_scales)
+
+        # group > 1: exactly load_qlinear_conv's own per-group im2col --
+        # a real, separate im2col per group, over that group's own
+        # Cin/group channel slice of the activation. See
+        # emit.emit_grouped_conv_matmul_chain_module's own docstring for
+        # why the conv's own output stays G separate matmuls all the way
+        # through the bridge into the first matmul layer.
+        cin_per_group = x_shape[1] // group
+        patches_groups = []
+        out_shape = None
+        for g in range(group):
+            xg = activation[:, g * cin_per_group:(g + 1) * cin_per_group, :, :]
+            pg, out_shape = im2col_nchw(xg, *conv_params)
+            patches_groups.append(pg)
+        n_batch, out_h, out_w = out_shape
 
         taken = set()
-        weight_syms = [sanitize_symbol(conv_node.input[3], taken)]
-        weight_syms += [sanitize_symbol(n.input[1], taken)
-                        for n in matmul_nodes]
-        act_sym = sanitize_symbol(x_name, taken)
+        weight_syms = [sanitize_symbol(f"{conv_node.input[3]}_g{g}", taken)
+                       for g in range(group)]
+        act_syms = [sanitize_symbol(f"{x_name}_g{g}", taken)
+                   for g in range(group)]
+        mm_weight_syms = [sanitize_symbol(n.input[1], taken)
+                         for n in matmul_nodes]
 
-        header = provenance(model_path, model_bytes, activation_source)
         header += (
-            f"//   conv im2col (layer 0): N={n_batch} OutH={out_h} "
-            f"OutW={out_w} -- the whole chain's printed output rows stay "
-            f"in (n, oh, ow) row-major order (emit_chain_module threads M "
-            f"through every layer unchanged), reshape to "
-            f"[N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) for ONNX's "
-            f"own [N, Cout, OutH, OutW] layout.\n")
-        return emit_chain_module(
-            [weight2d] + matmul_weights, patches, weight_syms=weight_syms,
-            act_sym=act_sym, header=header, scales=bridge_scales)
+            f"//   grouped conv im2col (layer 0): group={group}, "
+            f"N={n_batch} OutH={out_h} OutW={out_w} -- one real im2col per "
+            f"group, over that group's own Cin/group channel slice; raw "
+            f"matmul output rows are in (n, oh, ow) row-major order, "
+            f"reshape to [N, OutH, OutW, Cout] then transpose(0, 3, 1, 2) "
+            f"for ONNX's own [N, Cout, OutH, OutW] layout, exactly as the "
+            f"ungrouped case above.\n")
+        return emit_grouped_conv_matmul_chain_module(
+            weight_groups, patches_groups, matmul_weights,
+            weight_syms=weight_syms, act_syms=act_syms,
+            mm_weight_syms=mm_weight_syms, header=header,
+            conv_bridge_scale=bridge_scales[0], scales=bridge_scales[1:])
 
     if conv_count >= 2 and matmul_count >= 1 and pool_count >= 1:
         (conv_nodes, matmul_nodes, weights2d, x_name, x_shape, conv_params,

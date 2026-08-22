@@ -44,7 +44,7 @@ reasons.
 | A conv chain -> matmul chain | The realistic full-CNN shape |
 | `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
 | `MaxPool` composed with the conv->matmul bridge | A pool between the chain's own last conv and its first matmul layer — max is scale-invariant, so this needs no bridge of its own beyond moving the Transpose/Reshape's own source |
-| A grouped or depthwise `QLinearConv` (`group > 1`), standalone | `group` independent im2col matmuls, one per channel slice, concatenated into one output — not chained, and not composed with the matmul bridge or pooling yet |
+| A grouped or depthwise `QLinearConv` (`group > 1`), standalone or feeding a `MatMulInteger` chain | `group` independent im2col matmuls, one per channel slice, concatenated into one output — not yet chained into further convs or composed with pooling |
 
 Per layer, operands must be: constant int8 weights, rank 2 (or 4 for conv), all dimensions
 statically known, opset 10 or later.
@@ -148,9 +148,17 @@ Verified against independent NumPy convolution loops before any front-end code w
 written — both a real grouped case and a fully depthwise case matched `onnx.reference`
 exactly, so there is no oracle gap here (unlike `MaxPool`'s `strides == 1`).
 
-Standalone only, for now: the chain loaders (conv chain, conv-to-matmul bridge, pooling)
-still refuse `group != 1`, since a grouped conv's own weight/im2col shape has not been
-threaded through their channel-count bookkeeping.
+A grouped conv may also feed a `MatMulInteger` chain: `load_conv_matmul_chain`'s own conv
+layer is always the chain's own layer 0, so its grouped output only has to be the same flat
+`[M, Cout]` buffer an ungrouped conv's bridge already expects —
+`emit.emit_grouped_conv_matmul_chain_module` produces exactly that (the same G-way matmul +
+concatenation above, feeding straight into `emit_chain_module`'s own bridge-then-matmul
+loop, unchanged).
+
+Chained into further convs, or composed with pooling, still refuses `group != 1`, for now:
+there, a grouped layer's own per-group Cin/Cout would have to thread through gather/reshape
+machinery built for one dense channel count, since the grouped layer is not always the
+chain's own layer 0 the way it is here.
 
 ## What it refuses, and why refusing is the point
 
@@ -170,7 +178,7 @@ confident wrong number is worse than a refusal.
 | symbolic/dynamic dimensions | weights are materialized as dense literals |
 | a bridge with a non-positive scale, or a missing/non-zero zero point | `cim.requantize` needs a positive scale and an explicit int8 zero point of 0 |
 | a value read by more than one node along a chain | needs buffer-liveness reasoning this importer does not do; only a strictly linear chain is imported |
-| a grouped/depthwise conv (`group != 1`) **inside a chain** (conv chain, matmul bridge, or pooling) | accepted standalone (see above); the chain loaders don't yet thread a grouped shape through their channel bookkeeping |
+| a grouped/depthwise conv (`group != 1`) chained into further convs, or composed with pooling | accepted standalone or feeding a matmul chain (see above); those two loaders don't yet thread a grouped shape through their channel bookkeeping |
 | a conv with non-zero `w_zero_point` | its correction term is per-row and activation-dependent, not a fixed per-channel bias |
 | a conv with a non-scalar `x_zero_point`/`y_zero_point` | per-tensor activation quantization is the near-universal convention |
 | `auto_pad` other than `NOTSET`, on conv or pool | needs shape-dependent padding math this front end does not replicate. `VALID` is refused too, because `onnx.reference`'s own formula for it is wrong for `N != 1` or `Cin != 1` — an oracle bug, sidestepped rather than reproduced |

@@ -703,6 +703,225 @@ def emit_chain_module(weights, activation, weight_syms=None, act_sym="a",
     return "\n".join(lines)
 
 
+def emit_grouped_conv_matmul_chain_module(weight_groups, activation_groups,
+                                          weights, weight_syms=None,
+                                          act_syms=None, mm_weight_syms=None,
+                                          header="", conv_bridge_scale=1.0,
+                                          scales=None):
+    """A grouped/depthwise QLinearConv (layer 0) feeding one or more
+    MatMulInteger layers -- `emit_grouped_conv_module`'s own G-way matmul
+    plus column-concatenation (see its docstring for why G separate
+    matmuls, not one block-diagonal one) as the FIRST layer of
+    `emit_chain_module`'s own bridge-then-matmul chain, instead of that
+    function's single `linalg.matmul_transpose_b`.
+
+    `weight_groups`/`activation_groups` are exactly
+    `emit_grouped_conv_module`'s own first two parameters. `weights` is
+    the chain's remaining matmul layers -- `weights[0]`'s own K must
+    equal the concatenated groups' total Cout (`sum(w.shape[0] for w in
+    weight_groups)`), exactly `emit_chain_module`'s own K-matches-N
+    check between consecutive layers. At least one entry is required:
+    this function models a conv CHAINED INTO further layers, not a
+    standalone one -- see `emit_grouped_conv_module` for that case.
+
+    `conv_bridge_scale` is the conv -> first-matmul bridge's real,
+    positive requantize scale (`y_scale / (x_scale * w_scale)`,
+    QLinearConv's own reference formula -- exactly
+    `load_conv_matmul_chain`'s own `bridge_scales[0]` for the ungrouped
+    case). `scales`, if given, are the remaining `len(weights) - 1`
+    matmul->matmul bridge scales, exactly `emit_chain_module`'s own
+    `scales` parameter (same default of 1.0 each).
+
+    A bias is deliberately NOT a parameter here, matching
+    `load_conv_matmul_chain`'s own refusal of a bias on a convolution
+    chained into further layers: `emit_chain_module`'s own bridge has no
+    `cim.reduce_partial` step for one, and this function's whole point is
+    to reuse that same bridge-then-matmul tail unchanged.
+    """
+    weight_groups = [np.asarray(w) for w in weight_groups]
+    activation_groups = [np.asarray(a) for a in activation_groups]
+    weights = [np.asarray(w) for w in weights]
+    group = len(weight_groups)
+    if group < 1:
+        raise ValueError("weight_groups must have at least one group")
+    if len(activation_groups) != group:
+        raise ValueError(
+            f"weight_groups has {group} entries but activation_groups has "
+            f"{len(activation_groups)}; exactly one activation array per "
+            f"group is required")
+    if not weights:
+        raise ValueError(
+            "emit_grouped_conv_matmul_chain_module needs at least one "
+            "matmul layer chained after the grouped convolution -- use "
+            "emit_grouped_conv_module for a standalone grouped conv")
+    if not (float(conv_bridge_scale) > 0.0):
+        raise ValueError(
+            f"conv_bridge_scale must be positive, got {conv_bridge_scale}")
+
+    norm_acts = []
+    for i, a in enumerate(activation_groups):
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        elif a.ndim != 2:
+            raise ValueError(
+                f"group {i}'s activation must be 1-D [K] or 2-D [M, K], "
+                f"got shape {a.shape}")
+        norm_acts.append(a)
+    activation_groups = norm_acts
+
+    m = activation_groups[0].shape[0]
+    for i, a in enumerate(activation_groups):
+        if a.shape[0] != m:
+            raise ValueError(
+                f"group {i}'s activation has M={a.shape[0]}, but group 0's "
+                f"has M={m} -- every group shares the same output spatial "
+                f"positions, since grouping only splits channels")
+    for i, (w, a) in enumerate(zip(weight_groups, activation_groups)):
+        if w.ndim != 2:
+            raise ValueError(
+                f"group {i}'s weight must be 2-D [Cout_g, K_g], got shape "
+                f"{w.shape}")
+        if w.shape[1] != a.shape[1]:
+            raise ValueError(
+                f"group {i}'s weight K ({w.shape[1]}) does not match its "
+                f"activation K ({a.shape[1]})")
+
+    if weight_syms is None:
+        weight_syms = [f"w{i}" for i in range(group)]
+    if act_syms is None:
+        act_syms = [f"a{i}" for i in range(group)]
+    if len(weight_syms) != group or len(act_syms) != group:
+        raise ValueError(
+            "weight_syms and act_syms must each have one entry per group")
+    if mm_weight_syms is None:
+        mm_weight_syms = [f"mw{i}" for i in range(len(weights))]
+    if len(mm_weight_syms) != len(weights):
+        raise ValueError("mm_weight_syms must have one entry per matmul layer")
+    if scales is None:
+        scales = [1.0] * (len(weights) - 1)
+    if len(scales) != len(weights) - 1:
+        raise ValueError(
+            f"scales must have one entry per matmul->matmul bridge "
+            f"(len(weights) - 1 = {len(weights) - 1}), got {len(scales)}")
+    for i, s in enumerate(scales):
+        if not (s > 0.0):
+            raise ValueError(f"bridge {i}'s scale must be positive, got {s}")
+
+    cout_per_group = [w.shape[0] for w in weight_groups]
+    cout = sum(cout_per_group)
+    if weights[0].shape[1] != cout:
+        raise ValueError(
+            f"the first matmul layer's K ({weights[0].shape[1]}) does not "
+            f"match the grouped convolution's total Cout ({cout})")
+    for i in range(1, len(weights)):
+        if weights[i].shape[1] != weights[i - 1].shape[0]:
+            raise ValueError(
+                f"layer {i}'s K ({weights[i].shape[1]}) does not match "
+                f"layer {i - 1}'s N ({weights[i - 1].shape[0]})")
+
+    globals_text = ""
+    lines = []
+    allocs = []
+    # The grouped conv's own G-way matmul + column-concatenation --
+    # IDENTICAL to emit_grouped_conv_module's own prefix; see that
+    # function's docstring for why G separate matmuls, not one
+    # block-diagonal one.
+    for i, (w, a, wsym, asym) in enumerate(
+            zip(weight_groups, activation_groups, weight_syms, act_syms)):
+        n_g, k_g = w.shape
+        wty = f"memref<{n_g}x{k_g}xi8>"
+        aty = f"memref<{m}x{k_g}xi8>"
+        outty = f"memref<{m}x{n_g}xi32>"
+        globals_text += (
+            f'memref.global "private" constant @{wsym} : {wty} = '
+            f"dense<{_dense_2d(w)}>\n"
+            f'memref.global "private" constant @{asym} : {aty} = '
+            f"dense<{_dense_2d(a)}>\n")
+        lines += [
+            f"  %w{i} = memref.get_global @{wsym} : {wty}",
+            f"  %aInit{i} = memref.get_global @{asym} : {aty}",
+            f"  %a{i} = memref.alloc() : {aty}",
+            f"  memref.copy %aInit{i}, %a{i} : {aty} to {aty}",
+            f"  %outg{i} = memref.alloc() : {outty}",
+            f"  linalg.matmul_transpose_b ins(%a{i}, %w{i} : {aty}, {wty})",
+            f"    outs(%outg{i} : {outty})",
+        ]
+        allocs.append((f"%a{i}", aty))
+        allocs.append((f"%outg{i}", outty))
+
+    i32mcout = f"memref<{m}x{cout}xi32>"
+    lines.append(f"  %out = memref.alloc() : {i32mcout}")
+    allocs.append(("%out", i32mcout))
+    offset = 0
+    for i, n_g in enumerate(cout_per_group):
+        src_ty = f"memref<{m}x{n_g}xi32>"
+        dst_ty = f"memref<{m}x{n_g}xi32, strided<[{cout}, 1], offset: {offset}>>"
+        lines += [
+            f"  %outCol{i} = memref.subview %out[0, {offset}] [{m}, {n_g}] "
+            f"[1, 1] : {i32mcout} to {dst_ty}",
+            f"  memref.copy %outg{i}, %outCol{i} : {src_ty} to {dst_ty}",
+        ]
+        offset += n_g
+
+    # The conv -> first-matmul bridge: exactly emit_chain_module's own
+    # bridge (scalar cim.requantize, zero_point=0), reused unchanged --
+    # this function's whole reason to exist is that everything AFTER the
+    # concatenated [m, cout] accumulator is indistinguishable from an
+    # ordinary matmul chain's own layer 0 output.
+    i8mcout = f"memref<{m}x{cout}xi8>"
+    lines.append(
+        f"  %act0 = cim.requantize %out {{scale = "
+        f"{float(conv_bridge_scale)!r} : f32, zero_point = 0 : i32, "
+        f"effective_bits = 8 : i32}}")
+    lines.append(f"    : {i32mcout} -> {i8mcout}")
+    allocs.append(("%act0", i8mcout))
+
+    # emit_chain_module's own per-layer loop, byte-for-byte, starting
+    # from the grouped conv's bridged activation instead of a plain
+    # memref.global-backed one.
+    for sym, w in zip(mm_weight_syms, weights):
+        n, k = w.shape
+        globals_text += (
+            f'memref.global "private" constant @{sym} : memref<{n}x{k}xi8> '
+            f"= dense<{_dense_2d(w)}>\n")
+    for sym, w in zip(mm_weight_syms, weights):
+        n, k = w.shape
+        lines.append(f"  %{sym} = memref.get_global @{sym} : memref<{n}x{k}xi8>")
+
+    act_val = "%act0"
+    for i, (sym, w) in enumerate(zip(mm_weight_syms, weights)):
+        n, k = w.shape
+        out_val = f"%mmout{i}"
+        lines.append(f"  {out_val} = memref.alloc() : memref<{m}x{n}xi32>")
+        lines.append(
+            f"  linalg.matmul_transpose_b ins({act_val}, %{sym} : "
+            f"memref<{m}x{k}xi8>, memref<{n}x{k}xi8>)")
+        lines.append(f"    outs({out_val} : memref<{m}x{n}xi32>)")
+        if i < len(weights) - 1:
+            act_val = f"%mmact{i + 1}"
+            lines.append(
+                f"  {act_val} = cim.requantize {out_val} {{scale = "
+                f"{float(scales[i])!r} : f32, "
+                f"zero_point = 0 : i32, effective_bits = 8 : i32}}")
+            lines.append(f"    : memref<{m}x{n}xi32> -> memref<{m}x{n}xi8>")
+
+    last_n = weights[-1].shape[0]
+    lines.append(
+        f"  %u = memref.cast %mmout{len(weights) - 1} : memref<{m}x{last_n}xi32> "
+        f"to memref<*xi32>")
+    lines.append("  func.call @cim_print_i32(%u) : (memref<*xi32>) -> ()")
+    for name, ty in allocs:
+        lines.append(f"  memref.dealloc {name} : {ty}")
+    lines.append(
+        f"  memref.dealloc %mmout{len(weights) - 1} : memref<{m}x{last_n}xi32>")
+    lines.append("  return")
+    lines.append("}")
+    lines.append("")
+
+    body = "\n".join(lines)
+    return f"{header}{globals_text}func.func private @cim_print_i32(memref<*xi32>)\nfunc.func @main() {{\n{body}"
+
+
 def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                            weight_syms=None, act_sym="a", header="",
                            scales=None, n_conv_layers=None, last_bias=None,

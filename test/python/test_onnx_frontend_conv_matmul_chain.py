@@ -41,7 +41,8 @@ from onnx import numpy_helper  # noqa: E402
 
 from cim_frontend.onnx_import import import_model  # noqa: E402
 from cim_frontend.refusal import Refusal  # noqa: E402
-from onnx_fixtures import conv_matmul_chain_model, onnx_reference_eval  # noqa: E402
+from onnx_fixtures import (conv_chain_matmul_chain_model,  # noqa: E402
+                           conv_matmul_chain_model, onnx_reference_eval)
 from test_numerical_differential import compile_and_run, PipelineError  # noqa: E402
 
 SEED = int(os.environ.get("CIM_TEST_SEED", "0x5eed1234abcd"), 0)
@@ -246,26 +247,104 @@ def test_refuses_more_than_one_qlinear_conv_in_a_chain():
         import_model(model, act)
 
 
-def test_refuses_a_grouped_conv():
-    # Grouped/depthwise convolution is accepted STANDALONE
-    # (test_onnx_frontend_conv.py's own tests), via load_qlinear_conv's
-    # allow_grouped=True -- but _conv_geometry's default is still
-    # allow_grouped=False for every chain loader, this one included. A
-    # grouped conv's own weight/im2col shape has not been threaded through
-    # this loader's channel-count bookkeeping (Cin == the previous layer's
-    # own Cout, here always ungrouped), so accepting it here would need
-    # real new work, not just flipping a flag -- see _conv_geometry's own
-    # allow_grouped docstring note.
-    cout, cin, kh, kw = 4, 2, 2, 2
-    rng = np.random.default_rng(SEED + 38)
-    conv_w = rng.integers(-4, 5, size=(cout, cin, kh, kw),
-                          dtype=np.int64).astype(np.int8)
-    x_shape = (1, cin, 5, 5)
-    mm_w = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+# --- grouped/depthwise conv as the chain's own layer 0 ----------------------
 
-    model = conv_matmul_chain_model(conv_w, x_shape, [mm_w])
+def test_a_grouped_conv_feeding_a_matmul_matches_the_reference(cim_opt,
+                                                                cim_run):
+    # Grouped conv IS accepted here: load_conv_matmul_chain's own conv
+    # layer is ALWAYS the chain's own layer 0, and
+    # emit_grouped_conv_matmul_chain_module produces the same flat
+    # [M, Cout] activation an ungrouped conv's own emit_chain_module
+    # bridge already expects -- see load_conv_matmul_chain's own
+    # docstring and _conv_geometry's allow_grouped note for why this is
+    # different from every OTHER chain loader, which still refuses.
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    rng = np.random.default_rng(SEED + 39)
+    conv_w = rng.integers(-4, 5, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    mm_w = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_matmul_chain_model(conv_w, x_shape, [mm_w], group=group)
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled grouped-conv-matmul-chain output {outputs.tolist()} != "
+        f"ONNX reference {want.tolist()}")
+
+
+def test_a_depthwise_conv_feeding_a_matmul_matches_the_reference(cim_opt,
+                                                                  cim_run):
+    # group == Cin == Cout: the fully depthwise special case.
+    cin_out, kh, kw, group = 4, 2, 2, 4
+    rng = np.random.default_rng(SEED + 40)
+    conv_w = rng.integers(-4, 5, size=(cin_out, 1, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_out, 5, 5)
+    mm_w = rng.integers(-4, 5, size=(cin_out, 3), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_matmul_chain_model(conv_w, x_shape, [mm_w], group=group)
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled depthwise-conv-matmul-chain output {outputs.tolist()} "
+        f"!= ONNX reference {want.tolist()}")
+
+
+def test_a_wrong_weight_in_one_group_of_a_conv_matmul_chain_would_be_caught(
+        cim_opt, cim_run):
+    # Anti-vacuity: perturbing group 1's own conv weight (not group 0's,
+    # and not the matmul's) must still change the compiled result --
+    # proving the concatenated groups actually feed the matmul, not just
+    # group 0's slice.
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    rng = np.random.default_rng(SEED + 41)
+    conv_w = rng.integers(-4, 5, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    mm_w = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    base_model = conv_matmul_chain_model(conv_w, x_shape, [mm_w], group=group)
+    base = onnx_reference_eval(base_model, act, act_name="X")
+
+    cout_per_group = cout // group
+    bumped_w = conv_w.copy()
+    bumped_w[cout_per_group, 0, 0, 0] = np.int8(
+        int(bumped_w[cout_per_group, 0, 0, 0]) ^ 0x5A)
+    bumped_model = conv_matmul_chain_model(bumped_w, x_shape, [mm_w],
+                                           group=group)
+    want = onnx_reference_eval(bumped_model, act, act_name="X")
+    assert not np.array_equal(base, want), "the perturbation changed nothing"
+
+    outputs, _ = compile_and_run(
+        cim_opt, cim_run, None, None,
+        source=import_model(bumped_model, act))
+    assert np.array_equal(np.asarray(outputs), want)
+
+
+def test_refuses_a_grouped_conv_in_a_two_conv_chain():
+    # Unlike load_conv_matmul_chain (single conv, always layer 0),
+    # load_conv_chain_matmul_chain's own conv layers gather each other's
+    # bridged output via emit_conv_chain_module's 4-D NHWC machinery,
+    # built for one dense channel count -- a grouped layer's own
+    # per-group Cin/Cout has not been threaded through that gather, so
+    # this loader's own _conv_geometry call keeps its allow_grouped=False
+    # default. Confirms the acceptance above is genuinely scoped to
+    # load_conv_matmul_chain, not a blanket lift.
+    cout0, cin0, kh, kw = 4, 2, 2, 2
+    cout1 = 3
+    rng = np.random.default_rng(SEED + 42)
+    conv_w0 = rng.integers(-4, 5, size=(cout0, cin0, kh, kw),
+                           dtype=np.int64).astype(np.int8)
+    conv_w1 = rng.integers(-4, 5, size=(cout1, cout0, kh, kw),
+                           dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin0, 6, 6)
+    mm_w = rng.integers(-4, 5, size=(cout1, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model([conv_w0, conv_w1], x_shape, [mm_w])
     for node in model.graph.node:
-        if node.op_type == "QLinearConv":
+        if node.op_type == "QLinearConv" and node.name == "conv0":
             node.attribute.append(onnx_helper.make_attribute("group", 2))
 
     act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)

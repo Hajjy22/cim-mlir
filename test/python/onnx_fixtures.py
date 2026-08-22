@@ -257,7 +257,7 @@ def conv_matmul_chain_model(conv_weight, x_shape, matmul_weights,
                             x_zero_point=0, x_dtype=TensorProto.INT8,
                             strides=(1, 1), pads=(0, 0, 0, 0),
                             dilations=(1, 1), bridge_scales=None,
-                            check=True):
+                            group=1, check=True):
     """A QLinearConv (layer 0) feeding one or more MatMulInteger layers,
     bridged the way cim_frontend.onnx_import.load_conv_matmul_chain reads:
     Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]) between the conv and
@@ -286,14 +286,18 @@ def conv_matmul_chain_model(conv_weight, x_shape, matmul_weights,
     and no bias on the conv layer -- load_conv_matmul_chain requires
     exactly that for a convolution chained into further layers (see its
     own module section header).
+
+    `group` (default 1) is ONNX's own grouped-convolution attribute,
+    exactly qlinear_conv_model's own: `conv_weight`'s Cin axis is then
+    Cin/group, not the activation's own total Cin.
     """
     conv_weight = np.asarray(conv_weight)
     cout, cin, kh, kw = conv_weight.shape
     n, x_cin, h, w = x_shape
-    if x_cin != cin:
+    if x_cin != cin * group:
         raise ValueError(
-            f"x_shape's Cin ({x_cin}) does not match conv_weight's Cin "
-            f"({cin})")
+            f"x_shape's Cin ({x_cin}) does not match conv_weight's "
+            f"Cin/group ({cin}) times group ({group}) = {cin * group}")
     matmul_weights = [np.asarray(w) for w in matmul_weights]
     if matmul_weights[0].shape[0] != cout:
         raise ValueError(
@@ -341,7 +345,7 @@ def conv_matmul_chain_model(conv_weight, x_shape, matmul_weights,
         [x_name, "conv_xs", "conv_xzp", "conv_W", "conv_ws", "conv_wzp",
          "conv_ys", "conv_yzp"],
         ["conv_y"], name="conv0", strides=list(strides),
-        pads=list(pads), dilations=list(dilations))
+        pads=list(pads), dilations=list(dilations), group=group)
     transpose_node = helper.make_node(
         "Transpose", ["conv_y"], ["conv_y_nhwc"], perm=[0, 2, 3, 1],
         name="transpose0")
