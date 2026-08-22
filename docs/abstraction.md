@@ -9,7 +9,7 @@ flowchart LR
     onnx["ONNX\n(.onnx file)"] --> fe["Frontend\n(python/cim_frontend)"]
     fe --> mlir["MLIR\n(linalg / memref / scf)"]
     mlir --> dialect["CIM Dialect\n(cim-detect)"]
-    dialect --> compiler["Compiler\ncim-partition -> cim-placement\n-> cim-legalize-precision -> cim-insert-transfers\n-> cim-lower-to-target"]
+    dialect --> compiler["Compiler\ncim-partition -> cim-placement -> cim-schedule\n-> cim-insert-transfers -> cim-legalize-precision\n-> cim-lower-to-target"]
     compiler --> runtime["Runtime\n(cimrt ABI)"]
     runtime --> hw{{"CIM Hardware /\nSimulator"}}
 

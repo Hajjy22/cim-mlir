@@ -61,6 +61,29 @@ See [`python/README.md`](python/README.md) for what the ONNX front end accepts.
 
 ## The pipeline
 
+```mermaid
+flowchart LR
+    onnx["ONNX\n(.onnx file)"] --> fe["Frontend\n(python/cim_frontend)"]
+    fe --> mlir["MLIR\n(linalg / memref / scf)"]
+    mlir --> compiler["Compiler\n(cim dialect + the 8 passes below)"]
+    compiler --> runtime["Runtime\n(cimrt ABI)"]
+    runtime --> hw{{"CIM Hardware /\nSimulator"}}
+
+    hw --> reram["ReRAM"]
+    hw --> pcm["PCM"]
+    hw --> sram["SRAM"]
+    hw --> other["Other CIM"]
+    hw --> sim["Simulator"]
+
+    sim -.->|"cim-run --profile\n(measured cost feeds cim-bench)"| compiler
+```
+
+Only the **Simulator** backend is real today — every test and benchmark in this repo
+runs against it. **ReRAM/PCM/SRAM/"Other CIM"** are not separate implementations; they
+are points on the target-YAML axes described in
+[`docs/abstraction.md`](docs/abstraction.md), reachable with no dialect or compiler
+change, not chips this project currently runs on. See that document for the full model.
+
 | # | Pass | What it does |
 |---|---|---|
 | 1 | `cim-detect` | Finds INT8 matmuls with a constant weight operand |
