@@ -4,23 +4,16 @@ This is the most valuable file in the repository. Everything else follows from i
 
 ## Pipeline at a glance
 
-```mermaid
-flowchart LR
-    onnx["ONNX\n(.onnx file)"] --> fe["Frontend\n(python/cim_frontend)"]
-    fe --> mlir["MLIR\n(linalg / memref / scf)"]
-    mlir --> dialect["CIM Dialect\n(cim-detect)"]
-    dialect --> compiler["Compiler\ncim-partition -> cim-placement -> cim-schedule\n-> cim-insert-transfers -> cim-legalize-precision\n-> cim-lower-to-target"]
-    compiler --> runtime["Runtime\n(cimrt ABI)"]
-    runtime --> hw{{"CIM Hardware /\nSimulator"}}
+![Pipeline: ONNX to Frontend to MLIR to CIM Dialect to Compiler (placement, scheduling, optimization) to Runtime to CIM Hardware/Simulator, branching to ReRAM/PCM/SRAM/Other CIM/Simulator, with a feedback loop from the hardware row back into the compiler's placement stage](images/pipeline-architecture.png)
 
-    hw --> reram["ReRAM"]
-    hw --> pcm["PCM"]
-    hw --> sram["SRAM"]
-    hw --> other["Other CIM"]
-    hw --> sim["Simulator"]
-
-    sim -.->|"cim-run --profile\n(measured cost feeds cim-bench)"| compiler
-```
+"CIM Dialect" is `cim-detect`; "Compiler" is the remaining seven passes
+(`cim-partition -> cim-placement -> cim-schedule -> cim-insert-transfers ->
+cim-legalize-precision -> cim-lower-to-target`, plus `cim-cost-report`), grouped in the
+picture as Placement (`cim-placement`; Belady/LRU/FIFO are real, verified eviction
+policies — see the root README's "The result that matters"), Scheduling
+(`cim-schedule`), and Optimization (`cim-insert-transfers` and
+`cim-legalize-precision` together). The feedback arrow is `cim-run --profile`'s
+measured cost feeding back into placement decisions, via `cim-bench`.
 
 The tile abstraction below (`!cim.tile`, one target YAML per chip) is what lets one
 compiler and one dialect target every box in that bottom row without a

@@ -61,22 +61,14 @@ See [`python/README.md`](python/README.md) for what the ONNX front end accepts.
 
 ## The pipeline
 
-```mermaid
-flowchart LR
-    onnx["ONNX\n(.onnx file)"] --> fe["Frontend\n(python/cim_frontend)"]
-    fe --> mlir["MLIR\n(linalg / memref / scf)"]
-    mlir --> compiler["Compiler\n(cim dialect + the 8 passes below)"]
-    compiler --> runtime["Runtime\n(cimrt ABI)"]
-    runtime --> hw{{"CIM Hardware /\nSimulator"}}
+![Pipeline: ONNX to Frontend to MLIR to CIM Dialect to Compiler (placement, scheduling, optimization) to Runtime to CIM Hardware/Simulator, branching to ReRAM/PCM/SRAM/Other CIM/Simulator, with a feedback loop from the hardware row back into the compiler's placement stage](docs/images/pipeline-architecture.png)
 
-    hw --> reram["ReRAM"]
-    hw --> pcm["PCM"]
-    hw --> sram["SRAM"]
-    hw --> other["Other CIM"]
-    hw --> sim["Simulator"]
-
-    sim -.->|"cim-run --profile\n(measured cost feeds cim-bench)"| compiler
-```
+"Compiler" here is the `cim` dialect plus the 8 passes below; "Placement" is
+`cim-placement` (Belady/LRU/FIFO are real, verified eviction policies — see "The
+result that matters"); "Scheduling" is `cim-schedule`; "Optimization" covers
+`cim-insert-transfers`, `cim-legalize-precision`, and `cim-lower-to-target` together.
+The feedback arrow is `cim-run --profile`'s measured cost feeding back into placement
+decisions, via `cim-bench`.
 
 Only the **Simulator** backend is real today — every test and benchmark in this repo
 runs against it. **ReRAM/PCM/SRAM/"Other CIM"** are not separate implementations; they
