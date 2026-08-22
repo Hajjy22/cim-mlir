@@ -803,6 +803,11 @@ def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
     conv-to-matmul bridge -- those are always derived from each
     conv layer's own `y_scale / (x_scale * w_scale)`, exactly
     conv_matmul_chain_model's own convention).
+
+    `relu_after`, if given, is a set of bridge indices `0 <= i < n_conv`:
+    `i < n_conv - 1` inserts a Relu between conv layer `i` and `i + 1`
+    (conv_chain_model's own convention); `i == n_conv - 1` inserts one
+    directly before the Transpose that starts the conv-to-matmul bridge.
     """
     conv_weights = [np.asarray(w) for w in conv_weights]
     n_conv = len(conv_weights)
@@ -812,10 +817,11 @@ def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
     if relu_after is None:
         relu_after = set()
     for i in relu_after:
-        if not (0 <= i < n_conv - 1):
+        if not (0 <= i < n_conv):
             raise ValueError(
                 f"relu_after has bridge {i}, but this chain only has "
-                f"conv-conv bridges 0 <= bridge < {n_conv - 1}")
+                f"conv-conv bridges 0 <= bridge < {n_conv - 1} plus the "
+                f"conv-to-matmul bridge at {n_conv - 1}")
     if conv_w_scales is None:
         conv_w_scales = [1.0] * n_conv
     if conv_y_scales is None:

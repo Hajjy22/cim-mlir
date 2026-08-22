@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(
 
 pytest.importorskip("onnx", reason="the ONNX front end's oracle")
 
-from onnx import numpy_helper  # noqa: E402
+from onnx import helper, numpy_helper  # noqa: E402
 
 from cim_frontend.onnx_import import import_model  # noqa: E402
 from cim_frontend.refusal import Refusal  # noqa: E402
@@ -203,6 +203,112 @@ def test_a_relu_between_two_convs_feeding_a_matmul_matches_the_reference(
     assert np.array_equal(outputs, want), (
         f"compiled output {outputs.tolist()} != ONNX reference "
         f"{want.tolist()}")
+
+
+def test_a_relu_directly_before_the_conv_to_matmul_bridge_matches_the_reference(
+        cim_opt, cim_run):
+    # Relu right on the conv-to-matmul bridge itself (index n_conv - 1) --
+    # the one position load_conv_chain_matmul_chain didn't recognize
+    # before: _discover_conv_chain never looks past the chain's own last
+    # conv, so this bridge's own optional Relu is detected by the loader
+    # directly, immediately before its Transpose/Reshape check. Reuses
+    # emit_conv_chain_module's existing relu_bridges capability
+    # unchanged -- every bridge it emits, including this one, already
+    # has zero_point == 0, so no new emission code was needed, only
+    # discovery-side wiring.
+    rng = np.random.default_rng(SEED + 86)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], relu_after={1})
+    no_relu_model = conv_chain_matmul_chain_model([w0, w1], x_shape, [mm_w])
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_a_relu_at_both_an_interior_bridge_and_the_matmul_bridge_matches_the_reference(
+        cim_opt, cim_run):
+    # Both positions at once, on a three-conv chain -- proves the two
+    # Relu discovery paths (the interior _discover_conv_chain walk, and
+    # this loader's own extra bridge check) are tracked independently in
+    # the same relu_after dict rather than one silently overwriting the
+    # other.
+    rng = np.random.default_rng(SEED + 87)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w2 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model(
+        [w0, w1, w2], x_shape, [mm_w], relu_after={0, 2})
+    no_relu_model = conv_chain_matmul_chain_model(
+        [w0, w1, w2], x_shape, [mm_w])
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_refuses_a_relu_directly_before_the_bridge_with_a_stray_extra_reader():
+    # A second reader of the bridge Relu's own output -- the new
+    # "must feed exactly one reader" check this loader's own bridge-Relu
+    # detection adds, mirroring _discover_conv_chain's identical
+    # fan-out check for interior Relus.
+    rng = np.random.default_rng(SEED + 88)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+    mm_w = rng.integers(-4, 5, size=(2, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], relu_after={1}, check=False)
+    stray = helper.make_node(
+        "Relu", ["L1_relu"], ["stray_out"], name="stray_relu_reader")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="must feed exactly one reader"):
+        import_model(model, act)
+
+
+def test_refuses_a_disconnected_relu_elsewhere_when_a_bridge_relu_is_also_present():
+    # A Relu that is not on any edge this loader (or _discover_conv_chain,
+    # which it calls) ever walks -- reads the graph's own input, feeds
+    # nothing -- exercises the "every Relu actually present must be
+    # USED" check independent of a legitimate bridge Relu also being
+    # present and correctly recognized in the same graph.
+    rng = np.random.default_rng(SEED + 89)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+    mm_w = rng.integers(-4, 5, size=(2, 3), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], relu_after={1}, check=False)
+    stray = helper.make_node("Relu", ["X"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly"):
+        import_model(model, act)
 
 
 # --- refusals ------------------------------------------------------------

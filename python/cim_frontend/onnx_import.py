@@ -2802,9 +2802,10 @@ def load_conv_chain_matmul_chain(model):
 
     A `Relu` node is accepted directly between two consecutive conv
     layers, exactly `load_conv_chain`'s own acceptance (see
-    `_discover_conv_chain`'s own docstring) -- NOT yet between the
-    chain's own last conv and the matmul tail, nor between matmul
-    layers; both remain out of scope here.
+    `_discover_conv_chain`'s own docstring), and directly before the
+    conv-to-matmul bridge (between the chain's own last conv and the
+    Transpose that starts it) -- NOT yet between matmul layers, which
+    remains out of scope here.
 
     Returns (conv_nodes, matmul_nodes, weights2d, x_name, x_shape,
     conv_params, x_zero_point, matmul_weights, bridge_scales,
@@ -2868,23 +2869,13 @@ def load_conv_chain_matmul_chain(model):
             f"{ACCEPTED_CONV_OP} chain feeding {ACCEPTED_OP} layers may "
             f"only be bridged, between conv layers, by nothing at all "
             f"(conv_i's own \"Y\" feeds conv_(i+1)'s own \"X\" directly) "
-            f"or one Relu, between the chain's own last conv and the "
-            f"first matmul by Transpose(perm=[0, 2, 3, 1]) -> "
-            f"Reshape([M, Cout]), and between matmul layers by "
-            f"Cast(to=float32) -> QuantizeLinear. Nothing emitted.")
+            f"or one Relu, between the chain's own last conv (or a "
+            f"following Relu) and the first matmul by "
+            f"Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]), and "
+            f"between matmul layers by Cast(to=float32) -> "
+            f"QuantizeLinear. Nothing emitted.")
 
     chain, relu_after, consumers = _discover_conv_chain(graph, convs)
-
-    # Every Relu actually present must be USED at a position
-    # _discover_conv_chain recognized -- exactly load_conv_chain's own
-    # same check.
-    used_relu_ids = {id(r) for r in relu_after.values()}
-    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
-    if unused_relus:
-        raise Refusal(
-            f"{len(unused_relus)} Relu node(s) are not positioned "
-            f"directly between two consecutive {ACCEPTED_CONV_OP} "
-            f"layers. Nothing emitted.")
 
     producer = {out: n for n in graph.node for out in n.output}
 
@@ -3047,19 +3038,54 @@ def load_conv_chain_matmul_chain(model):
                 f"Nothing emitted.")
     m = n_batch * cur_h * cur_w
 
-    # The chain's own last conv -> first-matmul bridge: Transpose(perm=
-    # [0, 2, 3, 1]) -> Reshape([M, Cout]) -- see load_conv_matmul_chain's
-    # own module header for why this exact pattern is required, not
-    # merely tolerated.
+    # The chain's own last conv -> first-matmul bridge: an optional Relu,
+    # then Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]) -- see
+    # load_conv_matmul_chain's own module header for why the
+    # Transpose/Reshape pattern is required, not merely tolerated.
+    # _discover_conv_chain never looks here: it stops once every conv has
+    # been chained, with no idea a matmul bridge follows chain[-1] at
+    # all -- so this bridge's own optional Relu is detected here, the
+    # same "one extra position past what the interior walk covers"
+    # pattern load_conv_pool_chain_matmul_chain already uses for its own
+    # trailing pool.
     last_where = (f"node '{chain[-1].name or ACCEPTED_CONV_OP}' "
                  f"(layer {len(chain) - 1})")
     conv_out = chain[-1].output[0]
     conv_readers = consumers.get(conv_out, [])
+    if len(conv_readers) == 1 and conv_readers[0].op_type == "Relu":
+        bridge_relu = conv_readers[0]
+        relu_out = bridge_relu.output[0]
+        relu_readers = consumers.get(relu_out, [])
+        if len(relu_readers) != 1:
+            raise Refusal(
+                f"Relu '{bridge_relu.name}''s output is read by "
+                f"{len(relu_readers)} node(s); a Relu directly before "
+                f"the conv->matmul bridge must feed exactly one reader. "
+                f"Nothing emitted.", where=last_where)
+        relu_after[len(chain) - 1] = bridge_relu
+        conv_out = relu_out
+        conv_readers = relu_readers
+
+    # Every Relu actually present must be USED at a position this
+    # function (or _discover_conv_chain, which it calls) recognized --
+    # exactly load_conv_chain's own same check, run here rather than
+    # right after _discover_conv_chain returns, now that relu_after also
+    # covers this function's own extra bridge position.
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
+        raise Refusal(
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive {ACCEPTED_CONV_OP} "
+            f"layers, or directly before the conv->matmul bridge. "
+            f"Nothing emitted.")
+
     if len(conv_readers) != 1 or conv_readers[0].op_type != "Transpose":
         raise Refusal(
-            f"the chain's own last layer's output is not read by exactly "
-            f"one Transpose node ({len(conv_readers)} reader(s) found). "
-            f"Nothing emitted.", where=last_where)
+            f"the chain's own last layer's output (after an optional "
+            f"Relu) is not read by exactly one Transpose node "
+            f"({len(conv_readers)} reader(s) found). Nothing emitted.",
+            where=last_where)
     transpose_node = conv_readers[0]
     perm_attr = next((a for a in transpose_node.attribute
                       if a.name == "perm"), None)
