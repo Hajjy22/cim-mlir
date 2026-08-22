@@ -40,7 +40,7 @@ reasons.
 | A chain of `MatMulInteger` | Bridged by `Cast(float32) -> QuantizeLinear(scale, zero_point=0)`, optionally followed by `Relu` directly on that bridge's own output |
 | One `QLinearConv` | Via im2col, entirely in Python — no new MLIR op |
 | `QLinearConv` -> `MatMulInteger` chain | Bridged by `Transpose(perm=[0,2,3,1]) -> Reshape([M, Cout])` |
-| A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]` |
+| A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]`, optionally with `Relu` (and `Relu` then `MaxPool`) directly between two layers |
 | A conv chain -> matmul chain | The realistic full-CNN shape |
 | `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
 | `MaxPool` composed with the conv->matmul bridge | A pool between the chain's own last conv and its first matmul layer — max is scale-invariant, so this needs no bridge of its own beyond moving the Transpose/Reshape's own source |
@@ -100,7 +100,7 @@ Pooling compiles all the way to a real-target binary, not just `cim-run`:
 `cim-lower-to-target` materializes each non-contiguous pooling tap into a fresh contiguous
 buffer before staging it.
 
-### `Relu` details (on a `MatMulInteger` chain)
+### `Relu` details
 
 `Relu` is accepted directly on a bridge's own output — `Cast -> QuantizeLinear -> Relu ->`
 the next layer — needing no new dialect capability. Every interior bridge already requires
@@ -115,14 +115,18 @@ Confirmed against `onnx.reference` directly (Relu on a signed int8 tensor comput
 trip of the exact `matmul -> requantize -> reduce_max(x, 0) -> matmul` shape before any
 front-end code was written.
 
-Only the exact bridge position is recognized: a `Relu` node must be the immediate producer
-of a later layer's own input. A `Relu` anywhere else in the graph — off on an unrelated
-branch, between `Cast` and `QuantizeLinear`, duplicated — is not silently accepted; it
-falls into the same "graph also contains ..." refusal as any other unrecognized op. This is
-a position check, not a type allow-list.
+Only the exact bridge position is recognized: on a `MatMulInteger` chain, a `Relu` node
+must be the immediate producer of a later layer's own input; on a `QLinearConv` chain, it
+must sit directly between two layers' own `X`/`Y` (optionally followed immediately by a
+`MaxPool`, matching ONNX's own `Conv -> Relu -> MaxPool -> Conv` node order — the reverse
+order is not recognized). A `Relu` anywhere else in the graph — off on an unrelated branch,
+between `Cast` and `QuantizeLinear`, after a pool instead of before it, duplicated — is not
+silently accepted; it falls into the same "graph also contains ..." refusal as any other
+unrecognized op. This is a position check, not a type allow-list.
 
-Matmul-chain only, for now: a `QLinearConv` chain, the conv-to-matmul bridge, and pooling
-do not thread a Relu flag yet.
+Still refused: a `Relu` on a chain's own *final* layer output (there is no bridge there to
+carry it), and a `Relu` directly before a conv-pool chain's own trailing pool (the one
+sitting right before the conv-to-matmul bridge).
 
 ### Grouped/depthwise convolution details
 

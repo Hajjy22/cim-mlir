@@ -1716,18 +1716,30 @@ def _discover_conv_chain(graph, convs):
     chain's own LAST layer is each caller's own decision, made from the
     `consumers` map this also returns, not this helper's.
 
-    Returns `(chain, consumers)`: `chain` is the ordered list of
-    QLinearConv nodes, with `len(chain) == len(convs)` always -- fewer
+    A `Relu` node is recognized directly between two consecutive
+    QLinearConv layers, exactly the matmul-chain side's own
+    `_strip_optional_relu` position: conv_i's own "Y" feeds a Relu node
+    (read by nothing else) whose own output feeds conv_(i+1)'s own "X"
+    (read by nothing else). This is a POSITION check, not a type
+    allow-list -- a Relu anywhere else is not recognized here, and it is
+    each caller's own job (mirroring `load_conv_pool_chain`'s own
+    "every pool actually present must be used" check) to refuse a Relu
+    node this function did not consume.
+
+    Returns `(chain, relu_after, consumers)`: `chain` is the ordered list
+    of QLinearConv nodes, with `len(chain) == len(convs)` always -- fewer
     would mean the given convs do not form one single linear chain
     (branching, a second chain, or a disconnected node), which is raised
     HERE as a Refusal rather than returned partially, so both callers
     share one implementation of "is this actually one chain" instead of
     two that could silently drift apart (the same "one copy, not two"
     discipline `_conv_geometry`'s own factoring already follows).
-    `consumers` maps every tensor name in the graph to the list of nodes
-    that read it (built once, over every node, not just the convs) --
-    reused by the caller for its own further lookups past the chain's
-    own last layer.
+    `relu_after[i]`, if present, is the Relu node between `chain[i]` and
+    `chain[i + 1]` (never present for `i == len(chain) - 1`, since
+    nothing follows the chain's own last layer here). `consumers` maps
+    every tensor name in the graph to the list of nodes that read it
+    (built once, over every node, not just the convs) -- reused by the
+    caller for its own further lookups past the chain's own last layer.
     """
     producer = {n.output[0]: n for n in convs}
     consumers = {}
@@ -1736,32 +1748,64 @@ def _discover_conv_chain(graph, convs):
             if inp:
                 consumers.setdefault(inp, []).append(n)
 
-    starts = [n for n in convs if n.input[0] not in producer]
+    def feeder_conv(x_name):
+        """The conv (in `convs`) that feeds `x_name`, directly or through
+        exactly one Relu hop -- or None if neither."""
+        if x_name in producer:
+            return producer[x_name]
+        relu_producer = {n.output[0]: n for n in graph.node
+                        if n.op_type == "Relu"}
+        relu = relu_producer.get(x_name)
+        if relu is not None and relu.input[0] in producer:
+            return producer[relu.input[0]]
+        return None
+
+    starts = [n for n in convs if feeder_conv(n.input[0]) is None]
     if len(starts) != 1:
         raise Refusal(
             f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
-            f"activation is not another {ACCEPTED_CONV_OP}'s output; a "
-            f"single linear chain has exactly one such node (its own "
-            f"first layer) -- {len(starts)} means either a disconnected "
-            f"graph or more than one chain. Nothing emitted.")
+            f"activation is not another {ACCEPTED_CONV_OP}'s output "
+            f"(directly, or through one Relu hop); a single linear chain "
+            f"has exactly one such node (its own first layer) -- "
+            f"{len(starts)} means either a disconnected graph or more "
+            f"than one chain. Nothing emitted.")
 
     chain = [starts[0]]
+    relu_after = {}
     seen_ids = {id(starts[0])}
     current = starts[0]
     while len(chain) < len(convs):
         out = current.output[0]
         readers = consumers.get(out, [])
-        conv_readers = [r for r in readers if r.op_type == ACCEPTED_CONV_OP]
-        if (len(readers) != 1 or len(conv_readers) != 1
-                or conv_readers[0].input[0] != out):
+        idx = len(chain) - 1
+
+        if (len(readers) == 1 and readers[0].op_type == ACCEPTED_CONV_OP
+                and readers[0].input[0] == out):
+            nxt = readers[0]
+        elif len(readers) == 1 and readers[0].op_type == "Relu":
+            relu_node = readers[0]
+            relu_readers = consumers.get(relu_node.output[0], [])
+            if (len(relu_readers) != 1
+                    or relu_readers[0].op_type != ACCEPTED_CONV_OP
+                    or relu_readers[0].input[0] != relu_node.output[0]):
+                raise Refusal(
+                    f"Relu '{relu_node.name or 'Relu'}''s own output is "
+                    f"not read as exactly one {ACCEPTED_CONV_OP}'s own "
+                    f"activation ({len(relu_readers)} total reader(s) "
+                    f"found). A chain must be linear -- no branching, no "
+                    f"extra consumers. Nothing emitted.")
+            relu_after[idx] = relu_node
+            nxt = relu_readers[0]
+        else:
             raise Refusal(
                 f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
                 f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
-                f"own activation ({len(readers)} total reader(s) found). "
-                f"A chain must be linear -- no branching, no extra "
-                f"consumers, no non-conv reader before its own last "
-                f"layer. Nothing emitted.")
-        nxt = conv_readers[0]
+                f"own activation, directly or through one Relu hop "
+                f"({len(readers)} total reader(s) found). A chain must "
+                f"be linear -- no branching, no extra consumers, no "
+                f"non-conv/non-Relu reader before its own last layer. "
+                f"Nothing emitted.")
+
         if id(nxt) in seen_ids:
             raise Refusal(
                 f"the {ACCEPTED_CONV_OP} chain forms a cycle. Nothing "
@@ -1770,7 +1814,7 @@ def _discover_conv_chain(graph, convs):
         seen_ids.add(id(nxt))
         current = nxt
 
-    return chain, consumers
+    return chain, relu_after, consumers
 
 
 def load_conv_chain(model):
@@ -1780,9 +1824,15 @@ def load_conv_chain(model):
     conv_i's own "Y" feeding conv_(i+1)'s own "X" with no bridge node
     between them (see this section's own module header for why).
 
+    A `Relu` node is accepted directly between two consecutive conv
+    layers -- see `_discover_conv_chain`'s own docstring for the exact
+    position recognized and why it is exact (the same `zero_point == 0`
+    argument the matmul-chain side's own `_strip_optional_relu` already
+    established).
+
     Returns (conv_nodes, weights2d, x_name, x_shape, conv_params,
     x_zero_point, trailing_requantize, per_channel_requantize, bias,
-    uint8_output_shifted, bridge_scales) where:
+    uint8_output_shifted, bridge_scales, relu_bridges) where:
 
     - `conv_nodes` is the chain's own QLinearConv nodes, in execution
       order.
@@ -1812,13 +1862,17 @@ def load_conv_chain(model):
       positive cim.requantize scale -- see this section's own module
       header for the derivation and why no cross-layer validation is
       needed.
+    - `relu_bridges` is a set of bridge indices with a `Relu` -- pass it
+      straight through to `emit.emit_conv_chain_module`'s own same-named
+      parameter.
 
     Raises Refusal for anything outside this function's own scope (see
     this section's own module header): fewer than two QLinearConv nodes,
-    any non-conv node in the graph, a branching/cyclic/disconnected
-    "chain", a non-zero y_zero_point/per-channel w_scale/bias on any
-    layer but the last, or a non-zero x_zero_point on any layer but the
-    first.
+    any node in the graph that is not a QLinearConv or (directly between
+    two consecutive QLinearConv nodes) a Relu, a branching/cyclic/
+    disconnected "chain", a non-zero y_zero_point/per-channel w_scale/
+    bias on any layer but the last, or a non-zero x_zero_point on any
+    layer but the first.
     """
     from onnx import numpy_helper
 
@@ -1827,6 +1881,7 @@ def load_conv_chain(model):
     initializers = _tensor_names(model)
 
     convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
+    relus = [n for n in graph.node if n.op_type == "Relu"]
     if len(convs) < 2:
         raise Refusal(
             f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); load_conv_chain "
@@ -1835,20 +1890,38 @@ def load_conv_chain(model):
             f"convolution feeding MatMulInteger layers, instead. Nothing "
             f"emitted.")
 
-    others = [n for n in graph.node if n.op_type != ACCEPTED_CONV_OP]
+    others = [n for n in graph.node
+             if n.op_type not in (ACCEPTED_CONV_OP, "Relu")]
     if others:
         kinds = sorted({n.op_type for n in others})
         raise Refusal(
             f"graph also contains {', '.join(kinds)}. A chain of "
             f"{ACCEPTED_CONV_OP} nodes needs no bridge node between layers "
             f"(unlike a {ACCEPTED_CONV_OP} chained into {ACCEPTED_OP}, or a "
-            f"chain of {ACCEPTED_OP} layers) -- conv_i's own \"Y\" feeds "
-            f"conv_(i+1)'s own \"X\" directly, both natively [N, C, H, W] "
-            f"per the ONNX spec. Nothing emitted.")
+            f"chain of {ACCEPTED_OP} layers) beyond an optional Relu "
+            f"directly between two consecutive layers -- conv_i's own "
+            f"\"Y\" feeds conv_(i+1)'s own \"X\" directly (or through "
+            f"that one Relu), both natively [N, C, H, W] per the ONNX "
+            f"spec. Nothing emitted.")
 
     # `_unused_consumers`: nothing downstream of a pure conv chain's own
     # last layer is validated except the graph output check below.
-    chain, _unused_consumers = _discover_conv_chain(graph, convs)
+    chain, relu_after, _unused_consumers = _discover_conv_chain(graph, convs)
+
+    # Every Relu actually present in the graph must be USED, at a
+    # position _discover_conv_chain recognized -- exactly the same
+    # "every pool actually present must be used" discipline
+    # load_conv_pool_chain's own check below already follows for
+    # MaxPool, so a Relu sitting somewhere this loader does not expect
+    # (branching off the chain, feeding something else) is refused
+    # rather than silently ignored.
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
+        raise Refusal(
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive {ACCEPTED_CONV_OP} "
+            f"layers. Nothing emitted.")
 
     if len(graph.output) != 1:
         raise Refusal(
@@ -2034,9 +2107,10 @@ def load_conv_chain(model):
 
         prev_cout = cout
 
+    relu_bridges = set(relu_after.keys())
     return (chain, weights2d, x_name, x_shape, conv_params, x_zero_point,
            trailing_requantize, per_channel_requantize, bias,
-           uint8_output_shifted, bridge_scales)
+           uint8_output_shifted, bridge_scales, relu_bridges)
 
 
 # ---------------------------------------------------------------------------
@@ -2260,22 +2334,30 @@ def _pool_geometry(node, where):
 
 
 def _discover_conv_pool_chain(graph, convs):
-    """Like `_discover_conv_chain`, but a single MaxPool node may sit
-    directly between two consecutive QLinearConv nodes in the chain:
-    conv_i's own "Y" feeds either conv_(i+1)'s own "X" directly (no pool,
-    exactly `_discover_conv_chain`'s own rule) or a single MaxPool node
-    whose own "Y" feeds conv_(i+1)'s own "X" (a pool step). A SEPARATE
+    """Like `_discover_conv_chain`, but a single MaxPool node, a single
+    Relu node, or a Relu directly followed by a MaxPool, may sit between
+    two consecutive QLinearConv nodes in the chain -- conv_i's own "Y"
+    feeds one of: conv_(i+1)'s own "X" directly (no intermediate node,
+    exactly `_discover_conv_chain`'s own rule), a single Relu whose own
+    output feeds conv_(i+1)'s own "X", a single MaxPool whose own output
+    feeds conv_(i+1)'s own "X", or a Relu whose own output feeds a
+    MaxPool whose own output feeds conv_(i+1)'s own "X" -- matching
+    ONNX's own `Conv -> Relu -> MaxPool -> Conv` node order (Relu THEN
+    Pool only; the reverse order is not recognized here, since ONNX
+    graphs do not produce it and this loader has no need to). A SEPARATE
     function from `_discover_conv_chain`, not a generalization of it in
     place -- see this section's own module header for why.
 
-    Returns `(chain, pool_after, consumers)`: `chain` is exactly
-    `_discover_conv_chain`'s own return -- the ordered QLinearConv nodes,
-    with `len(chain) == len(convs)` always (fewer would mean the given
-    convs do not form one single linear chain, raised HERE as a Refusal).
-    `pool_after[i]`, if present, is the MaxPool node between `chain[i]`
-    and `chain[i + 1]` (never present for `i == len(chain) - 1`, since
-    nothing follows the chain's own last layer here -- see this section's
-    own "pool at the chain's own edges" refusal note). `consumers` maps
+    Returns `(chain, relu_after, pool_after, consumers)`: `chain` is
+    exactly `_discover_conv_chain`'s own return -- the ordered
+    QLinearConv nodes, with `len(chain) == len(convs)` always (fewer
+    would mean the given convs do not form one single linear chain,
+    raised HERE as a Refusal). `relu_after[i]`/`pool_after[i]`, if
+    present, are the Relu/MaxPool node between `chain[i]` and
+    `chain[i + 1]` (never present for `i == len(chain) - 1`, since
+    nothing follows the chain's own last layer here -- see this
+    section's own "pool at the chain's own edges" refusal note; the
+    same holds for Relu, by the identical argument). `consumers` maps
     every tensor name in the graph to the list of nodes that read it.
     """
     producer = {out: n for n in graph.node for out in n.output}
@@ -2286,19 +2368,26 @@ def _discover_conv_pool_chain(graph, convs):
             if inp:
                 consumers.setdefault(inp, []).append(n)
 
+    def is_conv(n):
+        return n is not None and n.op_type == ACCEPTED_CONV_OP and id(n) in conv_ids
+
     def feeder_conv(x_name):
-        """The conv (in `convs`) that feeds `x_name`, directly or through
-        exactly one MaxPool hop -- or None if neither."""
+        """The conv (in `convs`) that feeds `x_name`, directly, through
+        one Relu hop, through one MaxPool hop, or through Relu-then-
+        MaxPool -- or None if none of those apply."""
         prod = producer.get(x_name)
-        if prod is None:
-            return None
-        if prod.op_type == ACCEPTED_CONV_OP and id(prod) in conv_ids:
+        if is_conv(prod):
             return prod
-        if prod.op_type == ACCEPTED_POOL_OP:
+        if prod is not None and prod.op_type == "Relu":
             prod2 = producer.get(prod.input[0])
-            if (prod2 is not None and prod2.op_type == ACCEPTED_CONV_OP
-                    and id(prod2) in conv_ids):
+            return prod2 if is_conv(prod2) else None
+        if prod is not None and prod.op_type == ACCEPTED_POOL_OP:
+            prod2 = producer.get(prod.input[0])
+            if is_conv(prod2):
                 return prod2
+            if prod2 is not None and prod2.op_type == "Relu":
+                prod3 = producer.get(prod2.input[0])
+                return prod3 if is_conv(prod3) else None
         return None
 
     starts = [n for n in convs if feeder_conv(n.input[0]) is None]
@@ -2306,12 +2395,37 @@ def _discover_conv_pool_chain(graph, convs):
         raise Refusal(
             f"found {len(starts)} {ACCEPTED_CONV_OP} node(s) whose own "
             f"activation is not another {ACCEPTED_CONV_OP}'s output "
-            f"(directly, or through one {ACCEPTED_POOL_OP} hop); a "
-            f"single linear chain has exactly one such node (its own "
-            f"first layer) -- {len(starts)} means either a disconnected "
-            f"graph or more than one chain. Nothing emitted.")
+            f"(directly, through one Relu hop, through one "
+            f"{ACCEPTED_POOL_OP} hop, or through Relu then "
+            f"{ACCEPTED_POOL_OP}); a single linear chain has exactly one "
+            f"such node (its own first layer) -- {len(starts)} means "
+            f"either a disconnected graph or more than one chain. "
+            f"Nothing emitted.")
+
+    def one_conv_reader(out, owner_label):
+        """`consumers[out]`, validated as exactly one QLinearConv (in
+        `convs`) reading its own activation from `out` -- shared by every
+        "does this edge terminate at the next conv layer" check below."""
+        readers = consumers.get(out, [])
+        if (len(readers) != 1 or not is_conv(readers[0])
+                or readers[0].input[0] != out):
+            raise Refusal(
+                f"{owner_label}'s own output is not read as exactly one "
+                f"{ACCEPTED_CONV_OP}'s own activation ({len(readers)} "
+                f"total reader(s) found). A chain must be linear -- no "
+                f"branching, no extra consumers. Nothing emitted.")
+        return readers[0]
+
+    def check_no_indices_consumer(pool_node):
+        if (len(pool_node.output) > 1 and pool_node.output[1]
+                and consumers.get(pool_node.output[1])):
+            raise Refusal(
+                f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}' "
+                f"has a consumed Indices output; this front end never "
+                f"produces one. Nothing emitted.")
 
     chain = [starts[0]]
+    relu_after = {}
     pool_after = {}
     seen_ids = {id(starts[0])}
     current = starts[0]
@@ -2320,39 +2434,41 @@ def _discover_conv_pool_chain(graph, convs):
         readers = consumers.get(out, [])
         idx = len(chain) - 1
 
-        if (len(readers) == 1 and readers[0].op_type == ACCEPTED_CONV_OP
-                and readers[0].input[0] == out):
+        if len(readers) == 1 and is_conv(readers[0]) and readers[0].input[0] == out:
             nxt = readers[0]
-        elif (len(readers) == 1 and readers[0].op_type == ACCEPTED_POOL_OP):
+        elif len(readers) == 1 and readers[0].op_type == "Relu":
+            relu_node = readers[0]
+            relu_readers = consumers.get(relu_node.output[0], [])
+            if len(relu_readers) == 1 and relu_readers[0].op_type == ACCEPTED_POOL_OP:
+                pool_node = relu_readers[0]
+                check_no_indices_consumer(pool_node)
+                nxt = one_conv_reader(
+                    pool_node.output[0],
+                    f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}'")
+                relu_after[idx] = relu_node
+                pool_after[idx] = pool_node
+            else:
+                nxt = one_conv_reader(
+                    relu_node.output[0],
+                    f"Relu '{relu_node.name or 'Relu'}'")
+                relu_after[idx] = relu_node
+        elif len(readers) == 1 and readers[0].op_type == ACCEPTED_POOL_OP:
             pool_node = readers[0]
-            pool_readers = consumers.get(pool_node.output[0], [])
-            if (len(pool_readers) != 1
-                    or pool_readers[0].op_type != ACCEPTED_CONV_OP
-                    or pool_readers[0].input[0] != pool_node.output[0]):
-                raise Refusal(
-                    f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}''s "
-                    f"own output is not read as exactly one "
-                    f"{ACCEPTED_CONV_OP}'s own activation "
-                    f"({len(pool_readers)} total reader(s) found). A chain "
-                    f"must be linear -- no branching, no extra consumers. "
-                    f"Nothing emitted.")
-            if (len(pool_node.output) > 1 and pool_node.output[1]
-                    and consumers.get(pool_node.output[1])):
-                raise Refusal(
-                    f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}' "
-                    f"has a consumed Indices output; this front end never "
-                    f"produces one. Nothing emitted.")
+            check_no_indices_consumer(pool_node)
+            nxt = one_conv_reader(
+                pool_node.output[0],
+                f"{ACCEPTED_POOL_OP} '{pool_node.name or ACCEPTED_POOL_OP}'")
             pool_after[idx] = pool_node
-            nxt = pool_readers[0]
         else:
             raise Refusal(
                 f"node '{current.name or ACCEPTED_CONV_OP}''s own output "
                 f"is not read as exactly one other {ACCEPTED_CONV_OP}'s "
-                f"own activation, directly or through one "
-                f"{ACCEPTED_POOL_OP} hop ({len(readers)} total reader(s) "
-                f"found). A chain must be linear -- no branching, no "
-                f"extra consumers, no non-conv/non-pool reader before its "
-                f"own last layer. Nothing emitted.")
+                f"own activation, directly, through one Relu hop, "
+                f"through one {ACCEPTED_POOL_OP} hop, or through Relu "
+                f"then {ACCEPTED_POOL_OP} ({len(readers)} total "
+                f"reader(s) found). A chain must be linear -- no "
+                f"branching, no extra consumers, no other reader before "
+                f"its own last layer. Nothing emitted.")
 
         if id(nxt) in seen_ids:
             raise Refusal(
@@ -2362,7 +2478,7 @@ def _discover_conv_pool_chain(graph, convs):
         seen_ids.add(id(nxt))
         current = nxt
 
-    return chain, pool_after, consumers
+    return chain, relu_after, pool_after, consumers
 
 
 def load_conv_pool_chain(model):
@@ -2377,23 +2493,32 @@ def load_conv_pool_chain(model):
     x_zero_point. A MaxPool between two layers changes neither of those --
     see this section's own module header for why.
 
+    A `Relu` node is accepted the same way `load_conv_chain` accepts one
+    (directly between two consecutive conv layers), and additionally
+    directly before a MaxPool in that same position -- ONNX's own
+    `Conv -> Relu -> MaxPool -> Conv` order; see
+    `_discover_conv_pool_chain`'s own docstring for the exact positions
+    recognized.
+
     Returns (conv_nodes, weights2d, x_name, x_shape, conv_params,
     x_zero_point, trailing_requantize, per_channel_requantize, bias,
-    uint8_output_shifted, bridge_scales, pool_params) where every entry
-    but the last is exactly `load_conv_chain`'s own (pass straight
-    through to `emit.emit_conv_chain_module`'s own same-named
+    uint8_output_shifted, bridge_scales, pool_params, relu_bridges) where
+    every entry but the last two is exactly `load_conv_chain`'s own (pass
+    straight through to `emit.emit_conv_chain_module`'s own same-named
     parameters). `pool_params` is a `{bridge_index: geometry}` dict, one
     entry per MaxPool actually present in the chain -- exactly
     `emit_conv_chain_module`'s own `pool_params` parameter, pass it
-    straight through too.
+    straight through too. `relu_bridges` is a set of bridge indices with
+    a Relu -- exactly `emit_conv_chain_module`'s own `relu_bridges`
+    parameter.
 
     Raises Refusal for anything outside this function's own scope: fewer
     than two QLinearConv nodes, any node in the graph that is not a
-    QLinearConv or (between two consecutive QLinearConv nodes) a MaxPool,
-    a branching/cyclic/disconnected chain, a MaxPool outside this
-    function's own restricted geometry (see `_pool_geometry`), or
-    anything `load_conv_chain` would itself refuse on its own conv
-    layers.
+    QLinearConv, a Relu, or (between two consecutive QLinearConv nodes,
+    optionally after that Relu) a MaxPool, a branching/cyclic/
+    disconnected chain, a MaxPool outside this function's own restricted
+    geometry (see `_pool_geometry`), or anything `load_conv_chain` would
+    itself refuse on its own conv layers.
     """
     from onnx import numpy_helper
 
@@ -2403,6 +2528,7 @@ def load_conv_pool_chain(model):
 
     convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
     pools = [n for n in graph.node if n.op_type == ACCEPTED_POOL_OP]
+    relus = [n for n in graph.node if n.op_type == "Relu"]
     if len(convs) < 2:
         raise Refusal(
             f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); "
@@ -2417,24 +2543,25 @@ def load_conv_pool_chain(model):
             f"emitted.")
 
     others = [n for n in graph.node
-             if n.op_type not in (ACCEPTED_CONV_OP, ACCEPTED_POOL_OP)]
+             if n.op_type not in (ACCEPTED_CONV_OP, ACCEPTED_POOL_OP, "Relu")]
     if others:
         kinds = sorted({n.op_type for n in others})
         raise Refusal(
             f"graph also contains {', '.join(kinds)}. A "
             f"{ACCEPTED_CONV_OP} chain with pooling needs no bridge node "
-            f"between conv layers, and a {ACCEPTED_POOL_OP} needs no "
-            f"quantization node of its own (max is scale-invariant -- see "
-            f"this section's own module header). Nothing emitted.")
+            f"between conv layers beyond an optional Relu, and a "
+            f"{ACCEPTED_POOL_OP} needs no quantization node of its own "
+            f"(max is scale-invariant -- see this section's own module "
+            f"header). Nothing emitted.")
 
-    chain, pool_after, _unused_consumers = _discover_conv_pool_chain(
-        graph, convs)
+    chain, relu_after, pool_after, _unused_consumers = (
+        _discover_conv_pool_chain(graph, convs))
 
-    # Every MaxPool actually present in the graph must be USED, at a
-    # position `_discover_conv_pool_chain` recognized -- otherwise a
-    # legitimate-looking pool sitting somewhere this loader does not
-    # expect (branching off the chain, say) would be silently ignored
-    # rather than refused.
+    # Every MaxPool AND every Relu actually present in the graph must be
+    # USED, at a position `_discover_conv_pool_chain` recognized --
+    # otherwise a legitimate-looking node sitting somewhere this loader
+    # does not expect (branching off the chain, say) would be silently
+    # ignored rather than refused.
     used_pool_ids = {id(p) for p in pool_after.values()}
     unused_pools = [p for p in pools if id(p) not in used_pool_ids]
     if unused_pools:
@@ -2442,6 +2569,13 @@ def load_conv_pool_chain(model):
             f"{len(unused_pools)} {ACCEPTED_POOL_OP} node(s) are not "
             f"positioned directly between two consecutive chain layers "
             f"this loader discovered. Nothing emitted.")
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
+        raise Refusal(
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive chain layers this loader "
+            f"discovered. Nothing emitted.")
 
     if len(graph.output) != 1:
         raise Refusal(
@@ -2627,9 +2761,10 @@ def load_conv_pool_chain(model):
 
         prev_cout = cout
 
+    relu_bridges = set(relu_after.keys())
     return (chain, weights2d, x_name, x_shape, conv_params, x_zero_point,
            trailing_requantize, per_channel_requantize, bias,
-           uint8_output_shifted, bridge_scales, pool_params)
+           uint8_output_shifted, bridge_scales, pool_params, relu_bridges)
 
 
 # ---------------------------------------------------------------------------
@@ -2665,8 +2800,15 @@ def load_conv_chain_matmul_chain(model):
     between a SINGLE conv and its first matmul -- generalized here to the
     chain's own LAST conv layer (see this section's own module header).
 
+    A `Relu` node is accepted directly between two consecutive conv
+    layers, exactly `load_conv_chain`'s own acceptance (see
+    `_discover_conv_chain`'s own docstring) -- NOT yet between the
+    chain's own last conv and the matmul tail, nor between matmul
+    layers; both remain out of scope here.
+
     Returns (conv_nodes, matmul_nodes, weights2d, x_name, x_shape,
-    conv_params, x_zero_point, matmul_weights, bridge_scales) where:
+    conv_params, x_zero_point, matmul_weights, bridge_scales,
+    relu_bridges) where:
 
     - `conv_nodes`/`weights2d`/`conv_params`/`x_name`/`x_shape`/
       `x_zero_point` are exactly load_conv_chain's own shapes (see its
@@ -2701,6 +2843,7 @@ def load_conv_chain_matmul_chain(model):
 
     convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
     matmul_nodes = [n for n in graph.node if n.op_type == ACCEPTED_OP]
+    relus = [n for n in graph.node if n.op_type == "Relu"]
     if len(convs) < 2:
         raise Refusal(
             f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); "
@@ -2716,7 +2859,7 @@ def load_conv_chain_matmul_chain(model):
             f"standalone convolution chain instead. Nothing emitted.")
 
     allowed = {ACCEPTED_CONV_OP, ACCEPTED_OP, "Cast", "QuantizeLinear",
-              "Transpose", "Reshape"}
+              "Transpose", "Reshape", "Relu"}
     others = [n for n in graph.node if n.op_type not in allowed]
     if others:
         kinds = sorted({n.op_type for n in others})
@@ -2724,13 +2867,25 @@ def load_conv_chain_matmul_chain(model):
             f"graph also contains {', '.join(kinds)}. A "
             f"{ACCEPTED_CONV_OP} chain feeding {ACCEPTED_OP} layers may "
             f"only be bridged, between conv layers, by nothing at all "
-            f"(conv_i's own \"Y\" feeds conv_(i+1)'s own \"X\" directly), "
-            f"between the chain's own last conv and the first matmul by "
-            f"Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]), and "
-            f"between matmul layers by Cast(to=float32) -> "
-            f"QuantizeLinear. Nothing emitted.")
+            f"(conv_i's own \"Y\" feeds conv_(i+1)'s own \"X\" directly) "
+            f"or one Relu, between the chain's own last conv and the "
+            f"first matmul by Transpose(perm=[0, 2, 3, 1]) -> "
+            f"Reshape([M, Cout]), and between matmul layers by "
+            f"Cast(to=float32) -> QuantizeLinear. Nothing emitted.")
 
-    chain, consumers = _discover_conv_chain(graph, convs)
+    chain, relu_after, consumers = _discover_conv_chain(graph, convs)
+
+    # Every Relu actually present must be USED at a position
+    # _discover_conv_chain recognized -- exactly load_conv_chain's own
+    # same check.
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
+        raise Refusal(
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive {ACCEPTED_CONV_OP} "
+            f"layers. Nothing emitted.")
+
     producer = {out: n for n in graph.node for out in n.output}
 
     x_name = None
@@ -3018,8 +3173,9 @@ def load_conv_chain_matmul_chain(model):
         matmul_weights.append(np.ascontiguousarray(mm_weight.T))
         prev_n = mm_weight.shape[1]
 
+    relu_bridges = set(relu_after.keys())
     return (chain, matmul_nodes, weights2d, x_name, x_shape, conv_params,
-           x_zero_point, matmul_weights, bridge_scales)
+           x_zero_point, matmul_weights, bridge_scales, relu_bridges)
 
 
 # ---------------------------------------------------------------------------
@@ -3056,7 +3212,7 @@ def load_conv_chain_matmul_chain(model):
 def load_conv_pool_chain_matmul_chain(model):
     """load_conv_pool_chain_matmul_chain(model) -> (chain, matmul_nodes,
     weights2d, x_name, x_shape, conv_params, x_zero_point, matmul_weights,
-    bridge_scales, pool_params).
+    bridge_scales, pool_params, relu_bridges).
 
     Every conv-portion entry is exactly load_conv_chain_matmul_chain's own
     (same restrictions: every conv layer, including the last, needs
@@ -3067,16 +3223,24 @@ def load_conv_pool_chain_matmul_chain(model):
     present, where bridge_index == len(chain) - 1 means the pool sits
     between the chain's own last conv and the matmul bridge (a shape
     load_conv_pool_chain itself never produces, since it has no bridge to
-    sit before). Pass every return value straight through to
-    emit.emit_conv_chain_module.
+    sit before). `relu_bridges` is a set of bridge indices with a Relu --
+    exactly `emit_conv_chain_module`'s own `relu_bridges` parameter --
+    but ONLY for the interior conv-conv positions
+    `_discover_conv_pool_chain` recognizes (the same Relu/MaxPool
+    ordering `load_conv_pool_chain` accepts); a Relu directly before the
+    matmul bridge (the one trailing position this function adds pooling
+    support for, above) is not yet recognized, matching
+    `load_conv_chain_matmul_chain`'s own identical scope note. Pass every
+    return value straight through to emit.emit_conv_chain_module.
 
     Raises Refusal for anything outside this function's own scope: fewer
     than two QLinearConv nodes, no MatMulInteger node, no MaxPool node (use
     load_conv_pool_chain, load_conv_matmul_chain, or
     load_conv_chain_matmul_chain respectively instead), a pool outside
     `_discover_conv_pool_chain`'s own recognized positions or the one
-    additional trailing position this function adds, or anything either
-    composed function would itself refuse on its own layers.
+    additional trailing position this function adds, a Relu outside
+    `_discover_conv_pool_chain`'s own recognized positions, or anything
+    either composed function would itself refuse on its own layers.
     """
     from onnx import numpy_helper
 
@@ -3087,6 +3251,7 @@ def load_conv_pool_chain_matmul_chain(model):
     convs = [n for n in graph.node if n.op_type == ACCEPTED_CONV_OP]
     matmul_nodes = [n for n in graph.node if n.op_type == ACCEPTED_OP]
     pools = [n for n in graph.node if n.op_type == ACCEPTED_POOL_OP]
+    relus = [n for n in graph.node if n.op_type == "Relu"]
     if len(convs) < 2:
         raise Refusal(
             f"found {len(convs)} {ACCEPTED_CONV_OP} node(s); "
@@ -3106,7 +3271,7 @@ def load_conv_pool_chain_matmul_chain(model):
             f"emitted.")
 
     allowed = {ACCEPTED_CONV_OP, ACCEPTED_OP, ACCEPTED_POOL_OP, "Cast",
-              "QuantizeLinear", "Transpose", "Reshape"}
+              "QuantizeLinear", "Transpose", "Reshape", "Relu"}
     others = [n for n in graph.node if n.op_type not in allowed]
     if others:
         kinds = sorted({n.op_type for n in others})
@@ -3114,14 +3279,16 @@ def load_conv_pool_chain_matmul_chain(model):
             f"graph also contains {', '.join(kinds)}. A "
             f"{ACCEPTED_CONV_OP} chain with pooling, feeding "
             f"{ACCEPTED_OP} layers, may only be bridged, between conv "
-            f"layers, by nothing at all or by one {ACCEPTED_POOL_OP} "
+            f"layers, by nothing at all, one Relu, one {ACCEPTED_POOL_OP} "
             f"(no quantization node of its own -- max is scale-invariant), "
-            f"between the chain's own last conv (or a trailing pool after "
-            f"it) and the first matmul by Transpose(perm=[0, 2, 3, 1]) -> "
+            f"or Relu then {ACCEPTED_POOL_OP}, between the chain's own "
+            f"last conv (or a trailing pool after it) and the first "
+            f"matmul by Transpose(perm=[0, 2, 3, 1]) -> "
             f"Reshape([M, Cout]), and between matmul layers by "
             f"Cast(to=float32) -> QuantizeLinear. Nothing emitted.")
 
-    chain, pool_after, consumers = _discover_conv_pool_chain(graph, convs)
+    chain, relu_after, pool_after, consumers = _discover_conv_pool_chain(
+        graph, convs)
     producer = {out: n for n in graph.node for out in n.output}
 
     # The one position _discover_conv_pool_chain never considers: a pool
@@ -3157,6 +3324,14 @@ def load_conv_pool_chain_matmul_chain(model):
             f"positioned directly between two consecutive chain layers, "
             f"or between the chain's own last layer and the matmul "
             f"bridge, that this loader discovered. Nothing emitted.")
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
+        raise Refusal(
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive chain layers this loader "
+            f"discovered (a Relu directly before the matmul bridge is "
+            f"not yet recognized). Nothing emitted.")
 
     # pool_params, exactly load_conv_pool_chain's own construction --
     # computed here, before the per-layer loop below, since _pool_geometry
@@ -3459,8 +3634,10 @@ def load_conv_pool_chain_matmul_chain(model):
         matmul_weights.append(np.ascontiguousarray(mm_weight.T))
         prev_n = mm_weight.shape[1]
 
+    relu_bridges = set(relu_after.keys())
     return (chain, matmul_nodes, weights2d, x_name, x_shape, conv_params,
-           x_zero_point, matmul_weights, bridge_scales, pool_params)
+           x_zero_point, matmul_weights, bridge_scales, pool_params,
+           relu_bridges)
 
 
 def _validate_conv_activation(activation, x_shape, x_zero_point=0):
@@ -3651,8 +3828,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
 
     if conv_count >= 2 and matmul_count >= 1 and pool_count >= 1:
         (conv_nodes, matmul_nodes, weights2d, x_name, x_shape, conv_params,
-         x_zero_point, matmul_weights, bridge_scales, pool_params) = (
-            load_conv_pool_chain_matmul_chain(model))
+         x_zero_point, matmul_weights, bridge_scales, pool_params,
+         relu_bridges) = load_conv_pool_chain_matmul_chain(model)
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
 
@@ -3681,11 +3858,12 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             weights2d + matmul_weights, conv_params_padded, patches0,
             out_shape0, weight_syms=weight_syms, act_sym=act_sym,
             header=header, scales=bridge_scales,
-            n_conv_layers=len(conv_nodes), pool_params=pool_params)
+            n_conv_layers=len(conv_nodes), pool_params=pool_params,
+            relu_bridges=relu_bridges)
 
     if conv_count >= 2 and matmul_count >= 1:
         (conv_nodes, matmul_nodes, weights2d, x_name, x_shape, conv_params,
-         x_zero_point, matmul_weights, bridge_scales) = (
+         x_zero_point, matmul_weights, bridge_scales, relu_bridges) = (
             load_conv_chain_matmul_chain(model))
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
@@ -3718,12 +3896,12 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             weights2d + matmul_weights, conv_params_padded, patches0,
             out_shape0, weight_syms=weight_syms, act_sym=act_sym,
             header=header, scales=bridge_scales,
-            n_conv_layers=len(conv_nodes))
+            n_conv_layers=len(conv_nodes), relu_bridges=relu_bridges)
 
     if matmul_count == 0 and conv_count >= 2 and pool_count >= 1:
         (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
          trailing_requantize, per_channel_requantize, bias,
-         uint8_output_shifted, bridge_scales, pool_params) = (
+         uint8_output_shifted, bridge_scales, pool_params, relu_bridges) = (
             load_conv_pool_chain(model))
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
@@ -3759,12 +3937,13 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             scales=bridge_scales, last_bias=bias,
             last_trailing_requantize=trailing_requantize,
             last_per_channel_requantize=per_channel_requantize,
-            pool_params=pool_params)
+            pool_params=pool_params, relu_bridges=relu_bridges)
 
     if matmul_count == 0 and conv_count >= 2:
         (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
          trailing_requantize, per_channel_requantize, bias,
-         uint8_output_shifted, bridge_scales) = load_conv_chain(model)
+         uint8_output_shifted, bridge_scales, relu_bridges) = (
+            load_conv_chain(model))
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
 
@@ -3797,7 +3976,8 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             weight_syms=weight_syms, act_sym=act_sym, header=header,
             scales=bridge_scales, last_bias=bias,
             last_trailing_requantize=trailing_requantize,
-            last_per_channel_requantize=per_channel_requantize)
+            last_per_channel_requantize=per_channel_requantize,
+            relu_bridges=relu_bridges)
 
     if matmul_count == 0 and conv_count >= 1:
         (node, weight2d, x_name, x_shape, conv_params, x_zero_point,

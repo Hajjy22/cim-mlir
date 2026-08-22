@@ -179,6 +179,32 @@ def test_a_wrong_weight_in_the_matmul_layer_would_actually_be_caught(
     assert np.array_equal(outputs, want)
 
 
+def test_a_relu_between_two_convs_feeding_a_matmul_matches_the_reference(
+        cim_opt, cim_run):
+    # Relu on the interior conv-conv bridge, reused unchanged from
+    # load_conv_chain's own acceptance (see _discover_conv_chain) --
+    # this loader's own matmul tail is untouched by it.
+    rng = np.random.default_rng(SEED + 85)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], relu_after={0})
+    no_relu_model = conv_chain_matmul_chain_model([w0, w1], x_shape, [mm_w])
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
 # --- refusals ------------------------------------------------------------
 
 def test_refuses_a_missing_transpose_reshape_bridge_after_the_chain():

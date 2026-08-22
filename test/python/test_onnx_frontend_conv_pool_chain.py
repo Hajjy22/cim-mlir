@@ -329,6 +329,91 @@ def test_a_wrong_weight_after_the_pool_would_actually_be_caught(
     assert np.array_equal(outputs, want)
 
 
+# --- Relu, alone and composed with a pool -----------------------------------
+
+def test_a_relu_between_two_convs_with_no_pool_matches_the_reference(
+        cim_opt, cim_run):
+    # Relu on its own (no pool at this bridge) inside a loader whose own
+    # scope is "conv chain WITH pooling somewhere" -- proves relu_after
+    # is tracked independently of pool_after, not only reachable when a
+    # pool is also present at the SAME bridge.
+    rng = np.random.default_rng(SEED + 82)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    w2 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    # bridge 0: Relu only. bridge 1: MaxPool only (so this graph still
+    # qualifies for load_conv_pool_chain -- at least one pool required).
+    model = conv_pool_chain_model(
+        [w0, w1, w2], x_shape, pools={1: dict(kernel_shape=(2, 2))},
+        relu_after={0})
+    no_relu_model = conv_pool_chain_model(
+        [w0, w1, w2], x_shape, pools={1: dict(kernel_shape=(2, 2))})
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_a_conv_relu_maxpool_conv_chain_matches_the_reference(cim_opt,
+                                                              cim_run):
+    # THE two-intermediate-node case: Relu directly followed by MaxPool
+    # at the SAME bridge -- ONNX's own Conv -> Relu -> MaxPool -> Conv
+    # order, and the highest-risk new code path (_discover_conv_pool_
+    # chain's forward walk and feeder_conv back-hop both have to resolve
+    # two hops, not one, to find this bridge's own conv boundaries).
+    rng = np.random.default_rng(SEED + 83)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        relu_after={0})
+    no_relu_model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))})
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled Conv->Relu->MaxPool->Conv output {outputs.tolist()} "
+        f"!= ONNX reference {want.tolist()}")
+
+
+def test_refuses_a_maxpool_then_relu_the_reverse_order():
+    # The order _discover_conv_pool_chain does NOT recognize: MaxPool
+    # THEN Relu (ONNX graphs do not produce this, and this loader has no
+    # need to support it) -- confirms the acceptance above is genuinely
+    # scoped to Relu-then-Pool, not either order.
+    rng = np.random.default_rng(SEED + 84)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 6, 6)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        check=False)
+    stray = onnx_helper.make_node("Relu", ["L0_pool"], ["L0_pool_relu"],
+                                  name="r0")
+    model.graph.node.insert(2, stray)
+    model.graph.node[3].input[0] = "L0_pool_relu"
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="Relu"):
+        import_model(model, act)
+
+
 # --- refusals --------------------------------------------------------------
 
 def test_refuses_a_pool_with_stride_one():

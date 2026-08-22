@@ -212,6 +212,95 @@ def test_a_wrong_weight_in_an_interior_layer_would_actually_be_caught(
     assert np.array_equal(outputs, want)
 
 
+# --- Relu between two convs -------------------------------------------------
+
+def test_a_relu_between_two_convs_matches_the_reference(cim_opt, cim_run):
+    # w0/act chosen so layer 0's raw accumulator has both positive and
+    # negative entries -- otherwise Relu is a no-op and this test would
+    # pass vacuously (see the fixture-assumption assertion below).
+    rng = np.random.default_rng(SEED + 58)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_model([w0, w1], x_shape, relu_after={0})
+    no_relu_model = conv_chain_model([w0, w1], x_shape)
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference for this "
+        "weight/activation pair")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled Relu-between-convs output {outputs.tolist()} != ONNX "
+        f"reference {want.tolist()}")
+
+
+def test_a_missing_relu_between_convs_would_actually_be_caught(cim_opt,
+                                                                cim_run):
+    # Anti-vacuity: compiling WITH relu_after must match onnx.reference's
+    # own Relu output, not the no-Relu one -- proving the compiled module
+    # really emits the reduce_max step rather than it being present in
+    # the IR but inert.
+    rng = np.random.default_rng(SEED + 59)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_model([w0, w1], x_shape, relu_after={0})
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    no_relu_want = onnx_reference_eval(
+        conv_chain_model([w0, w1], x_shape), act, act_name="X")
+    assert not np.array_equal(want, no_relu_want)
+    assert np.array_equal(outputs, want)
+
+
+def test_refuses_a_relu_with_a_stray_extra_reader():
+    # A Relu directly between two convs, but its OWN output is also read
+    # by a stray extra node -- needs buffer-liveness reasoning this
+    # importer does not do, exactly the matmul-chain side's own
+    # equivalent refusal.
+    rng = np.random.default_rng(SEED + 60)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+
+    model = conv_chain_model([w0, w1], x_shape, relu_after={0}, check=False)
+    # A second Relu reading the SAME tensor -- an allowed op TYPE, but a
+    # fan-out _discover_conv_chain's own no-branching rule still refuses,
+    # proving that rule is a real position/liveness check and not merely
+    # a type allow-list.
+    stray = onnx_helper.make_node(
+        "Relu", ["L0_relu"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="2 total reader"):
+        import_model(model, act)
+
+
+def test_refuses_a_disconnected_relu_elsewhere_in_the_graph():
+    # A Relu that is not on any edge _discover_conv_chain walks at all --
+    # reads the graph's own input, feeds nothing -- exercises the
+    # separate "every Relu actually present must be USED" check, not the
+    # position-check the two tests above exercise.
+    rng = np.random.default_rng(SEED + 61)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+
+    model = conv_chain_model([w0, w1], x_shape, check=False)
+    stray = onnx_helper.make_node("Relu", ["X"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly"):
+        import_model(model, act)
+
+
 # --- refusals ------------------------------------------------------------
 
 def test_refuses_a_single_qlinear_conv():
@@ -228,18 +317,23 @@ def test_refuses_a_single_qlinear_conv():
 
 
 def test_refuses_a_stray_non_conv_node():
+    # Relu is now accepted directly between two convs (see the tests
+    # above) -- this checks a genuinely still-unsupported op type in
+    # that exact position, so the "graph also contains ..." refusal is
+    # proven to still fire for real, not just made vacuous by the Relu
+    # acceptance.
     rng = np.random.default_rng(SEED + 57)
     w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
     w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
     x_shape = (1, 2, 4, 4)
 
     model = conv_chain_model([w0, w1], x_shape, check=False)
-    stray = onnx_helper.make_node("Relu", ["L0_Y"], ["L0_Y_relu"], name="r0")
+    stray = onnx_helper.make_node("Sigmoid", ["L0_Y"], ["L0_Y_sig"], name="s0")
     model.graph.node.insert(1, stray)
-    model.graph.node[2].input[0] = "L0_Y_relu"
+    model.graph.node[2].input[0] = "L0_Y_sig"
 
     act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
-    with pytest.raises(Refusal, match="Relu"):
+    with pytest.raises(Refusal, match="Sigmoid"):
         import_model(model, act)
 
 

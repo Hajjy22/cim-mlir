@@ -939,7 +939,8 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                            scales=None, n_conv_layers=None, last_bias=None,
                            last_trailing_requantize=None,
                            last_per_channel_requantize=None,
-                           effective_bits=8, pool_params=None):
+                           effective_bits=8, pool_params=None,
+                           relu_bridges=None):
     """Two or more chained QLinearConv layers -- a REAL MLIR-level im2col
     for every layer after the first, docs/roadmap.md's "chain convolution
     layers" plan, part 2.
@@ -1109,6 +1110,26 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     the run -- an "extra" live map entry until then is not a real leak,
     confirmed clean under the same MLIR+ASan+UBSan configuration CI's
     `mlir-asan` job uses.
+
+    `relu_bridges`, if given, is a set of bridge indices -- the SAME
+    `bridge_index` convention `pool_params` uses, but with no per-index
+    payload (a `Relu` needs no geometry). Bridge i means "apply Relu to
+    layer i's own bridged activation" -- any bridge in the chain, since
+    (unlike a pool) Relu needs nothing beyond the zero_point == 0 every
+    interior bridge already has. Applied right after that bridge's own
+    `cim.requantize` and BEFORE any `pool_params[i]` entry, matching
+    ONNX's own `Conv -> Relu -> MaxPool` node order (also the only order
+    that keeps the emitted IR a faithful statement of the graph -- Relu
+    and a max-pool both reduce via max, so the two orders are numerically
+    identical, confirmed by hand for several inputs before this parameter
+    was written, but ordering the IR to match the graph is still the
+    right default). Emitted as `cim.reduce_max(bridged, zero)` against a
+    fresh zero-filled buffer, exactly `emit_chain_module`'s own
+    `relu_flags` parameter -- see its docstring for why this needs no new
+    dialect capability. Reuses this function's own already-hoisted
+    `%zeroI8` (unconditional here, unlike `emit_chain_module`'s
+    conditional one), so passing an empty or absent `relu_bridges` emits
+    byte-identical text to before this parameter existed.
     """
     weights2d = [np.asarray(w) for w in weights2d]
     patches0 = np.asarray(patches0)
@@ -1159,6 +1180,24 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                 f"of the chain, optionally right after its own last conv "
                 f"layer when a matmul tail follows (0 <= bridge < "
                 f"{max_pool_bridge}). Nothing emitted.")
+    if relu_bridges is None:
+        relu_bridges = set()
+    # Unlike pool_params, Relu has no range restriction beyond "a bridge
+    # exists at all": every bridge this loop ever emits -- conv->conv,
+    # conv->matmul, or matmul->matmul -- already has zero_point == 0,
+    # which is the only thing Relu's own reduce_max(x, 0) composition
+    # needs. The `i == n_layers - 1` branch above breaks before emitting
+    # bridge n_layers - 1 at all (there is no bridge out of the chain's
+    # own last layer), so that is the same upper bound pool_params'
+    # own n_conv_layers check is protecting against silently dropping.
+    max_relu_bridge = n_layers - 1
+    for i in relu_bridges:
+        if not (0 <= i < max_relu_bridge):
+            raise ValueError(
+                f"relu_bridges has an entry for bridge {i}, but this chain "
+                f"only has bridges 0 <= bridge < {max_relu_bridge} -- "
+                f"there is no bridge out of the chain's own last layer. "
+                f"Nothing emitted.")
     if weight_syms is None:
         weight_syms = [f"w{i}" for i in range(n_layers)]
     if len(weight_syms) != n_layers:
@@ -1369,6 +1408,25 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
             f"{float(scales[i])!r} : f32, zero_point = 0 : i32, "
             f"effective_bits = 8 : i32}}")
         lines.append(f"    : memref<{cur_m}x{cout}xi32> -> memref<{cur_m}x{cout}xi8>")
+
+        if i in relu_bridges:
+            # ONNX Relu on this bridge -- exactly emit_chain_module's own
+            # relu_flags composition (see this function's own
+            # relu_bridges docstring): signed max against a fresh
+            # zero-filled buffer, reusing the SAME cim.reduce_max MaxPool
+            # already uses below, and this function's own already-hoisted
+            # %zeroI8 -- no new dialect capability, no new constant.
+            reluBridged_ty = f"memref<{cur_m}x{cout}xi8>"
+            reluZero = fresh("reluZero")
+            lines.append(f"  {reluZero} = memref.alloc() : {reluBridged_ty}")
+            lines.append(
+                f"  linalg.fill ins(%zeroI8 : i8) outs({reluZero} : "
+                f"{reluBridged_ty})")
+            reluVal = fresh("relu")
+            lines.append(
+                f"  {reluVal} = cim.reduce_max {bridged}, {reluZero} : "
+                f"({reluBridged_ty}, {reluBridged_ty}) -> {reluBridged_ty}")
+            bridged = reluVal
 
         if i in pool_params:
             # A MaxPool between this bridge and layer i+1's own gather --

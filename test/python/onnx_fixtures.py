@@ -401,7 +401,7 @@ def conv_chain_model(weights, x_shape, x_scale=1.0, x_zero_point=0,
                      y_scales=None, strides=None, pads=None,
                      dilations=None, last_bias=None,
                      last_y_zero_point=0, last_y_dtype=TensorProto.INT8,
-                     check=True):
+                     relu_after=None, check=True):
     """A chain of two or more QLinearConv nodes, connected DIRECTLY --
     conv_i's own "Y" feeds conv_(i+1)'s own "X" with no bridge node
     between them, the way cim_frontend.onnx_import.load_conv_chain reads
@@ -430,11 +430,23 @@ def conv_chain_model(weights, x_shape, x_scale=1.0, x_zero_point=0,
     build a graph load_conv_chain would refuse defeats the point of a
     "matches the reference" fixture. Only layer 0's `x_zero_point`/
     `x_dtype` are configurable, exactly like qlinear_conv_model's own.
+
+    `relu_after`, if given, is a set of bridge indices -- a Relu node
+    directly between layer i and layer i + 1, the way
+    cim_frontend.onnx_import.load_conv_chain reads (see
+    `_discover_conv_chain`'s own docstring for the exact position).
     """
     weights = [np.asarray(w) for w in weights]
     n_layers = len(weights)
     if n_layers < 2:
         raise ValueError("conv_chain_model needs at least two conv layers")
+    if relu_after is None:
+        relu_after = set()
+    for i in relu_after:
+        if not (0 <= i < n_layers - 1):
+            raise ValueError(
+                f"relu_after has bridge {i}, but this chain only has "
+                f"bridges 0 <= bridge < {n_layers - 1}")
     if w_scales is None:
         w_scales = [1.0] * n_layers
     if y_scales is None:
@@ -533,6 +545,11 @@ def conv_chain_model(weights, x_shape, x_scale=1.0, x_zero_point=0,
             dilations=[dilation_h, dilation_w]))
 
         cur_name = out_name
+        if i in relu_after:
+            relu_out = f"L{i}_relu"
+            nodes.append(helper.make_node(
+                "Relu", [cur_name], [relu_out], name=f"relu{i}"))
+            cur_name = relu_out
         cur_h, cur_w = out_h, out_w
 
     last_cout = weights[-1].shape[0]
@@ -555,7 +572,7 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
                           w_scales=None, y_scales=None, strides=None,
                           pads=None, dilations=None, last_bias=None,
                           last_y_zero_point=0, last_y_dtype=TensorProto.INT8,
-                          check=True):
+                          relu_after=None, check=True):
     """`conv_chain_model`, with a MaxPool optionally sitting between any
     two consecutive QLinearConv layers -- the way
     cim_frontend.onnx_import.load_conv_pool_chain reads (see its own
@@ -575,6 +592,13 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
     to exercise that refusal passes `strides=(1, 1)` explicitly), `pads`
     (default `(0, 0, 0, 0)`), `dilations` (default `(1, 1)`), and
     `ceil_mode` (default 0).
+
+    `relu_after`, if given, is a set of bridge indices -- a Relu node
+    directly between layer i's own Y and bridge i's own pool (if any) or
+    layer i + 1's own X otherwise -- ONNX's own `Conv -> Relu -> MaxPool
+    -> Conv` order, the way
+    cim_frontend.onnx_import.load_conv_pool_chain reads (see
+    `_discover_conv_pool_chain`'s own docstring for the exact positions).
     """
     weights = [np.asarray(w) for w in weights]
     n_layers = len(weights)
@@ -587,6 +611,13 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
                 f"pools has an entry for bridge {i}, which is out of "
                 f"range for {n_layers} layers (0 <= bridge < "
                 f"{n_layers - 1})")
+    if relu_after is None:
+        relu_after = set()
+    for i in relu_after:
+        if not (0 <= i < n_layers - 1):
+            raise ValueError(
+                f"relu_after has bridge {i}, but this chain only has "
+                f"bridges 0 <= bridge < {n_layers - 1}")
     if w_scales is None:
         w_scales = [1.0] * n_layers
     if y_scales is None:
@@ -685,6 +716,11 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
             dilations=[dilation_h, dilation_w]))
 
         cur_name = out_name
+        if i in relu_after:
+            relu_out = f"L{i}_relu"
+            nodes.append(helper.make_node(
+                "Relu", [cur_name], [relu_out], name=f"relu{i}"))
+            cur_name = relu_out
         cur_h, cur_w = out_h, out_w
 
         if i in pools:
@@ -739,7 +775,8 @@ def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
                                   x_dtype=TensorProto.INT8,
                                   conv_w_scales=None, conv_y_scales=None,
                                   strides=None, pads=None, dilations=None,
-                                  bridge_scales=None, check=True):
+                                  bridge_scales=None, relu_after=None,
+                                  check=True):
     """Two or more QLinearConv layers (connected directly, conv_chain_
     model's own convention) feeding one or more MatMulInteger layers via
     the SAME Transpose(perm=[0, 2, 3, 1]) -> Reshape([M, Cout]) bridge
@@ -772,6 +809,13 @@ def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
     if n_conv < 2:
         raise ValueError("conv_chain_matmul_chain_model needs at least "
                          "two conv layers")
+    if relu_after is None:
+        relu_after = set()
+    for i in relu_after:
+        if not (0 <= i < n_conv - 1):
+            raise ValueError(
+                f"relu_after has bridge {i}, but this chain only has "
+                f"conv-conv bridges 0 <= bridge < {n_conv - 1}")
     if conv_w_scales is None:
         conv_w_scales = [1.0] * n_conv
     if conv_y_scales is None:
@@ -868,6 +912,11 @@ def conv_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
             dilations=[dilation_h, dilation_w]))
 
         cur_name = out_name
+        if i in relu_after:
+            relu_out = f"L{i}_relu"
+            nodes.append(helper.make_node(
+                "Relu", [cur_name], [relu_out], name=f"relu{i}"))
+            cur_name = relu_out
         cur_h, cur_w = out_h, out_w
         last_cout = cout
 
@@ -928,7 +977,7 @@ def conv_pool_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
                                        conv_w_scales=None, conv_y_scales=None,
                                        strides=None, pads=None,
                                        dilations=None, bridge_scales=None,
-                                       check=True):
+                                       relu_after=None, check=True):
     """`conv_chain_matmul_chain_model`, with a MaxPool optionally sitting
     between any two consecutive conv layers OR between the chain's own
     last conv layer and the conv->matmul bridge -- the way
@@ -957,6 +1006,13 @@ def conv_pool_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
             raise ValueError(
                 f"pools has an entry for bridge {i}, which is out of "
                 f"range for {n_conv} conv layers (0 <= bridge < {n_conv})")
+    if relu_after is None:
+        relu_after = set()
+    for i in relu_after:
+        if not (0 <= i < n_conv - 1):
+            raise ValueError(
+                f"relu_after has bridge {i}, but this chain only has "
+                f"conv-conv bridges 0 <= bridge < {n_conv - 1}")
     if conv_w_scales is None:
         conv_w_scales = [1.0] * n_conv
     if conv_y_scales is None:
@@ -1048,6 +1104,11 @@ def conv_pool_chain_matmul_chain_model(conv_weights, x_shape, matmul_weights,
             dilations=[dilation_h, dilation_w]))
 
         cur_name = out_name
+        if i in relu_after:
+            relu_out = f"L{i}_relu"
+            nodes.append(helper.make_node(
+                "Relu", [cur_name], [relu_out], name=f"relu{i}"))
+            cur_name = relu_out
         cur_h, cur_w = out_h, out_w
         last_cout = cout
 

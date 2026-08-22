@@ -107,6 +107,35 @@ def test_interior_and_trailing_pools_together_match_the_reference(
         f"{want.tolist()}")
 
 
+def test_a_relu_composed_with_an_interior_pool_matches_the_reference(
+        cim_opt, cim_run):
+    # Relu directly before the interior pool (Conv -> Relu -> MaxPool ->
+    # Conv), the same two-intermediate-node shape load_conv_pool_chain's
+    # own test already proves, here reused unchanged by this loader's
+    # own matmul tail.
+    rng = np.random.default_rng(SEED + 86)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 9, 9)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    mm_w = rng.integers(-4, 5, size=(2, 4), dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w],
+        pools={0: dict(kernel_shape=(2, 2))}, relu_after={0})
+    no_relu_model = conv_pool_chain_matmul_chain_model(
+        [w0, w1], x_shape, [mm_w], pools={0: dict(kernel_shape=(2, 2))})
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
 def test_a_padded_trailing_pool_matches_the_reference(cim_opt, cim_run):
     # Real, asymmetric padding on the trailing pool -- exercises the -128
     # fill at the one new bridge position, against a negative-heavy
