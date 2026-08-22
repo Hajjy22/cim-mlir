@@ -452,3 +452,29 @@ def test_refuses_a_relu_with_more_than_one_input():
     act = np.ones(THREE_LAYER_SHAPES[0][0], dtype=np.int8)
     with pytest.raises(Refusal, match="unary"):
         import_model(model, act)
+
+
+def test_an_onnx_weight_named_a0_does_not_collide_with_the_activation(
+        cim_opt, cim_run):
+    # REGRESSION: emit_chain_module used to name each weight's SSA value
+    # after the ONNX tensor (`%{sym} = memref.get_global @{sym}`), while
+    # the staged activation is always `%a0`. A model whose weight was
+    # simply called "a0" therefore emitted `%a0` twice and cim-opt
+    # rejected the module with "redefinition of SSA value" -- loud, but a
+    # perfectly ordinary ONNX tensor name should not break the front end.
+    # SSA names are now generated positionally, independent of any ONNX
+    # name, matching what emit_module always did.
+    weights = _chain_weights(THREE_LAYER_SHAPES, SEED + 24)
+    model = matmul_chain_model(weights)
+    for init in model.graph.initializer:
+        if init.name == "W0":
+            init.name = "a0"
+    for node in model.graph.node:
+        node.input[:] = ["a0" if i == "W0" else i for i in node.input]
+
+    act = np.random.default_rng(SEED + 25).integers(
+        -127, 128, size=THREE_LAYER_SHAPES[0][0], dtype=np.int64).astype(np.int8)
+    want = onnx_reference_eval(model, act)
+    outputs, _ = compile_and_run(cim_opt, cim_run, None, None,
+                                 source=import_model(model, act))
+    assert np.array_equal(np.asarray(outputs), want)

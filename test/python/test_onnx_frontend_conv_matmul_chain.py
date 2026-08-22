@@ -429,3 +429,82 @@ def test_refuses_a_uint8_conv_output_in_a_chain():
     act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
     with pytest.raises(Refusal, match="int8 output"):
         import_model(model, act)
+
+
+def _rename_tensor(model, old, new):
+    """Rename one initializer and every reference to it, in place."""
+    for init in model.graph.initializer:
+        if init.name == old:
+            init.name = new
+    for node in model.graph.node:
+        node.input[:] = [new if i == old else i for i in node.input]
+    return model
+
+
+def test_a_grouped_chain_with_two_matmul_layers_and_a_real_scale(cim_opt,
+                                                                  cim_run):
+    # The grouped-conv chain's MULTI-matmul-layer path: the `scales`
+    # parameter and the intermediate cim.requantize bridge between matmul
+    # layers. Every other grouped-chain test passes a single matmul
+    # layer, which never reaches that code at all -- a real coverage hole
+    # this closes. The bridge scale is deliberately non-1.0 (and odd, so
+    # a rounding tie is impossible -- see test_onnx_frontend_chain.py's
+    # own note) to prove the scale is threaded through rather than
+    # silently hardcoded.
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    rng = np.random.default_rng(SEED + 43)
+    conv_w = rng.integers(-4, 5, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    mm_w0 = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+    mm_w1 = rng.integers(-4, 5, size=(3, 2), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_matmul_chain_model(conv_w, x_shape, [mm_w0, mm_w1],
+                                    group=group, bridge_scales=[3.0])
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled two-matmul grouped chain {outputs.tolist()} != ONNX "
+        f"reference {want.tolist()}")
+
+
+def test_an_onnx_weight_named_like_an_internal_ssa_value_still_compiles(
+        cim_opt, cim_run):
+    # REGRESSION: the emitters used to name SSA values after the ONNX
+    # tensor (`%{sym} = memref.get_global @{sym}`), so a model whose
+    # matmul weight happened to be called "w0" -- the same name the
+    # grouped conv's own group-0 weight uses internally -- emitted
+    # `%w0` twice and cim-opt rejected the module with "redefinition of
+    # SSA value". A loud failure rather than a wrong number, but a
+    # perfectly ordinary ONNX name should not break the front end at
+    # all. SSA names are now generated positionally and independently of
+    # any ONNX name (matching emit_module, which always did this).
+    cout, cin_per_group, kh, kw, group = 4, 2, 2, 2, 2
+    rng = np.random.default_rng(SEED + 44)
+    conv_w = rng.integers(-4, 5, size=(cout, cin_per_group, kh, kw),
+                          dtype=np.int64).astype(np.int8)
+    x_shape = (1, cin_per_group * group, 5, 5)
+    mm_w = rng.integers(-4, 5, size=(cout, 3), dtype=np.int64).astype(np.int8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = _rename_tensor(
+        conv_matmul_chain_model(conv_w, x_shape, [mm_w], group=group),
+        "mmW0", "w0")
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want)
+
+
+def test_the_grouped_chain_emitter_refuses_duplicate_symbols():
+    # The three symbol lists share ONE module-level namespace (each name
+    # becomes a memref.global). import_model can never violate this --
+    # it runs every name through sanitize_symbol against one shared
+    # `taken` set -- but a direct caller could, and used to get an opaque
+    # "redefinition of symbol" out of cim-opt instead of a clear error.
+    from cim_frontend.emit import emit_grouped_conv_matmul_chain_module
+
+    with pytest.raises(ValueError, match="distinct"):
+        emit_grouped_conv_matmul_chain_module(
+            [np.array([[1, 0]], np.int8), np.array([[0, 1]], np.int8)],
+            [np.array([3, 4], np.int8), np.array([5, 6], np.int8)],
+            [np.array([[1, 1]], np.int8)],
+            mm_weight_syms=["w0"])   # collides with the conv's default w0
