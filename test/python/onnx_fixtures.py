@@ -583,7 +583,7 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
                           w_scales=None, y_scales=None, strides=None,
                           pads=None, dilations=None, last_bias=None,
                           last_y_zero_point=0, last_y_dtype=TensorProto.INT8,
-                          relu_after=None, check=True):
+                          relu_after=None, final_relu=False, check=True):
     """`conv_chain_model`, with a MaxPool optionally sitting between any
     two consecutive QLinearConv layers -- the way
     cim_frontend.onnx_import.load_conv_pool_chain reads (see its own
@@ -610,6 +610,12 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
     -> Conv` order, the way
     cim_frontend.onnx_import.load_conv_pool_chain reads (see
     `_discover_conv_pool_chain`'s own docstring for the exact positions).
+
+    `final_relu`, if True, appends one more Relu directly on the LAST
+    layer's own "Y" (no pool may follow the chain's own last layer here
+    -- see this function's own module header), and makes the graph's own
+    declared output that Relu's output instead, exactly
+    `conv_chain_model`'s own `final_relu` parameter.
     """
     weights = [np.asarray(w) for w in weights]
     n_layers = len(weights)
@@ -767,6 +773,11 @@ def conv_pool_chain_model(weights, x_shape, pools, x_scale=1.0,
             cur_h, cur_w = pool_out_h, pool_out_w
 
     last_cout = weights[-1].shape[0]
+    if final_relu:
+        relu_final_out = "final_relu_out"
+        nodes.append(helper.make_node(
+            "Relu", [cur_name], [relu_final_out], name="final_relu"))
+        cur_name = relu_final_out
     graph = helper.make_graph(
         nodes, "conv_pool_chain",
         [helper.make_tensor_value_info(x_name, first_x_dtype, list(x_shape))],

@@ -414,6 +414,148 @@ def test_refuses_a_maxpool_then_relu_the_reverse_order():
         import_model(model, act)
 
 
+def test_a_relu_on_the_chains_own_final_layer_matches_the_reference(
+        cim_opt, cim_run):
+    # The one Relu position with no bridge at all -- exactly
+    # load_conv_chain's own final-layer acceptance, now also reachable
+    # through load_conv_pool_chain's identical graph-output check
+    # (pooling after the chain's own last layer is still refused; this
+    # loader still needs a pool somewhere else to even be reached at
+    # all, hence the interior pool at bridge 0).
+    # y_scales=[1.0, 20.0] keeps the final layer's quantized result
+    # spread across both signs, well clear of the +/-128 clamp -- the
+    # pool's own max-selection otherwise skews the accumulator heavily
+    # positive, saturating every entry to 127 and making Relu vacuous.
+    rng = np.random.default_rng(SEED + 80)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        y_scales=[1.0, 20.0], final_relu=True)
+    no_relu_model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        y_scales=[1.0, 20.0])
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference on the "
+        "chain's own final layer")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled final-layer-Relu output {outputs.tolist()} != ONNX "
+        f"reference {want.tolist()}")
+
+
+def test_a_relu_at_an_interior_bridge_and_the_final_layer_matches_the_reference(
+        cim_opt, cim_run):
+    # Both positions at once, alongside an interior MaxPool -- proves
+    # relu_after, pool_after, and this loader's own final-layer check
+    # are all tracked independently.
+    # Same saturation note as the test above -- y_scales=[1.0, 1.0, 50.0]
+    # keeps the final layer's quantized result spread across both signs.
+    rng = np.random.default_rng(SEED + 80)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    w2 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 8, 8)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_pool_chain_model(
+        [w0, w1, w2], x_shape, pools={1: dict(kernel_shape=(2, 2))},
+        relu_after={0}, y_scales=[1.0, 1.0, 50.0], final_relu=True)
+    no_relu_model = conv_pool_chain_model(
+        [w0, w1, w2], x_shape, pools={1: dict(kernel_shape=(2, 2))},
+        y_scales=[1.0, 1.0, 50.0])
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_refuses_a_final_relu_with_a_stray_extra_reader():
+    # The graph's own declared output IS the final Relu's output, but
+    # something else ALSO reads it -- exactly load_conv_chain's own
+    # identical refusal.
+    rng = np.random.default_rng(SEED + 96)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 6, 6)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        final_relu=True, check=False)
+    stray = onnx_helper.make_node(
+        "Relu", ["final_relu_out"], ["stray_out"], name="stray_relu_reader")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="true endpoint"):
+        import_model(model, act)
+
+
+def test_refuses_a_disconnected_relu_elsewhere_when_a_final_relu_is_present():
+    # A Relu that is not on any edge this loader (or
+    # _discover_conv_pool_chain, which it calls) ever walks, present
+    # alongside a LEGITIMATE final Relu in the same graph.
+    rng = np.random.default_rng(SEED + 97)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 6, 6)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        final_relu=True, check=False)
+    stray = onnx_helper.make_node("Relu", ["X"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly"):
+        import_model(model, act)
+
+
+def test_refuses_a_maxpool_after_the_chains_own_final_layer():
+    # Pooling after the chain's own last layer is still not supported --
+    # a MaxPool there still refuses, even with no Relu involved at all.
+    # Confirms the final-layer graph-output check's own extension does
+    # not accidentally widen what load_conv_pool_chain accepts past its
+    # documented scope. This MaxPool is never even reached by the new
+    # check: `_discover_conv_pool_chain` never places it in `pool_after`
+    # (it sits after the whole chain, not between two conv layers), so
+    # the pre-existing "every MaxPool present must be used" check -- run
+    # BEFORE the final-layer check -- catches it first.
+    rng = np.random.default_rng(SEED + 98)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 6, 6)
+
+    model = conv_pool_chain_model(
+        [w0, w1], x_shape, pools={0: dict(kernel_shape=(2, 2))},
+        check=False)
+    pool_last = onnx_helper.make_node(
+        "MaxPool", ["L1_Y"], ["final_pool_out"], name="final_pool",
+        kernel_shape=[2, 2], strides=[2, 2])
+    model.graph.node.append(pool_last)
+    # The refusal fires on the "unused MaxPool" check alone, before
+    # anything inspects the declared output's own shape -- no need to
+    # keep that shape consistent with the (unreachable) new output
+    # tensor.
+    model.graph.output[0].name = "final_pool_out"
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly between "
+                                      "two consecutive chain layers"):
+        import_model(model, act)
+
+
 # --- refusals --------------------------------------------------------------
 
 def test_refuses_a_pool_with_stride_one():
