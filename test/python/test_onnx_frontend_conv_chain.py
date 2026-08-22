@@ -301,6 +301,102 @@ def test_refuses_a_disconnected_relu_elsewhere_in_the_graph():
         import_model(model, act)
 
 
+def test_a_relu_on_the_chains_own_final_layer_matches_the_reference(
+        cim_opt, cim_run):
+    # The one position with no bridge at all: `_discover_conv_chain`
+    # never looks past the chain's own last conv, so this Relu is
+    # recognized by load_conv_chain's own graph-output check instead --
+    # threaded into emit_conv_chain_module's `final_relu` flag, applied
+    # inside _emit_bias_and_requantize's own tail. w1/act chosen so the
+    # FINAL layer's own quantized result has both positive and negative
+    # entries -- otherwise Relu is a no-op here too.
+    rng = np.random.default_rng(SEED + 90)
+    w0 = rng.integers(-4, 5, size=(3, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 3, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_model([w0, w1], x_shape, final_relu=True)
+    no_relu_model = conv_chain_model([w0, w1], x_shape)
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference on the "
+        "chain's own final layer")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled final-layer-Relu output {outputs.tolist()} != ONNX "
+        f"reference {want.tolist()}")
+
+
+def test_a_relu_on_both_an_interior_bridge_and_the_final_layer_matches_the_reference(
+        cim_opt, cim_run):
+    # Both positions at once -- proves the interior _discover_conv_chain
+    # walk and this loader's own final-layer check are tracked
+    # independently in relu_after/final_relu, not one silently
+    # overwriting the other.
+    rng = np.random.default_rng(SEED + 91)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w2 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 5, 5)
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+
+    model = conv_chain_model(
+        [w0, w1, w2], x_shape, relu_after={0}, final_relu=True)
+    no_relu_model = conv_chain_model([w0, w1, w2], x_shape)
+    with_relu = onnx_reference_eval(model, act, act_name="X")
+    without_relu = onnx_reference_eval(no_relu_model, act, act_name="X")
+    assert not np.array_equal(with_relu, without_relu), (
+        "fixture assumption broken: Relu made no difference")
+
+    outputs, want = _run(model, act, cim_opt, cim_run)
+    assert np.array_equal(outputs, want), (
+        f"compiled output {outputs.tolist()} != ONNX reference "
+        f"{want.tolist()}")
+
+
+def test_refuses_a_final_relu_with_a_stray_extra_reader():
+    # The graph's own declared output IS the final Relu's output, but
+    # something else ALSO reads it -- there is nothing past `final_relu`
+    # for the emitted module to compute, so this is refused rather than
+    # silently ignoring the extra reader.
+    rng = np.random.default_rng(SEED + 92)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+
+    model = conv_chain_model([w0, w1], x_shape, final_relu=True, check=False)
+    stray = onnx_helper.make_node(
+        "Relu", ["final_relu_out"], ["stray_out"], name="stray_relu_reader")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="true endpoint"):
+        import_model(model, act)
+
+
+def test_refuses_a_disconnected_relu_elsewhere_when_a_final_relu_is_present():
+    # A Relu that is not on any edge this loader (or _discover_conv_chain,
+    # which it calls) ever walks, present alongside a LEGITIMATE final
+    # Relu in the same graph -- exercises "every Relu actually present
+    # must be USED" independent of the final Relu also being correctly
+    # recognized.
+    rng = np.random.default_rng(SEED + 93)
+    w0 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    w1 = rng.integers(-4, 5, size=(2, 2, 2, 2), dtype=np.int64).astype(np.int8)
+    x_shape = (1, 2, 4, 4)
+
+    model = conv_chain_model([w0, w1], x_shape, final_relu=True, check=False)
+    stray = onnx_helper.make_node("Relu", ["X"], ["stray"], name="stray_relu")
+    model.graph.node.append(stray)
+
+    act = rng.integers(-4, 5, size=x_shape, dtype=np.int64).astype(np.int8)
+    with pytest.raises(Refusal, match="not positioned directly"):
+        import_model(model, act)
+
+
 # --- refusals ------------------------------------------------------------
 
 def test_refuses_a_single_qlinear_conv():

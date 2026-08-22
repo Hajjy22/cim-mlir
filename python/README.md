@@ -40,7 +40,7 @@ reasons.
 | A chain of `MatMulInteger` | Bridged by `Cast(float32) -> QuantizeLinear(scale, zero_point=0)`, optionally followed by `Relu` directly on that bridge's own output |
 | One `QLinearConv` | Via im2col, entirely in Python — no new MLIR op |
 | `QLinearConv` -> `MatMulInteger` chain | Bridged by `Transpose(perm=[0,2,3,1]) -> Reshape([M, Cout])` |
-| A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]`, optionally with `Relu` (and `Relu` then `MaxPool`) directly between two layers |
+| A chain of `QLinearConv` | Directly connected, no bridge node — both `X` and `Y` are already `[N,C,H,W]`, optionally with `Relu` (and `Relu` then `MaxPool`) directly between two layers, or directly on the chain's own final layer output (unpooled chains only) |
 | A conv chain -> matmul chain | The realistic full-CNN shape, optionally with `Relu` between convs or directly on the conv-to-matmul bridge |
 | `MaxPool` between two convs | The first non-matmul op this front end executes, not just analyzes |
 | `MaxPool` composed with the conv->matmul bridge | A pool between the chain's own last conv and its first matmul layer — max is scale-invariant, so this needs no bridge of its own beyond moving the Transpose/Reshape's own source |
@@ -119,17 +119,27 @@ Only the exact bridge position is recognized: on a `MatMulInteger` chain, a `Rel
 must be the immediate producer of a later layer's own input; on a `QLinearConv` chain, it
 must sit directly between two layers' own `X`/`Y` (optionally followed immediately by a
 `MaxPool`, matching ONNX's own `Conv -> Relu -> MaxPool -> Conv` node order — the reverse
-order is not recognized), or directly on the conv-to-matmul bridge, between a conv chain's
-own last layer and the `Transpose` that starts it. A `Relu` anywhere else in the graph —
-off on an unrelated branch, between `Cast` and `QuantizeLinear`, after a pool instead of
-before it, duplicated — is not silently accepted; it falls into the same "graph also
-contains ..." refusal as any other unrecognized op. This is a position check, not a type
-allow-list.
+order is not recognized), directly on the conv-to-matmul bridge, between a conv chain's
+own last layer and the `Transpose` that starts it, or directly on an UNPOOLED conv chain's
+own final layer output — the graph's own declared output IS that Relu's own output,
+reading the last conv's "Y" directly, with nothing else reading it. A `Relu` anywhere else
+in the graph — off on an unrelated branch, between `Cast` and `QuantizeLinear`, after a
+pool instead of before it, duplicated — is not silently accepted; it falls into the same
+"graph also contains ..." refusal as any other unrecognized op. This is a position check,
+not a type allow-list.
 
-Still refused: a `Relu` on a chain's own *final* layer output (there is no bridge there to
-carry it); a `Relu` directly before a conv-pool chain's own trailing pool (the one sitting
-right before the conv-to-matmul bridge, when a pool is also present there); and a `Relu`
-between matmul layers.
+The final-layer position is `max(q, 0)`, exactly like every other position — **not**
+`max(q, zero_point)`, even though the final layer's own `y_zero_point` may be anything at
+all (every interior bridge instead requires it to be exactly zero). Confirmed directly
+against `onnx.reference`: `Relu` has no scale/zero_point attributes whatsoever, and is
+defined as literal elementwise `max(x, 0)` regardless of what `x` represents. The
+`zero_point == 0` requirement everywhere else exists only so `max(q, 0)` in the quantized
+domain equals `max(dequant(q), 0)` in the real one — not because `Relu` itself needs it.
+
+Still refused: a `Relu` on a conv-*pool* chain's own final layer output (the unpooled case
+above is accepted; the pooled one is not yet); a `Relu` directly before a conv-pool chain's
+own trailing pool (the one sitting right before the conv-to-matmul bridge, when a pool is
+also present there); and a `Relu` between matmul layers.
 
 ### Grouped/depthwise convolution details
 

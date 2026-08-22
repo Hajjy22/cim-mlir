@@ -249,9 +249,36 @@ func.func @main() {{
 
 def _emit_bias_and_requantize(acc_val, m, n, weight_sym, bias=None,
                               per_channel_requantize=None,
-                              trailing_requantize=None, effective_bits=8):
+                              trailing_requantize=None, effective_bits=8,
+                              relu=False):
     """Shared tail: an optional bias-add, then an optional requantize,
-    applied to an `[m, n]` int32 accumulator named `acc_val`.
+    then an optional `Relu`, applied to an `[m, n]` int32 accumulator
+    named `acc_val`.
+
+    `relu`, if True, applies `max(q, 0)` to the requantized int8 result
+    via `cim.reduce_max` against a fresh zero-filled buffer -- the same
+    composition every other Relu position in this front end already
+    uses, and requires one of `trailing_requantize`/`per_channel_
+    requantize` to have run (there is no requantized int8 result to
+    apply it to otherwise). This is `max(q, 0)`, not `max(q,
+    zero_point)`, deliberately: ONNX's own `Relu` operator has no scale/
+    zero_point attributes at all -- it is defined as the literal
+    elementwise `max(x, 0)` on whatever raw numeric values `x` holds,
+    with zero meaning nothing more than the ordinary number zero.
+    Confirmed directly against `onnx.reference` on a signed int8 tensor
+    with a deliberately non-zero-point-shaped input before writing this:
+    `Relu([-5, -1, 0, 3, 10]) == [0, 0, 0, 3, 10]`, matching literal
+    `max(x, 0)` exactly, with no reference anywhere to a zero_point.
+    That is also why every OTHER Relu position in this front end
+    requires `zero_point == 0` at the exact edge Relu sits on -- not
+    because Relu itself needs it, but because those bridges are
+    otherwise indistinguishable intermediate int32 accumulators to the
+    matmul that reads them next, and zero_point == 0 is what makes
+    `max(q, 0)` in the quantized domain equal `max(dequant(q), 0)` in
+    the real one. The graph's own FINAL declared output carries no such
+    constraint -- its own `y_zero_point` may be anything -- but `Relu`'s
+    definition does not change: it is still `max(q, 0)` on the printed
+    int8 result, whatever `q`'s own zero_point happens to be.
 
     Factored out of `emit_module`'s own original inline logic so
     `emit_conv_chain_module` can apply the EXACT same tail to a
@@ -279,8 +306,17 @@ def _emit_bias_and_requantize(acc_val, m, n, weight_sym, bias=None,
         is responsible for where this one goes.
       * `result_val`, `result_elem` -- the SSA name and element type
         (`"i8"` if either requantize path ran, else `"i32"`) of the final
-        value to print.
+        value to print. When `relu=True`, `result_val` names the
+        post-Relu buffer instead; `result_elem` is unaffected (Relu
+        never changes element type).
     """
+    if relu and per_channel_requantize is None and trailing_requantize is None:
+        raise ValueError(
+            "relu=True needs one of trailing_requantize/"
+            "per_channel_requantize to have run first -- there is no "
+            "requantized int8 result for Relu to apply to; a bare i32 "
+            "accumulator is not a supported target for this tail's own "
+            "Relu step.")
     if trailing_requantize is not None and per_channel_requantize is not None:
         raise ValueError(
             "trailing_requantize and per_channel_requantize are mutually "
@@ -365,6 +401,19 @@ def _emit_bias_and_requantize(acc_val, m, n, weight_sym, bias=None,
         result_val, result_elem = "%q", "i8"
     else:
         result_val, result_elem = acc_val, "i32"
+
+    if relu:
+        i8mn = f"memref<{m}x{n}xi8>"
+        lines += [
+            "  %reluZeroConst = arith.constant 0 : i8",
+            f"  %reluZero = memref.alloc() : {i8mn}",
+            f"  linalg.fill ins(%reluZeroConst : i8) outs(%reluZero : "
+            f"{i8mn})",
+            f"  %reluResult = cim.reduce_max {result_val}, %reluZero : "
+            f"({i8mn}, {i8mn}) -> {i8mn}",
+        ]
+        allocs += [("%reluZero", i8mn), ("%reluResult", i8mn)]
+        result_val = "%reluResult"
 
     return lines, allocs, bias_global, result_val, result_elem
 
@@ -940,7 +989,7 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                            last_trailing_requantize=None,
                            last_per_channel_requantize=None,
                            effective_bits=8, pool_params=None,
-                           relu_bridges=None):
+                           relu_bridges=None, final_relu=False):
     """Two or more chained QLinearConv layers -- a REAL MLIR-level im2col
     for every layer after the first, docs/roadmap.md's "chain convolution
     layers" plan, part 2.
@@ -1130,6 +1179,20 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
     `%zeroI8` (unconditional here, unlike `emit_chain_module`'s
     conditional one), so passing an empty or absent `relu_bridges` emits
     byte-identical text to before this parameter existed.
+
+    `final_relu`, if True, applies `Relu` to the chain's own FINAL
+    printed result -- only legal when the chain ends in a conv
+    (`ends_in_conv`; there is no `_emit_bias_and_requantize` tail to
+    attach it to otherwise, since a matmul-terminated chain prints its
+    last layer's raw accumulator directly, with no requantize step at
+    all) and only after one of `last_trailing_requantize`/
+    `last_per_channel_requantize` produced a real int8 result (`_emit_
+    bias_and_requantize`'s own `relu` parameter enforces this). Unlike
+    every `relu_bridges` entry, this is `max(q, 0)` on a result whose OWN
+    `zero_point` may be anything at all -- see `_emit_bias_and_
+    requantize`'s own docstring for why that is still correct: ONNX's
+    `Relu` is defined as literal `max(x, 0)`, with no zero_point
+    awareness whatsoever, regardless of what `x` represents.
     """
     weights2d = [np.asarray(w) for w in weights2d]
     patches0 = np.asarray(patches0)
@@ -1198,6 +1261,12 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                 f"only has bridges 0 <= bridge < {max_relu_bridge} -- "
                 f"there is no bridge out of the chain's own last layer. "
                 f"Nothing emitted.")
+    if final_relu and not ends_in_conv:
+        raise ValueError(
+            "final_relu=True needs the chain to end in a conv -- a "
+            "matmul-terminated chain prints its own last layer's raw "
+            "accumulator directly, with no _emit_bias_and_requantize "
+            "tail to attach a final Relu to. Nothing emitted.")
     if weight_syms is None:
         weight_syms = [f"w{i}" for i in range(n_layers)]
     if len(weight_syms) != n_layers:
@@ -1316,7 +1385,7 @@ def emit_conv_chain_module(weights2d, conv_params, patches0, out_shape0,
                 bias=last_bias,
                 per_channel_requantize=last_per_channel_requantize,
                 trailing_requantize=last_trailing_requantize,
-                effective_bits=effective_bits))
+                effective_bits=effective_bits, relu=final_relu))
         quantized = (last_trailing_requantize is not None
                     or last_per_channel_requantize is not None)
         print_call = "cim_print_i8" if quantized else "cim_print_i32"

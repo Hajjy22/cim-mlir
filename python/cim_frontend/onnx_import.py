@@ -1828,11 +1828,18 @@ def load_conv_chain(model):
     layers -- see `_discover_conv_chain`'s own docstring for the exact
     position recognized and why it is exact (the same `zero_point == 0`
     argument the matmul-chain side's own `_strip_optional_relu` already
-    established).
+    established) -- and directly on the chain's own FINAL layer output
+    (the graph's own declared output is that Relu's own output, reading
+    the last conv's "Y" directly). Unlike every interior position, the
+    final layer's own `y_zero_point` may be anything at all: `Relu` is
+    still `max(q, 0)` there, not `max(q, zero_point)`, because ONNX's
+    `Relu` has no zero_point awareness whatsoever -- see
+    `emit._emit_bias_and_requantize`'s own docstring for the oracle-
+    verified argument.
 
     Returns (conv_nodes, weights2d, x_name, x_shape, conv_params,
     x_zero_point, trailing_requantize, per_channel_requantize, bias,
-    uint8_output_shifted, bridge_scales, relu_bridges) where:
+    uint8_output_shifted, bridge_scales, relu_bridges, final_relu) where:
 
     - `conv_nodes` is the chain's own QLinearConv nodes, in execution
       order.
@@ -1865,14 +1872,17 @@ def load_conv_chain(model):
     - `relu_bridges` is a set of bridge indices with a `Relu` -- pass it
       straight through to `emit.emit_conv_chain_module`'s own same-named
       parameter.
+    - `final_relu` is a bool -- pass it straight through to
+      `emit.emit_conv_chain_module`'s own same-named parameter.
 
     Raises Refusal for anything outside this function's own scope (see
     this section's own module header): fewer than two QLinearConv nodes,
-    any node in the graph that is not a QLinearConv or (directly between
-    two consecutive QLinearConv nodes) a Relu, a branching/cyclic/
-    disconnected "chain", a non-zero y_zero_point/per-channel w_scale/
-    bias on any layer but the last, or a non-zero x_zero_point on any
-    layer but the first.
+    any node in the graph that is not a QLinearConv or a Relu (directly
+    between two consecutive QLinearConv nodes, or directly on the
+    chain's own final layer output), a branching/cyclic/disconnected
+    "chain", a non-zero y_zero_point/per-channel w_scale/bias on any
+    layer but the last, or a non-zero x_zero_point on any layer but the
+    first.
     """
     from onnx import numpy_helper
 
@@ -1904,33 +1914,68 @@ def load_conv_chain(model):
             f"that one Relu), both natively [N, C, H, W] per the ONNX "
             f"spec. Nothing emitted.")
 
-    # `_unused_consumers`: nothing downstream of a pure conv chain's own
-    # last layer is validated except the graph output check below.
-    chain, relu_after, _unused_consumers = _discover_conv_chain(graph, convs)
-
-    # Every Relu actually present in the graph must be USED, at a
-    # position _discover_conv_chain recognized -- exactly the same
-    # "every pool actually present must be used" discipline
-    # load_conv_pool_chain's own check below already follows for
-    # MaxPool, so a Relu sitting somewhere this loader does not expect
-    # (branching off the chain, feeding something else) is refused
-    # rather than silently ignored.
-    used_relu_ids = {id(r) for r in relu_after.values()}
-    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
-    if unused_relus:
-        raise Refusal(
-            f"{len(unused_relus)} Relu node(s) are not positioned "
-            f"directly between two consecutive {ACCEPTED_CONV_OP} "
-            f"layers. Nothing emitted.")
+    chain, relu_after, consumers = _discover_conv_chain(graph, convs)
 
     if len(graph.output) != 1:
         raise Refusal(
             f"graph has {len(graph.output)} outputs; a chain must end in "
             f"exactly one. Nothing emitted.")
-    if graph.output[0].name != chain[-1].output[0]:
+
+    # The graph's own declared output is either the chain's own last
+    # conv directly, or that conv's output read by exactly one Relu
+    # whose own output IS the graph's declared output -- Relu on the
+    # chain's own final layer, the one position _discover_conv_chain
+    # never looks at (its own forward walk stops once every conv is
+    # chained, with no idea whether the graph even ends here). Unlike
+    # every other Relu this loader recognizes, there is no bridge to
+    # apply it to -- it is threaded into emit_conv_chain_module's own
+    # `final_relu` flag instead, applied inside _emit_bias_and_
+    # requantize's own tail after the chain's own final requantize.
+    final_out = chain[-1].output[0]
+    final_relu = None
+    if graph.output[0].name != final_out:
+        final_readers = consumers.get(final_out, [])
+        if len(final_readers) == 1 and final_readers[0].op_type == "Relu":
+            candidate = final_readers[0]
+            if graph.output[0].name == candidate.output[0]:
+                final_relu = candidate
+        if final_relu is None:
+            raise Refusal(
+                f"the graph's output is not the chain's own last "
+                f"{ACCEPTED_CONV_OP}'s own output, or a Relu directly on "
+                f"it. Nothing emitted.")
+        # The graph's own declared output must be a true endpoint: a
+        # Relu correctly named as the graph output, but ALSO read by
+        # something else, is a real graph this loader still has no
+        # business accepting (there is nothing past `final_relu` for the
+        # emitted module to compute) -- refused rather than silently
+        # ignoring the extra reader.
+        extra_readers = consumers.get(final_relu.output[0], [])
+        if extra_readers:
+            raise Refusal(
+                f"the chain's own final Relu "
+                f"'{final_relu.name or 'Relu'}' is read by "
+                f"{len(extra_readers)} other node(s); the graph's own "
+                f"declared output must be a true endpoint. Nothing "
+                f"emitted.")
+
+    # Every Relu actually present in the graph must be USED, at a
+    # position _discover_conv_chain (or this function's own final-layer
+    # check, above) recognized -- exactly the same "every pool actually
+    # present must be used" discipline load_conv_pool_chain's own check
+    # below already follows for MaxPool, so a Relu sitting somewhere
+    # this loader does not expect (branching off the chain, feeding
+    # something else) is refused rather than silently ignored.
+    used_relu_ids = {id(r) for r in relu_after.values()}
+    if final_relu is not None:
+        used_relu_ids.add(id(final_relu))
+    unused_relus = [r for r in relus if id(r) not in used_relu_ids]
+    if unused_relus:
         raise Refusal(
-            f"the graph's output is not the chain's own last "
-            f"{ACCEPTED_CONV_OP}'s own output. Nothing emitted.")
+            f"{len(unused_relus)} Relu node(s) are not positioned "
+            f"directly between two consecutive {ACCEPTED_CONV_OP} "
+            f"layers, or directly on the chain's own final layer output. "
+            f"Nothing emitted.")
 
     n_layers = len(chain)
     weights2d = []
@@ -2110,7 +2155,8 @@ def load_conv_chain(model):
     relu_bridges = set(relu_after.keys())
     return (chain, weights2d, x_name, x_shape, conv_params, x_zero_point,
            trailing_requantize, per_channel_requantize, bias,
-           uint8_output_shifted, bridge_scales, relu_bridges)
+           uint8_output_shifted, bridge_scales, relu_bridges,
+           final_relu is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -3968,7 +4014,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
     if matmul_count == 0 and conv_count >= 2:
         (conv_nodes, weights2d, x_name, x_shape, conv_params, x_zero_point,
          trailing_requantize, per_channel_requantize, bias,
-         uint8_output_shifted, bridge_scales, relu_bridges) = (
+         uint8_output_shifted, bridge_scales, relu_bridges, final_relu) = (
             load_conv_chain(model))
         activation = _validate_conv_activation(activation, x_shape,
                                                x_zero_point)
@@ -4003,7 +4049,7 @@ def import_model(model, activation, model_path="<model>", model_bytes=b"",
             scales=bridge_scales, last_bias=bias,
             last_trailing_requantize=trailing_requantize,
             last_per_channel_requantize=per_channel_requantize,
-            relu_bridges=relu_bridges)
+            relu_bridges=relu_bridges, final_relu=final_relu)
 
     if matmul_count == 0 and conv_count >= 1:
         (node, weight2d, x_name, x_shape, conv_params, x_zero_point,
